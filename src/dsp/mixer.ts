@@ -12,8 +12,9 @@
  */
 
 import type { SystemSettings } from '../schema/types';
+import { PAN, TRACK_COUNT } from './ranges';
 
-const TRACKS = 5;
+const TRACKS = TRACK_COUNT;
 
 /**
  * Fader position 0..1 to linear gain: 0 is silence, the top (1) is unity, and `pos^2` in between gives an audio
@@ -25,12 +26,15 @@ export function faderGain(pos: number): number {
   return pos >= 1 ? 1 : pos * pos;
 }
 
-/** Constant-power pan law for a pan of -50 (hard left) .. 50 (hard right): `[left, right]` gains, centre = 1/sqrt(2). */
+/**
+ * Constant-power pan law over the schema's PAN range (hard left .. hard right, -50..50): `[left, right]` gains,
+ * centre = 1/sqrt(2).
+ */
 export function panGains(pan: number): [number, number] {
-  const p = pan !== pan ? 0 : Math.min(50, Math.max(-50, pan));
-  if (p <= -50) return [1, 0];
-  if (p >= 50) return [0, 1];
-  const theta = ((p + 50) / 100) * (Math.PI / 2);
+  const p = pan !== pan ? 0 : Math.min(PAN.max, Math.max(PAN.min, pan));
+  if (p <= PAN.min) return [1, 0];
+  if (p >= PAN.max) return [0, 1];
+  const theta = ((p - PAN.min) / (PAN.max - PAN.min)) * (Math.PI / 2);
   return [Math.cos(theta), Math.sin(theta)];
 }
 

@@ -10,6 +10,7 @@
  */
 
 import { FLUSH } from './biquad';
+import { MIC_NS } from './ranges';
 
 const DETECTOR_S = 0.005;
 const OPEN_S = 0.001;
@@ -22,7 +23,7 @@ const LN10_20 = Math.LN10 / 20;
 
 /** Threshold in dBFS (RMS) for a NS setting 1..100. */
 // INFERRED
-export function nsThresholdDb(ns: number): number { return -80 + 0.45 * ns; }
+export function nsThresholdDb(ns: number): number { return -80 + (45 * ns) / MIC_NS.max; }
 
 const coef = (seconds: number, sr: number): number => Math.exp(-1 / (seconds * sr));
 

@@ -10,6 +10,7 @@
  */
 
 import { FLUSH } from './biquad';
+import { MASTER_COMP, MIC_COMP } from './ranges';
 
 export type CompKind = 'mic' | 'master';
 
@@ -19,14 +20,18 @@ const KNEE_DB = 6;
 const DETECTOR_S = 0.010;
 const LN10_20 = Math.LN10 / 20;
 
-interface Curve { thrHi: number; thrLo: number; ratioLo: number; ratioHi: number; attackS: number; releaseS: number; maxDepth: number }
+interface Curve {
+  thrHi: number; thrLo: number; ratioLo: number; ratioHi: number; attackS: number; releaseS: number;
+  /** The schema's depth range for this comp (MIC1 COMP / MASTER FX COMP). */
+  minDepth: number; maxDepth: number;
+}
 
 // INFERRED
-// Depth d in 1..max maps t = (d - 1) / (max - 1) to threshold = thrHi + t * (thrLo - thrHi) dBFS (RMS) and
+// Depth d in min..max maps t = (d - min) / (max - min) to threshold = thrHi + t * (thrLo - thrHi) dBFS (RMS) and
 // ratio = ratioLo + t * (ratioHi - ratioLo). The master comp is gentler (it works on the whole mix) and slower.
 const CURVES: Record<CompKind, Curve> = {
-  mic: { thrHi: -10, thrLo: -30, ratioLo: 1.5, ratioHi: 6, attackS: 0.010, releaseS: 0.150, maxDepth: 100 },
-  master: { thrHi: -6, thrLo: -24, ratioLo: 1.5, ratioHi: 4, attackS: 0.020, releaseS: 0.250, maxDepth: 40 },
+  mic: { thrHi: -10, thrLo: -30, ratioLo: 1.5, ratioHi: 6, attackS: 0.010, releaseS: 0.150, minDepth: MIC_COMP.min, maxDepth: MIC_COMP.max },
+  master: { thrHi: -6, thrLo: -24, ratioLo: 1.5, ratioHi: 4, attackS: 0.020, releaseS: 0.250, minDepth: MASTER_COMP.min, maxDepth: MASTER_COMP.max },
 };
 
 const coef = (seconds: number, sr: number): number => Math.exp(-1 / (seconds * sr));
@@ -51,11 +56,11 @@ export class Compressor {
     this.aRel = coef(this.curve.releaseS, sr);
   }
 
-  /** 'OFF' bypasses (after letting any gain reduction in progress release); a number is the depth, 1..max. */
+  /** 'OFF' bypasses (after letting any gain reduction in progress release); a number is the depth, min..max of the schema range. */
   setDepth(depth: 'OFF' | number): void {
     if (depth === 'OFF') { this.active = false; return; }
     const c = this.curve;
-    const t = Math.min(Math.max((depth - 1) / (c.maxDepth - 1), 0), 1);
+    const t = Math.min(Math.max((depth - c.minDepth) / (c.maxDepth - c.minDepth), 0), 1);
     this.thr = c.thrHi + t * (c.thrLo - c.thrHi);
     this.slope = 1 / (c.ratioLo + t * (c.ratioHi - c.ratioLo)) - 1;
     this.kneeLoLin = Math.pow(10, (this.thr - KNEE_DB / 2) / 10);

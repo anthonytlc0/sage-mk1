@@ -14,6 +14,7 @@
  */
 
 import { FLUSH } from './biquad';
+import { MASTER_REVERB } from './ranges';
 
 const LINES = 8;
 /** Mutually prime delay lengths in samples at 48 kHz; scaled for other rates. */
@@ -27,7 +28,7 @@ const HADAMARD_SCALE = 1 / Math.sqrt(LINES);
 const DAMP = 0.35;
 /** Wet fade time constant in seconds (used when the depth changes). */
 const FADE_S = 0.02;
-const MAX_DEPTH = 40;
+const MAX_DEPTH = MASTER_REVERB.max;
 // INFERRED: the depth -> wet level and depth -> decay mappings in setDepth() below, and DAMP above.
 
 export class Reverb {
