@@ -1,0 +1,26 @@
+{
+  "name": "sage-mk1",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sage MK1: a browser-based recreation of a 5-track tabletop loop station (TypeScript + Web Audio)",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run",
+    "e2e": "playwright test",
+    "typecheck": "tsc --noEmit"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "fflate": "^0.8.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.0",
+    "fake-indexeddb": "^6.2.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4",
+    "vite-plugin-pwa": "^2.0.0",
+    "vitest": "^5.0.3"
+  }
+}
