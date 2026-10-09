@@ -11,6 +11,7 @@ import {
   snapLength,
 } from '../../src/core/transport';
 import { TEMPO_MAX, TEMPO_MIN } from '../../src/shared/constants';
+import { NOTE_VALUES } from '../../src/schema/types';
 
 const SR = 1000;
 const FOUR_FOUR = { num: 4, den: 4 } as const;
@@ -42,6 +43,20 @@ describe('frame math', () => {
 
   it('noteFrames rejects a note the guide does not have', () => {
     expect(() => noteFrames(SR, 120, '1/32')).toThrow(RangeError);
+  });
+
+  it('noteFrames rejects inherited object keys, not just missing ones', () => {
+    for (const key of ['toString', 'constructor', 'hasOwnProperty', '__proto__']) {
+      expect(() => noteFrames(SR, 120, key)).toThrow(RangeError);
+    }
+  });
+
+  it('every NOTE_VALUES entry gives a positive, finite noteFrames', () => {
+    for (const note of NOTE_VALUES) {
+      const frames = noteFrames(SR, 120, note);
+      expect(Number.isFinite(frames)).toBe(true);
+      expect(frames).toBeGreaterThan(0);
+    }
   });
 
   it('fadeFrames is a note length or a count of measures', () => {
@@ -110,7 +125,9 @@ describe('nextBoundary', () => {
 
   it('treats a frame computed as n * unit as sitting on boundary n', () => {
     const unit = (4 * 60 * 44100) / 117; // fractional measure length
-    for (let n = 1; n < 50; n++) expect(nextBoundary(n * unit, 0, unit)).toBeCloseTo(n * unit, 6);
+    // (61 * unit) / unit is 61.0000000000000071, so without the epsilon this would jump to boundary 62.
+    expect(nextBoundary(61 * unit, 0, unit)).toBe(61 * unit);
+    for (let n = 1; n <= 200; n++) expect(nextBoundary(n * unit, 0, unit)).toBe(n * unit);
   });
 });
 
@@ -147,6 +164,16 @@ describe('Transport', () => {
     expect(t.bpm).toBe(TEMPO_MAX);
   });
 
+  it('setTempo ignores a non-finite tempo and keeps the previous one', () => {
+    const t = new Transport(SR);
+    t.setTempo(95.5);
+    for (const bad of [NaN, Infinity, -Infinity]) {
+      t.setTempo(bad);
+      expect(t.bpm).toBe(95.5);
+    }
+    expect(t.measureAt(1000).index).toBe(0); // the grid is still usable
+  });
+
   it('measureAt gives the measure index and phase', () => {
     const t = new Transport(SR); // 2000 frames per measure
     expect(t.measureAt(0)).toEqual({ index: 0, phase: 0 });
@@ -172,6 +199,30 @@ describe('Transport', () => {
     t.setTempo(60); // 3000 per measure, 500 per beat
     expect(t.measureAt(1500)).toEqual({ index: 0, phase: 0.5 });
     expect(t.beatPhaseAt(125)).toBe(0.25);
+  });
+
+  it('measureAt puts a frame computed as k * measureFrames on measure k, phase 0', () => {
+    const t = new Transport(44100);
+    t.setTempo(117);
+    const unit = measureFrames(44100, 117, t.beat); // fractional
+    for (let k = 1; k <= 200; k++) {
+      expect(t.measureAt(k * unit)).toEqual({ index: k, phase: 0 });
+    }
+  });
+
+  it('beatPhaseAt reads phase 0 on a frame computed as k * beatFrames', () => {
+    const t = new Transport(44100);
+    t.setTempo(117);
+    const unit = beatFrames(44100, 117, t.beat);
+    for (let k = 1; k <= 200; k++) expect(t.beatPhaseAt(k * unit)).toBe(0);
+  });
+
+  it('measureAt keeps phase in [0, 1) just before a boundary', () => {
+    const t = new Transport(SR); // 2000 frames per measure
+    const { index, phase } = t.measureAt(1999.9);
+    expect(index).toBe(0);
+    expect(phase).toBeGreaterThan(0.99);
+    expect(phase).toBeLessThan(1);
   });
 
   it('beatPhaseAt is the position within the current beat', () => {

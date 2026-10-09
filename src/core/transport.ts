@@ -17,17 +17,21 @@ const AUTO_BPM_MIN = 80;
 const AUTO_BPM_MAX = 160;
 const AUTO_MEASURES = [1 / 4, 1 / 2, 1, 2, 4, 8, 16, 32, 64] as const;
 
-/** Relative slack so a frame computed as `n * unit` still counts as sitting on boundary n despite float rounding. */
-const BOUNDARY_EPSILON = 1e-9;
+/**
+ * Slack, in grid cells, so a frame computed as `n * unit` still counts as sitting on boundary n despite float
+ * rounding. `nextBoundary` and `cellAt` (so `measureAt` / `beatPhaseAt`) share it, so they always agree on where a
+ * boundary is.
+ */
+const GRID_EPSILON = 1e-9;
 
 function clampTempo(bpm: number): number {
   return Math.min(TEMPO_MAX, Math.max(TEMPO_MIN, bpm));
 }
 
 function noteQuarters(note: NoteLen): number {
-  const q = NOTE_QUARTERS[note];
-  if (q === undefined) throw new RangeError(`Unknown note length: ${note}`);
-  return q;
+  // hasOwn, not a lookup: 'toString' and other inherited keys must not count as notes.
+  if (!Object.hasOwn(NOTE_QUARTERS, note)) throw new RangeError(`Unknown note length: ${note}`);
+  return NOTE_QUARTERS[note];
 }
 
 /** Quarter notes in one measure of `beat`: `num * 4/den`. */
@@ -103,7 +107,7 @@ export function deriveTempo(
 
 /** The first boundary (`originFrame + k * unitFrames`, k an integer) at or after `frame`. */
 export function nextBoundary(frame: number, originFrame: number, unitFrames: number): number {
-  const k = Math.ceil((frame - originFrame) / unitFrames - BOUNDARY_EPSILON);
+  const k = Math.ceil((frame - originFrame) / unitFrames - GRID_EPSILON);
   return originFrame + k * unitFrames;
 }
 
@@ -112,11 +116,16 @@ export function snapLength(lengthFrames: number, unitFrames: number): number {
   return Math.max(1, Math.round(lengthFrames / unitFrames)) * unitFrames;
 }
 
-/** Position within a grid of `unit`-frame cells counted from `origin`: the cell number and how far through it. */
+/**
+ * Position within a grid of `unit`-frame cells counted from `origin`: the cell number and how far through it, in
+ * [0, 1). A frame within GRID_EPSILON cells of a boundary counts as on it (the new cell, phase 0), matching
+ * `nextBoundary`.
+ */
 function cellAt(frame: number, origin: number, unit: number): { index: number; phase: number } {
   const cells = (frame - origin) / unit;
-  const index = Math.floor(cells);
-  return { index, phase: cells - index };
+  const index = Math.floor(cells + GRID_EPSILON);
+  const phase = cells - index;
+  return { index, phase: phase < GRID_EPSILON ? 0 : phase };
 }
 
 /** The shared tempo and time signature, and the measure grid they lay over the timeline from `origin`. */
@@ -132,8 +141,9 @@ export class Transport {
     this.sr = sr;
   }
 
-  /** Set the tempo, clamped to TEMPO_MIN..TEMPO_MAX. */
+  /** Set the tempo, clamped to TEMPO_MIN..TEMPO_MAX. A non-finite value (NaN, Infinity) is ignored. */
   setTempo(bpm: number): void {
+    if (!Number.isFinite(bpm)) return;
     this.bpm = clampTempo(bpm);
   }
 
