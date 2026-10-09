@@ -4,6 +4,7 @@ import { openDb, QuotaError } from '../../src/storage/db';
 import { MemoryStore } from '../../src/storage/memoryStore';
 import { defaultMemory } from '../../src/schema/params';
 import type { TrackAudio } from '../../src/shared/protocol';
+import type { MemorySettings } from '../../src/schema/types';
 
 let seq = 0;
 let db: IDBDatabase;
@@ -111,6 +112,22 @@ describe('MemoryStore', () => {
     expect(loaded!.tracks.slice(1)).toEqual([null, null, null, null]);
     await expect(store.save(4, settings('TOOMANY'), Array(6).fill(null))).rejects.toThrow(RangeError);
     expect((await store.load(4))!.settings.name).toBe('SHORTLIST');
+  });
+
+  it('completes settings stored by an older schema, keeping the values that are still valid', async () => {
+    const old = { name: 'OLD', tempo: 91, retired: 1 } as unknown as MemorySettings;
+    await store.save(8, old, []);
+    const expected = defaultMemory();
+    expected.name = 'OLD';
+    expected.tempo = 91;
+    expect((await store.load(8))!.settings).toEqual(expected);
+
+    const rich = defaultMemory();
+    rich.name = 'RICH';
+    rich.track[1]!.measure = { note: '1/4' };
+    rich.play.loopLength = 12;
+    await store.save(9, rich, []);
+    expect((await store.load(9))!.settings).toEqual(rich);
   });
 
   it('returns null for a slot that was never saved', async () => {

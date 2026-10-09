@@ -3,10 +3,11 @@
  * and finds `running` still true together with a checkpoint, the last session ended abnormally and the checkpoint
  * (settings plus tracks, audio chunked under the `recovery/` prefix) can be offered back.
  *
- * `markCleanShutdown` only clears the flag; callers `discard()` a checkpoint they no longer want, otherwise it
- * stays and a later crash would offer it again.
+ * A clean shutdown discards the checkpoint in the same transaction that clears the flag: a deliberate power-off
+ * throws away unsaved work, as on the hardware, so a later crash never offers a checkpoint from an earlier session.
  */
 
+import { reconcileMemory } from '../schema/params';
 import type { MemorySettings } from '../schema/types';
 import type { TrackAudio } from '../shared/protocol';
 import { AUDIO, RECOVERY, reqP, writeTx } from './db';
@@ -31,18 +32,20 @@ interface CheckpointRecord {
 export class Recovery {
   constructor(private readonly db: IDBDatabase) {}
 
-  private setRunning(running: boolean): Promise<void> {
+  markRunning(): Promise<void> {
     return writeTx(this.db, [RECOVERY], (tx) => {
-      tx.objectStore(RECOVERY).put({ running }, STATE);
+      tx.objectStore(RECOVERY).put({ running: true }, STATE);
     });
   }
 
-  markRunning(): Promise<void> {
-    return this.setRunning(true);
-  }
-
+  /** Clears the running flag and deletes the checkpoint (record and audio chunks), atomically. */
   markCleanShutdown(): Promise<void> {
-    return this.setRunning(false);
+    return writeTx(this.db, [RECOVERY, AUDIO], (tx) => {
+      deleteChunks(tx.objectStore(AUDIO), RECOVERY_PREFIX);
+      const recovery = tx.objectStore(RECOVERY);
+      recovery.delete(CHECKPOINT);
+      recovery.put({ running: false }, STATE);
+    });
   }
 
   /** True only when the last session never marked a clean shutdown AND a checkpoint exists to restore. */
@@ -70,7 +73,7 @@ export class Recovery {
   /** The checkpoint, or null. Does not remove it. */
   async take(): Promise<{ slot: number; settings: MemorySettings; tracks: (TrackAudio | null)[] } | null> {
     const found = await readRecordWithAudio<CheckpointRecord>(this.db, RECOVERY, CHECKPOINT, RECOVERY_PREFIX);
-    return found && { slot: found.record.slot, settings: found.record.settings, tracks: found.tracks };
+    return found && { slot: found.record.slot, settings: reconcileMemory(found.record.settings), tracks: found.tracks };
   }
 
   discard(): Promise<void> {

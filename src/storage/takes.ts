@@ -31,13 +31,6 @@ export interface TakeInfo {
 
 const CHANNELS = 2;
 
-/** The exact bytes of `bytes` as an ArrayBuffer (a view's whole underlying buffer would otherwise be stored). */
-function exactBuffer(bytes: Uint8Array): ArrayBuffer {
-  const buf = bytes.buffer;
-  if (buf instanceof ArrayBuffer && bytes.byteOffset === 0 && bytes.byteLength === buf.byteLength) return buf;
-  return bytes.slice().buffer;
-}
-
 export class Takes {
   constructor(private readonly db: IDBDatabase) {}
 
@@ -54,9 +47,12 @@ export class Takes {
     return id;
   }
 
-  /** Appends one chunk of encoded bytes. Rejects (`QuotaError` on a full disk) if the take does not exist. */
+  /**
+   * Appends one chunk of encoded bytes. Rejects (`QuotaError` on a full disk) if the take does not exist.
+   * The bytes are copied before this returns, so the caller may reuse or overwrite `bytes` right away.
+   */
   append(id: number, bytes: Uint8Array): Promise<void> {
-    const data = exactBuffer(bytes);
+    const data = bytes.slice().buffer; // synchronous copy: the stored put happens later, in a request callback
     return writeTx(this.db, [TAKES, TAKE_CHUNKS], (tx, fail) => {
       const exists = tx.objectStore(TAKES).count(id);
       exists.onsuccess = () => {
@@ -90,8 +86,9 @@ export class Takes {
     const tx = this.db.transaction([TAKES, TAKE_CHUNKS], 'readonly');
     const exists = reqP<number>(tx.objectStore(TAKES).count(id));
     const chunks = reqP<TakeChunkRecord[]>(tx.objectStore(TAKE_CHUNKS).index(BY_TAKE).getAll(IDBKeyRange.only(id)));
-    if ((await exists) === 0) throw new Error(`take ${id} does not exist`);
-    const parts = (await chunks).map((c) => c.data);
+    const [count, rows] = await Promise.all([exists, chunks]); // both settled, so a failed tx leaves nothing unhandled
+    if (count === 0) throw new Error(`take ${id} does not exist`);
+    const parts = rows.map((c) => c.data);
     const total = parts.reduce((sum, p) => sum + p.byteLength, 0);
     const pad = total & 1 ? [new Uint8Array(1)] : []; // RIFF chunks are word aligned; wavHeader counts this byte
     const header = wavHeader(total, EXPORT_RATE, CHANNELS, 'pcm24') as Uint8Array<ArrayBuffer>; // wavHeader allocates a plain ArrayBuffer

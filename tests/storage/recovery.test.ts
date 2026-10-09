@@ -75,6 +75,33 @@ describe('Recovery', () => {
     expect(await (await reopen()).needsRecovery()).toBe(false);
   });
 
+  it('a clean shutdown discards the checkpoint: the next run starts with nothing to recover', async () => {
+    const memories = new MemoryStore(db);
+    await memories.save(7, settings('SAVED'), [track(2, 1)]);
+    await recovery.markRunning();
+    await recovery.checkpoint(7, settings('UNSAVED'), [track(25, 2)]);
+    expect((await audioKeys()).filter((k) => k.startsWith('recovery/'))).toHaveLength(3);
+
+    await recovery.markCleanShutdown();
+    expect(await recovery.take()).toBeNull();
+    expect((await audioKeys()).filter((k) => k.startsWith('recovery/'))).toEqual([]);
+
+    const next = await reopen();
+    await next.markRunning(); // the next session starts and (say) crashes before it checkpoints
+    expect(await next.needsRecovery()).toBe(false);
+    expect(await next.take()).toBeNull();
+    expect(await audioKeys()).toEqual(['m7/t0/c0']); // the saved memory is untouched
+    expect((await new MemoryStore(db).load(7))!.settings.name).toBe('SAVED');
+  });
+
+  it('a clean shutdown with no checkpoint is fine and leaves running false', async () => {
+    await recovery.markCleanShutdown();
+    await recovery.markRunning();
+    expect(await recovery.needsRecovery()).toBe(false);
+    await recovery.markCleanShutdown();
+    expect(await recovery.take()).toBeNull();
+  });
+
   it('needs both the running flag and a checkpoint', async () => {
     expect(await recovery.needsRecovery()).toBe(false); // fresh database
 
@@ -108,6 +135,16 @@ describe('Recovery', () => {
     expect(got!.tracks[2]!.recordedTempo).toBe(110);
     expect(await audioKeys()).toEqual(['recovery/t0/c0', 'recovery/t0/c1', 'recovery/t0/c2', 'recovery/t2/c0']);
     expect(await recovery.take()).not.toBeNull();
+  });
+
+  it('take completes a checkpoint written by an older schema (missing fields, unknown keys)', async () => {
+    const old = { name: 'OLD', tempo: 88, retired: 1 } as unknown as ReturnType<typeof defaultMemory>;
+    await recovery.checkpoint(3, old, [null, null, null, null, null]);
+    const got = await recovery.take();
+    const expected = defaultMemory();
+    expected.name = 'OLD';
+    expected.tempo = 88;
+    expect(got!.settings).toEqual(expected);
   });
 
   it('take is null when there is no checkpoint', async () => {

@@ -4,6 +4,12 @@ import { openDb } from '../../src/storage/db';
 import { Takes } from '../../src/storage/takes';
 import { EXPORT_RATE } from '../../src/shared/constants';
 
+// The tsconfig has no node types; this is the one process API the unhandled-rejection test needs.
+declare const process: {
+  on(event: 'unhandledRejection', listener: (reason: unknown) => void): void;
+  off(event: 'unhandledRejection', listener: (reason: unknown) => void): void;
+};
+
 let seq = 0;
 let db: IDBDatabase;
 let takes: Takes;
@@ -72,6 +78,48 @@ describe('Takes', () => {
     const out = await bytesOf(await takes.blob(id));
     expect(out.length).toBe(44 + 6);
     expect(Array.from(out.subarray(44))).toEqual([10, 11, 12, 13, 14, 15]);
+  });
+
+  it('copies the bytes at call time: mutating or reusing the source after a non-awaited append changes nothing', async () => {
+    const id = await takes.create();
+    const scratch = bytes(12, 1); // a full-span view, like a recorder's reusable block buffer
+    const first = Array.from(scratch);
+    const p1 = takes.append(id, scratch);
+    scratch.fill(9);
+    const second = Array.from(scratch);
+    const p2 = takes.append(id, scratch);
+    scratch.fill(7);
+    await Promise.all([p1, p2]);
+    const out = await bytesOf(await takes.blob(id));
+    expect(Array.from(out.subarray(44))).toEqual([...first, ...second]);
+  });
+
+  it('blob rejects with the transaction error and leaves no unhandled rejection behind', async () => {
+    const failing = (message: string) => {
+      const req: Record<string, unknown> = { error: new Error(message) };
+      Object.defineProperty(req, 'onsuccess', { set() {} });
+      Object.defineProperty(req, 'onerror', { set(fn: () => void) { queueMicrotask(fn); } });
+      return req;
+    };
+    const fakeDb = {
+      transaction: () => ({
+        objectStore: (name: string) =>
+          name === 'takes'
+            ? { count: () => failing('count failed') }
+            : { index: () => ({ getAll: () => failing('getAll failed') }) },
+      }),
+    } as unknown as IDBDatabase;
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      await expect(new Takes(fakeDb).blob(1)).rejects.toThrow('count failed');
+      await new Promise((r) => setTimeout(r, 20)); // unhandledRejection fires after the microtask queue drains
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+    expect(unhandled).toEqual([]);
   });
 
   it('pads an odd data length to a word boundary, as the RIFF size says', async () => {

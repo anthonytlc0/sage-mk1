@@ -6,6 +6,7 @@
  * stores, so a slot is never left half old, half new.
  */
 
+import { reconcileMemory } from '../schema/params';
 import type { MemorySettings } from '../schema/types';
 import type { TrackAudio } from '../shared/protocol';
 import { AUDIO, MEMORIES, reqP, writeTx } from './db';
@@ -55,7 +56,7 @@ export class MemoryStore {
   async load(slot: number): Promise<{ settings: MemorySettings; tracks: (TrackAudio | null)[] } | null> {
     checkSlot(slot);
     const found = await readRecordWithAudio<MemoryRecord>(this.db, MEMORIES, slot, memoryPrefix(slot));
-    return found && { settings: found.record.settings, tracks: found.tracks };
+    return found && { settings: reconcileMemory(found.record.settings), tracks: found.tracks };
   }
 
   /** Replaces the slot atomically. Rejects with `QuotaError` (MEMORY FULL) when storage is exhausted; the old slot is kept. */

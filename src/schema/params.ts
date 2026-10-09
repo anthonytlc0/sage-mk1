@@ -28,15 +28,18 @@
  *     place and returns the value that was stored.
  */
 
-import { MEMORY_PARAMS } from './memory';
-import { SYSTEM_PARAMS } from './system';
+import { MEMORY_PARAMS, defaultMemory } from './memory';
+import { SYSTEM_PARAMS, defaultSystem } from './system';
 import { parseBeat } from './format';
+import { reconcile } from './reconcile';
 import { NOTE_VALUES } from './types';
 import type { MemorySettings, ParamDef, SystemSettings } from './types';
 
 export { MEMORY_PARAMS, defaultMemory } from './memory';
 export { SYSTEM_PARAMS, defaultSystem } from './system';
 export { concreteIds, TRACK_INDICES } from './define';
+export { reconcile } from './reconcile';
+export type { ReconcileOptions } from './reconcile';
 export {
   PANEL_FUNCTIONS, CTL_FUNCTIONS, EXP_FUNCTIONS, KNOB_FUNCS, ASSIGN_SOURCES, ASSIGN_TARGETS, expand,
 } from './functions';
@@ -187,4 +190,51 @@ function coerceBeat(d: ParamDef, v: unknown): unknown {
   if (label === undefined) throw new TypeError(`${d.id}: expected a beat`);
   if (!d.values!.includes(label)) throw new RangeError(`${d.id}: ${label} is not a valid beat`);
   return parseBeat(label);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Reconciling stored settings with the current schema (see reconcile.ts)
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Params whose value can have more than one type: a number or a keyword (loopLength 'AUTO', master.comp 'OFF', loCut
+ * 'FLAT', txCh 'RX CTL'), or a MEASURE / FADE TIME that is a keyword or a { note } / { measures } object. The type of
+ * the default says nothing about these, so the schema decides.
+ */
+function isPolymorphic(d: ParamDef): boolean {
+  if (d.kind === 'note') return true;
+  return (d.kind === 'int' || d.kind === 'float') && ((d.values?.length ?? 0) > 0 || (d.choices?.some((c) => typeof c === 'string') ?? false));
+}
+
+function acceptPolymorphic(path: readonly string[], stored: unknown): boolean | undefined {
+  const hit = findParam(path.join('.'));
+  if (!hit || !isPolymorphic(hit.def)) return undefined;
+  try {
+    coerce(hit.def, stored);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Stored system settings completed and corrected against the current schema; the defaults when `stored` is absent. */
+export function reconcileSystem(stored: unknown): SystemSettings {
+  return reconcile(stored, defaultSystem(), { accept: acceptPolymorphic });
+}
+
+/**
+ * Stored memory settings completed and corrected against the current schema; the defaults when `stored` is absent.
+ * `prefs` (copies of whole system groups) has no keys in the defaults, so each group in it is reconciled against the
+ * matching group of the default system settings, and a group the system no longer has is dropped.
+ */
+export function reconcileMemory(stored: unknown): MemorySettings {
+  const memory = reconcile(stored, defaultMemory(), { accept: acceptPolymorphic });
+  const prefs = (stored as { prefs?: unknown } | null | undefined)?.prefs;
+  if (prefs !== null && typeof prefs === 'object' && !Array.isArray(prefs)) {
+    const groups = defaultSystem() as unknown as Record<string, unknown>;
+    const known: Record<string, unknown> = {};
+    for (const key of Object.keys(prefs)) if (Object.prototype.hasOwnProperty.call(groups, key)) known[key] = groups[key];
+    memory.prefs = reconcile(prefs, known, { accept: acceptPolymorphic }) as Partial<SystemSettings>;
+  }
+  return memory;
 }
