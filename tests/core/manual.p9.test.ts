@@ -5,7 +5,7 @@
  * yellow = overdubbing, dark = stopped (the phrase is kept, so the TRACK button stays lit).
  */
 import { describe, expect, it } from 'vitest';
-import { at, makeCore, recPlay, run, stop, trk } from './harness';
+import { at, makeCore, recPlay, run, stop, trk, XF } from './harness';
 
 /** The performance: a 0.5 phrase, then 0.25 and 0.125 overdub layers. */
 function performance(f: number): number {
@@ -48,11 +48,10 @@ describe('Owner\'s Manual p.9: recording on a single track', () => {
 
     // Stopping: press STOP. The button goes dark; the phrase is kept.
     at(core, 6500, stop(), performance);
-    run(core, 1);
     const s = trk(core);
     expect(s.state).toBe('stopped');
     expect(s.lengthFrames).toBe(1000);
-    expect(run(core, 1000).tracks[0].every((v) => v === 0)).toBe(true);
+    expect(run(core, 1000).tracks[0].subarray(XF).every((v) => v === 0)).toBe(true); // a 5 ms ramp, then silence
     expect(trk(core).lengthFrames).toBe(1000);
   });
 });

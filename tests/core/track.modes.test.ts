@@ -70,19 +70,20 @@ describe('STOP MODE', () => {
     at(core, 2000, stop());
     expect(trk(core).state).toBe('stopped');
     expect(trk(core).stopping).toBe(false);
-    expect(run(core, 500).tracks[0].every((v) => v === 0)).toBe(true);
+    expect(run(core, 500).tracks[0].subarray(XF).every((v) => v === 0)).toBe(true); // silent after XF frames
   });
 
   it('LOOP plays to the loop end, then stops', () => {
     const core = makeCore({ track: [{ stopMode: 'LOOP' }] });
     at(core, 0, recPlay(), dc(0.5));
     at(core, 1000, recPlay(), dc(0.5));
-    at(core, 1300, stop()); // loop position 300
+    at(core, 1300, stop(), dc(0.5)); // loop position 300; the input runs on through the seam crossfade
     expect(trk(core).stopping).toBe(true);
     const tail = run(core, 1000).tracks[0]; // frames 1300..2299; the loop ends at 2000
     expect(tail[0]).toBe(0.5);
     expect(tail[699]).toBe(0.5); // position 999
-    expect(tail.subarray(700).every((v) => v === 0)).toBe(true);
+    for (let i = 700; i <= 700 + XF; i++) expect(tail[i]).toBeLessThanOrEqual(tail[i - 1]); // XF ramp after the loop end
+    expect(tail.subarray(700 + XF).every((v) => v === 0)).toBe(true);
     expect(trk(core).state).toBe('stopped');
     expect(trk(core).stopping).toBe(false);
   });
@@ -120,7 +121,7 @@ describe('1SHOT', () => {
     at(core, 1000, recPlay(), ramp); // plays once: frames 1000..1999
     const once = run(core, 1500).tracks[0];
     expect(once[500]).toBe(500);
-    expect(once.subarray(1000).every((v) => v === 0)).toBe(true);
+    expect(once.subarray(1000 + XF).every((v) => v === 0)).toBe(true); // an XF ramp after the end, then silence
     expect(trk(core).state).toBe('stopped');
 
     at(core, 3000, recPlay());
@@ -130,7 +131,7 @@ describe('1SHOT', () => {
     const re = run(core, 1200).tracks[0];
     expect(re[100]).toBe(100);
     expect(re[999]).toBe(999);
-    expect(re.subarray(1000).every((v) => v === 0)).toBe(true);
+    expect(re.subarray(1000 + XF).every((v) => v === 0)).toBe(true);
     expect(trk(core).state).toBe('stopped');
   });
 
@@ -147,9 +148,9 @@ describe('REVERSE', () => {
     const core = makeCore({ track: [{ reverse: true }] });
     at(core, 0, recPlay(), ramp); // records 0..999
     at(core, 1000, recPlay(), ramp);
-    const out = run(core, 500, ramp).tracks[0]; // frames 1000..1499
-    expect(out[0]).toBe(999);
-    expect(out[1]).toBe(998);
+    const out = run(core, 500, ramp).tracks[0]; // frames 1000..1499; the first XF frames ramp in
+    expect(out[XF]).toBe(999 - XF);
+    expect(out[XF + 1]).toBe(998 - XF);
     expect(out[499]).toBe(500);
     at(core, 1500, recPlay(), ramp);
     expect(trk(core).state).toBe('playing');

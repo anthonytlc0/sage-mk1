@@ -192,7 +192,7 @@ export class LooperCore {
     return out;
   }
 
-  /** Track `i`'s loop, or null when it has none. Free loops report the current tempo as their recorded tempo. */
+  /** Track `i`'s loop, or null when it has none. A free loop reports the memory tempo when its recording ended. */
   getTrackAudio(i: TrackIndex): TrackAudio | null {
     return this.tracks[i]?.audio() ?? null;
   }

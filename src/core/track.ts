@@ -18,6 +18,11 @@
  *  - Overdub punch-in: the input fades in over 5 ms. Punch-out: it keeps being written for 5 ms after the press,
  *    fading out (a "tail"). REPLACE passes crossfade the old audio out and back in the same way.
  *  - REPLACE2 mutes and unmutes the track output over 5 ms.
+ *  - Starts ramp in over 5 ms: START MODE IMMEDIATE, and the first playback after a recording.
+ *  - Cuts ramp out over 5 ms (controller ruling R20): an IMMEDIATE stop, a second STOP during a FADE/LOOP stop, the end
+ *    of a LOOP stop and the end of a 1SHOT. The state changes at once; a "release" voice carries on from where the
+ *    playhead was, fading to silence over 5 ms. A 1SHOT retrigger is the same release crossfaded with a ramp-in from
+ *    the start.
  *
  * Nothing here allocates while rendering. Scratch buffers are per track; the only allocations are the take's own
  * 1-second chunks while recording (or copy-on-write), and a fresh take shell when one is cleared.
@@ -59,9 +64,20 @@ interface Tail {
   replace: boolean;
 }
 
-/** Reverse the first `n` samples of `a` in place. */
-function reverseInPlace(a: Float32Array, n: number): void {
-  for (let i = 0, j = n - 1; i < j; i++, j--) {
+/**
+ * The last 5 ms of playback after a cut: `left` frames read from take position `pos` in direction `dir`, at `gain`
+ * (the track's fade gain at the cut) times a fall from 1 to 1/xfade.
+ */
+interface Release {
+  pos: number;
+  dir: 1 | -1;
+  left: number;
+  gain: number;
+}
+
+/** Reverse samples `[from, from + n)` of `a` in place. */
+function reverseInPlace(a: Float32Array, from: number, n: number): void {
+  for (let i = from, j = from + n - 1; i < j; i++, j--) {
     const t = a[i];
     a[i] = a[j];
     a[j] = t;
@@ -85,6 +101,10 @@ export class Track {
   private readonly env = new Ramp(1);
   /** Output gain that REPLACE2 takes to 0 while overdubbing. */
   private readonly mute = new Ramp(1);
+  /** 5 ms ramp-in of a start that would otherwise step from silence. */
+  private readonly attack = new Ramp(1);
+  /** The fading tail of playback after a cut or retrigger. */
+  private readonly rel: Release = { pos: 0, dir: 1, left: 0, gain: 0 };
 
   /** DUB MODE of the pass in progress, fixed when it starts. */
   private passMode: DubMode = 'OVERDUB';
@@ -104,9 +124,12 @@ export class Track {
   /** What a pass or tail writes. */
   private readonly srcL = new Float32Array(STEP);
   private readonly srcR = new Float32Array(STEP);
-  /** The take's audio under a replace tail. */
+  /** The take's audio under a replace write. */
   private readonly tmpL = new Float32Array(STEP);
   private readonly tmpR = new Float32Array(STEP);
+  /** The release voice's audio for the current step. */
+  private readonly relL = new Float32Array(STEP);
+  private readonly relR = new Float32Array(STEP);
 
   constructor(index: TrackIndex, host: TrackHost) {
     this.index = index;
@@ -154,18 +177,18 @@ export class Track {
       case 'playing':
         if (this.stopping !== null) return; // FADE/LOOP stop under way: no overdub until playback stops
         if (this.cfg.oneShot) {
-          // 1SHOT: retrigger from the start, never overdub (INFERRED: no new START MODE fade-in).
-          this.playhead = this.startPosition();
+          this.retrigger(); // 1SHOT: retrigger from the start, never overdub
           return;
         }
         if (this.cfg.reverse) return; // REVERSE: no overdub
-        this.beginPass();
+        this.beginPass(false);
         return;
     }
   }
 
-  /** STOP, per STOP MODE. A second STOP during a FADE or LOOP stop stops at once. */
+  /** STOP, per STOP MODE. A second STOP during a FADE or LOOP stop stops at once (with the 5 ms ramp-out). */
   stop(): void {
+    const dir = this.direction();
     switch (this._state) {
       case 'empty':
       case 'stopped':
@@ -183,12 +206,12 @@ export class Track {
         break;
     }
     if (this.stopping !== null) {
-      this.toStopped();
+      this.cutToStopped(dir);
       return;
     }
     switch (this.cfg.stopMode) {
       case 'IMMEDIATE':
-        this.toStopped();
+        this.cutToStopped(dir);
         return;
       case 'FADE':
         this.stopping = 'FADE';
@@ -259,14 +282,16 @@ export class Track {
       this.toStopped();
       return;
     }
-    // INFERRED: playback straight after a recording starts at full level; START MODE applies to starts from stopped.
+    // INFERRED: playback straight after a recording starts at full level (after the 5 ms ramp-in from the silent
+    // recording); START MODE applies to starts from stopped.
     this._state = 'playing';
     this.stopping = null;
     this.env.set(1);
     this.mute.set(1);
+    this.rampIn();
     this.playhead = this.startPosition();
     // REC->DUB on a REVERSE or 1SHOT track, which cannot overdub, ends in playback (INFERRED).
-    if (next === 'dub' && !this.cfg.reverse && !this.cfg.oneShot) this.beginPass();
+    if (next === 'dub' && !this.cfg.reverse && !this.cfg.oneShot) this.beginPass(true);
   }
 
   /** Start playback from the beginning of the phrase (the end, in REVERSE), per START MODE. */
@@ -276,19 +301,35 @@ export class Track {
     this.mute.set(1);
     this.playhead = this.startPosition();
     if (this.cfg.startMode === 'FADE') {
+      this.attack.set(1); // the fade itself starts from 0
       this.env.set(0);
       this.env.start(1, this.fadeTime(this.host.memory.play.fadeIn));
     } else {
       this.env.set(1);
+      this.rampIn();
     }
   }
 
-  /** Punch in at the playhead. The DUB MODE is fixed for the pass (INFERRED: a change applies from the next pass). */
-  private beginPass(): void {
+  /** 1SHOT retrigger: the old position fades out (release) while the start fades in, both over 5 ms. */
+  private retrigger(): void {
+    this.startRelease(this.direction());
+    this.playhead = this.startPosition();
+    this.rampIn();
+  }
+
+  /**
+   * Punch in at the playhead. The DUB MODE is fixed for the pass (INFERRED: a change applies from the next pass).
+   * `fromSilence`: the pass follows a recording, during which the track output nothing, so REPLACE2 is muted at once
+   * rather than ramped (it must never play the track).
+   */
+  private beginPass(fromSilence: boolean): void {
     this._state = 'overdubbing';
     this.passMode = this.cfg.dubMode;
     this.passFrames = 0;
-    if (this.passMode === 'REPLACE2') this.mute.start(0, this.host.xfade);
+    if (this.passMode === 'REPLACE2') {
+      if (fromSilence) this.mute.set(0);
+      else this.mute.start(0, this.host.xfade);
+    }
   }
 
   /** Punch out: back to playing. `tail` keeps writing the fading input for 5 ms (not after MEMORY FULL). */
@@ -304,12 +345,37 @@ export class Track {
     this.host.audioChanged();
   }
 
+  /** Stop at once without a click: the release voice fades out what was playing over 5 ms. */
+  private cutToStopped(dir: 1 | -1): void {
+    this.startRelease(dir);
+    this.toStopped();
+  }
+
+  /**
+   * Start the release voice at the playhead (the next frame that would have played), at the track's current fade
+   * gain. A release still running from a cut under 5 ms ago is replaced (a negligible overlap).
+   */
+  private startRelease(dir: 1 | -1): void {
+    const rel = this.rel;
+    rel.pos = this.playhead;
+    rel.dir = dir;
+    rel.left = this.host.xfade;
+    rel.gain = this.env.value * this.mute.value * this.attack.value;
+  }
+
+  /** Ramp the output in from silence over 5 ms. */
+  private rampIn(): void {
+    this.attack.set(0);
+    this.attack.start(1, this.host.xfade);
+  }
+
   private toStopped(): void {
     this._state = 'stopped';
     this.stopping = null;
     this.playhead = 0;
     this.env.set(1);
     this.mute.set(1);
+    this.attack.set(1);
   }
 
   /** Release the take for a fresh one and return to empty, cancelling everything in flight. */
@@ -322,8 +388,10 @@ export class Track {
     this.playhead = 0;
     this.env.set(1);
     this.mute.set(1);
+    this.attack.set(1);
     this.recTail.left = 0;
     this.dubTail.left = 0;
+    this.rel.left = 0; // the take it read is gone (a clear cuts hard)
   }
 
   /** Where playback (re)starts: the first frame, or the last in REVERSE. */
@@ -358,24 +426,29 @@ export class Track {
         continue;
       }
       const sounding = this._state === 'playing' || this._state === 'overdubbing';
-      if (!sounding && this.recTail.left === 0 && this.dubTail.left === 0) {
+      if (!sounding && this.rel.left === 0 && this.recTail.left === 0 && this.dubTail.left === 0) {
         outL.fill(0, a, to);
         outR.fill(0, a, to);
         return;
       }
       const dir = this.direction();
       const m = this.stepLength(to - a, sounding, dir);
+      const relN = Math.min(m, this.rel.left);
+      // Reads first (the output is the audio before this step's writes)...
       if (sounding) this.readPlayback(m, dir);
-      if (this._state === 'overdubbing') this.writePass(inL, inR, a, m);
+      if (relN > 0) this.readRelease(relN);
+      // ...then the tails, then the pass. A recording's seam crossfade must land before a REC->DUB pass adds to the
+      // same frames, or it would scale the overdub layer down.
       if (this.recTail.left > 0) this.writeTail(this.recTail, inL, inR, a, m);
       if (this.dubTail.left > 0) this.writeTail(this.dubTail, inL, inR, a, m);
-      if (sounding) {
-        this.emit(outL, outR, a, m);
-        this.advance(m, dir);
+      if (this._state === 'overdubbing') this.writePass(inL, inR, a, m);
+      if (sounding || relN > 0) {
+        this.emit(outL, outR, a, m, sounding, relN);
       } else {
         outL.fill(0, a, a + m);
         outR.fill(0, a, a + m);
       }
+      if (sounding) this.advance(m, dir);
       a += m;
     }
   }
@@ -421,8 +494,32 @@ export class Track {
       this._take.read(this.playhead, this.rawL, this.rawR, 0, m);
     } else {
       this._take.read(this.playhead - m + 1, this.rawL, this.rawR, 0, m);
-      reverseInPlace(this.rawL, m);
-      reverseInPlace(this.rawR, m);
+      reverseInPlace(this.rawL, 0, m);
+      reverseInPlace(this.rawR, 0, m);
+    }
+  }
+
+  /** The release voice's next `n` frames into `relL`/`relR`, in play order, wrapping at the loop ends. */
+  private readRelease(n: number): void {
+    const rel = this.rel;
+    const len = this._take.length;
+    let k = 0;
+    while (k < n) {
+      if (rel.dir > 0) {
+        const piece = Math.min(n - k, len - rel.pos);
+        this._take.read(rel.pos, this.relL, this.relR, k, piece);
+        rel.pos += piece;
+        if (rel.pos >= len) rel.pos = 0;
+        k += piece;
+      } else {
+        const piece = Math.min(n - k, rel.pos + 1);
+        this._take.read(rel.pos - piece + 1, this.relL, this.relR, k, piece);
+        reverseInPlace(this.relL, k, piece);
+        reverseInPlace(this.relR, k, piece);
+        rel.pos -= piece;
+        if (rel.pos < 0) rel.pos = len - 1;
+        k += piece;
+      }
     }
   }
 
@@ -430,13 +527,15 @@ export class Track {
   private writePass(inL: Float32Array, inR: Float32Array, a: number, m: number): void {
     const xf = this.host.xfade;
     const j0 = this.passFrames;
-    const { rawL, rawR, srcL, srcR } = this;
+    const { srcL, srcR, tmpL, tmpR } = this;
     const replace = this.passMode !== 'OVERDUB';
     if (replace) {
+      // The audio being replaced as it is now, after any tail written this step.
+      this._take.read(this.playhead, tmpL, tmpR, 0, m);
       for (let k = 0; k < m; k++) {
         const g = punchInGain(j0 + k, xf);
-        srcL[k] = rawL[k] * (1 - g) + inL[a + k] * g;
-        srcR[k] = rawR[k] * (1 - g) + inR[a + k] * g;
+        srcL[k] = tmpL[k] * (1 - g) + inL[a + k] * g;
+        srcR[k] = tmpR[k] * (1 - g) + inR[a + k] * g;
       }
     } else {
       for (let k = 0; k < m; k++) {
@@ -486,8 +585,11 @@ export class Track {
     }
   }
 
-  /** The step's output: raw audio x PLAY LEVEL x PAN x start/stop fade x REPLACE2 mute. */
-  private emit(outL: Float32Array, outR: Float32Array, a: number, m: number): void {
+  /**
+   * The step's output: (playback x start/stop fade x REPLACE2 mute x ramp-in, plus the release voice for its first
+   * `relN` frames) x PLAY LEVEL x PAN.
+   */
+  private emit(outL: Float32Array, outR: Float32Array, a: number, m: number, sounding: boolean, relN: number): void {
     const cfg = this.cfg;
     const level = cfg.playLevel / 100; // INFERRED: linear, 100 = unity, 200 = x2
     // INFERRED: a balance law, unity at CENTER (a mono input recorded in the center plays back at the level it went
@@ -495,12 +597,26 @@ export class Track {
     const pan = cfg.pan;
     const gl = level * (pan > 0 ? 1 - pan / 50 : 1);
     const gr = level * (pan < 0 ? 1 + pan / 50 : 1);
-    const { rawL, rawR, env, mute } = this;
+    const { rawL, rawR, relL, relR, env, mute, attack, rel } = this;
+    const xf = this.host.xfade;
+    const relGain = rel.gain;
+    const relLeft = rel.left;
     let peak = this.peakAbs;
     for (let k = 0; k < m; k++) {
-      const g = env.next() * mute.next();
-      const l = rawL[k] * g * gl;
-      const r = rawR[k] * g * gr;
+      let l = 0;
+      let r = 0;
+      if (sounding) {
+        const g = env.next() * mute.next() * attack.next();
+        l = rawL[k] * g;
+        r = rawR[k] * g;
+      }
+      if (k < relN) {
+        const g = relGain * punchOutGain(relLeft - k, xf);
+        l += relL[k] * g;
+        r += relR[k] * g;
+      }
+      l *= gl;
+      r *= gr;
       outL[a + k] = l;
       outR[a + k] = r;
       const al = l < 0 ? -l : l;
@@ -509,6 +625,7 @@ export class Track {
       if (ar > peak) peak = ar;
     }
     this.peakAbs = peak;
+    rel.left = relLeft - relN;
   }
 
   /** Move the playhead `m` frames on; handle the loop end (wrap, 1SHOT end, LOOP stop) and the end of a FADE stop. */
@@ -518,6 +635,9 @@ export class Track {
     if (this.playhead >= len || this.playhead < 0) {
       this.playhead = dir > 0 ? 0 : len - 1;
       if (this.cfg.oneShot || this.stopping === 'LOOP') {
+        // The release runs on from the wrapped position: the seam crossfade made it the loop end's continuation.
+        // (INFERRED: the 5 ms ramp follows the loop end rather than taking the loop's last 5 ms.)
+        this.startRelease(dir);
         if (this._state === 'overdubbing') this.endPass(true);
         this.toStopped();
         return;
