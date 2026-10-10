@@ -123,25 +123,35 @@ describe('QUANTIZE MEASURE with the rhythm on', () => {
 });
 
 describe('a late end press with REC->DUB', () => {
-  it.each(['OVERDUB', 'REPLACE1'] as const)(
-    '%s: a press inside the 5 ms crossfade carries the seam on, so the loop matches an on-time press from there',
-    (dubMode) => {
-      const take = (press: number) => {
-        const core = makeCore({ rec: { recAction: 'REC->DUB' }, track: [{ loopSyncSw: true, dubMode }] });
-        rhythmOn(core);
-        at(core, 0, recPlay(), ramp);
-        at(core, press, recPlay(), ramp); // ends the recording (4000 frames) and starts the pass
-        expect(trk(core).state).toBe('overdubbing');
-        at(core, 5000, recPlay(), ramp); // ends the pass at position 1000 in both
-        run(core, 10, ramp);
-        return core.getTrackAudio(0)!.L;
-      };
-      const exact = take(4000);
-      const late = take(4002);
-      // Positions 0 and 1 went by before the late press, so only those differ (they have no overdub layer).
-      expect(late.subarray(2)).toEqual(exact.subarray(2));
-    },
-  );
+  /** The take after recording 0 -> 4000 (rhythm on), ending at `press`, and overdubbing until 5000. */
+  const takeAfter = (dubMode: 'OVERDUB' | 'REPLACE1' | 'REPLACE2', press: number): Float32Array => {
+    const core = makeCore({ rec: { recAction: 'REC->DUB' }, track: [{ loopSyncSw: true, dubMode }] });
+    rhythmOn(core);
+    at(core, 0, recPlay(), ramp);
+    at(core, press, recPlay(), ramp); // ends the recording (4000 frames) and starts the pass
+    expect(trk(core).state).toBe('overdubbing');
+    expect(trk(core).lengthFrames).toBe(4000);
+    at(core, 5000, recPlay(), ramp); // ends the pass at position 1000 in both
+    run(core, 10, ramp);
+    return core.getTrackAudio(0)!.L;
+  };
+
+  it.each([
+    ['OVERDUB', 2], // inside the 5 ms seam crossfade
+    ['REPLACE1', 2],
+    ['REPLACE2', 2],
+    ['OVERDUB', 100], // past it: the performer's input from the line to the press must still be dubbed in
+    ['REPLACE1', 100],
+    ['REPLACE2', 100],
+  ] as const)('%s, %i frames late: the loop is sample-for-sample the on-time one', (dubMode, late) => {
+    expect(takeAfter(dubMode, 4000 + late)).toEqual(takeAfter(dubMode, 4000));
+  });
+
+  it('the overshoot is dubbed in by the pass rules: OVERDUB adds it, REPLACE writes it', () => {
+    // Position 50: recorded at frame 50, and the input at the line + 50 is 4050.
+    expect(takeAfter('OVERDUB', 4100)[50]).toBe(50 + 4050);
+    expect(takeAfter('REPLACE1', 4100)[50]).toBe(4050);
+  });
 });
 
 describe('the first synced recording with no tempo reference', () => {
@@ -374,5 +384,17 @@ describe('SYNC ADJUST (LOOP SYNC MODE IMMEDIATE restarts)', () => {
     const { core, position: got } = restart(frame, adjust);
     expect(got).toBeCloseTo(position, 6);
     expect(run(core, 20).tracks[0][10]).toBe(position + 10);
+  });
+
+  it('SYNC ADJUST applies only with SPEED CHANGE IMMEDIATE (guide p.4); with LOOP END the restart is from the start', () => {
+    const core = makeCore({ track: [{ loopSyncSw: true }], play: { syncAdjust: 'MEASURE', speedChange: 'LOOP END' } });
+    rhythmOn(core);
+    at(core, 0, recPlay(), ramp);
+    at(core, 8000, recPlay(), ramp);
+    at(core, 9000, stop(), ramp);
+    at(core, 16300, recPlay()); // 300 frames after a phrase line: would snap with SPEED CHANGE IMMEDIATE
+    expect(trk(core).state).toBe('playing');
+    expect(trk(core).position).toBe(0);
+    expect(run(core, 20).tracks[0][10]).toBe(10);
   });
 });

@@ -329,6 +329,7 @@ export class Track implements SyncTrack {
    * states are left alone.
    */
   interrupt(): void {
+    this.arm.action = null; // an armed action would fire on a stale line when audio resumes
     if (this._state === 'recording') this.forceFinish();
     else if (this._state === 'overdubbing') this.endPass(true);
   }
@@ -466,9 +467,10 @@ export class Track implements SyncTrack {
   /**
    * Make the first `T` frames of the recording the loop, `measures` long, and move on to `next`.
    *
-   * Frames recorded past `T` (a late press, or a trim) are the input that followed the loop end. Their first 5 ms are
-   * crossfaded into the loop start, exactly as the live input is after an on-time press, and the rest are dropped.
-   * Playback then picks up where the loop has got to since `T`, so it is in step with the grid at once.
+   * Frames recorded past `T` (a late press, or a trim) are the input that followed the loop end, so they get exactly
+   * what an on-time press would have done with that input: their first 5 ms are crossfaded into the loop start (the
+   * seam), and with REC->DUB the pass dubs all of them onto the loop start by its DUB MODE rules. Then they are
+   * dropped, and playback (and the pass) pick up where the loop has got to since `T`, in step with the grid at once.
    */
   private closeLoop(T: number, next: EndAction, measures: number | null): void {
     const take = this._take;
@@ -476,7 +478,6 @@ export class Track implements SyncTrack {
     const over = take.length - T;
     const baked = Math.min(xf, over);
     if (baked > 0) this.bakeSeam(T, baked);
-    if (over > 0) take.truncate(T);
     // The rest of the seam crossfade comes from the live input.
     this.recTail.pos = baked;
     this.recTail.left = xf - baked;
@@ -487,6 +488,7 @@ export class Track implements SyncTrack {
     this._recordedTempo = this.host.transport.bpm;
     this.host.audioChanged();
     if (next === 'stop') {
+      if (over > 0) take.truncate(T);
       this.toStopped();
       return;
     }
@@ -497,10 +499,40 @@ export class Track implements SyncTrack {
     this.env.set(1);
     this.mute.set(1);
     this.rampIn();
+    // REC->DUB on a REVERSE or 1SHOT track, which cannot overdub, ends in playback (INFERRED).
+    if (next === 'dub' && this.canDub()) {
+      // The pass as it would have run from the line: from position 0, under the seam crossfade. An OVERDUB pass ramps
+      // in with the seam (the two input gains sum to 1); a REPLACE pass writes the input at full gain, since the seam
+      // already fades it in over the old audio (a second ramp would dip the level by 1 - u + u^2).
+      this.beginPass(true, this.cfg.dubMode === 'OVERDUB' ? 0 : xf);
+      if (over > 0) this.dubOvershoot(T, over);
+    }
+    if (over > 0) take.truncate(T);
     const into = over % T;
     this.playhead = this.cfg.reverse ? T - 1 - into : into;
-    // REC->DUB on a REVERSE or 1SHOT track, which cannot overdub, ends in playback (INFERRED).
-    if (next === 'dub' && !this.cfg.reverse && !this.cfg.oneShot) this.beginPass(true);
+  }
+
+  /**
+   * A late REC->DUB end press: run the pass over the loop positions `[0, over)` with the recorded overshoot
+   * (`take[T, T + over)`) as its input, as it would have run live from the line, wrapping at `T`. `passFrames` carries
+   * on from there, so the live pass continues the same ramp.
+   */
+  private dubOvershoot(T: number, over: number): void {
+    const { rawL, rawR } = this;
+    let k = 0;
+    while (k < over && this._state === 'overdubbing') {
+      const pos = k % T;
+      const m = Math.min(STEP, over - k, T - pos);
+      this._take.read(T + k, rawL, rawR, 0, m);
+      this.playhead = pos;
+      this.writePass(rawL, rawR, 0, m);
+      k += m;
+    }
+  }
+
+  /** Whether the track can overdub at all: REVERSE and 1SHOT tracks cannot. */
+  private canDub(): boolean {
+    return !this.cfg.reverse && !this.cfg.oneShot;
   }
 
   /** Crossfade `take[T, T + n)`, the audio just after the loop end, into the loop's first `n` frames (n <= xfade). */
@@ -593,12 +625,14 @@ export class Track implements SyncTrack {
       else this.startPlayback(this.alignedPosition(now));
       return;
     }
-    // IMMEDIATE starts now. SYNC ADJUST: within one measure (or beat) of a phrase line, either side, the start snaps
-    // into step with it (INFERRED: at once, at the aligned position, rather than waiting for the line).
+    // IMMEDIATE starts now. SYNC ADJUST, which the guide gives only "When SPEED CHANGE is set to IMMEDIATE": within
+    // one measure (or beat) of a phrase line, either side, the start snaps into step with it (INFERRED: at once, at the
+    // aligned position, rather than waiting for the line).
+    const play = this.host.memory.play;
     const len = this._take.length;
     const off = phraseOffset(now, sync.origin, len);
-    const window = this.host.memory.play.syncAdjust === 'BEAT' ? sync.beat() : sync.measure();
-    const near = off <= window || len - off <= window;
+    const window = play.syncAdjust === 'BEAT' ? sync.beat() : sync.measure();
+    const near = play.speedChange === 'IMMEDIATE' && (off <= window || len - off <= window);
     this.startPlayback(near ? this.alignedPosition(now) : this.startPosition());
   }
 
@@ -665,18 +699,14 @@ export class Track implements SyncTrack {
 
   /**
    * Punch in at the playhead. The DUB MODE is fixed for the pass (INFERRED: a change applies from the next pass).
+   * `passFrames` is where the punch-in ramp starts (0: from silence; xfade or more: full gain at once).
    * `fromRecording`: the pass follows a recording, during which the track output nothing, so REPLACE2 is muted at once
-   * rather than ramped (it must never play the track). And where the recording's seam crossfade is still running under
-   * the playhead (it starts there, at `recTail.pos`), the pass carries it on rather than ramping in afresh: a REPLACE
-   * pass writes the input at full gain (a second ramp would dip the level by 1 - u + u^2), and an OVERDUB pass takes
-   * its ramp up where the seam has got to, so the two input gains still sum to 1 after a late end press.
+   * rather than ramped (it must never play the track).
    */
-  private beginPass(fromRecording: boolean): void {
+  private beginPass(fromRecording: boolean, passFrames = 0): void {
     this._state = 'overdubbing';
     this.passMode = this.cfg.dubMode;
-    const replace = this.passMode !== 'OVERDUB';
-    const seam = fromRecording && this.recTail.left > 0;
-    this.passFrames = !seam ? 0 : replace ? this.host.xfade : this.recTail.pos;
+    this.passFrames = passFrames;
     if (this.passMode === 'REPLACE2') {
       if (fromRecording) this.mute.set(0);
       else this.mute.start(0, this.host.xfade);
@@ -1072,8 +1102,11 @@ export class Track implements SyncTrack {
     this.peakAbs = 0;
     return {
       state: this._state,
-      // An armed start or recording, or the action a recording will end in once it reaches its line.
-      pending: this.arm.action ?? (this._state === 'recording' ? this.recEnd : null),
+      // An armed start or recording, or the action a recording will end in once it reaches its line (a REC->DUB end
+      // on a track that cannot overdub ends in playback, so it shows 'play').
+      pending:
+        this.arm.action ??
+        (this._state !== 'recording' ? null : this.recEnd === 'dub' && !this.canDub() ? 'play' : this.recEnd),
       stopping: this.stopping !== null,
       autoRecWaiting: false,
       // INFERRED: the playhead's place in the take, so it runs 1 -> 0 in REVERSE; 0 when not playing.

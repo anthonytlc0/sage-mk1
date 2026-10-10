@@ -5,9 +5,20 @@
 import { describe, expect, it } from 'vitest';
 import { at, clear, configure, dc, makeCore, ramp, recPlay, run, SR, stop, trk } from './harness';
 import type { LooperCore } from '../../src/core/looper';
+import { defaultMemory } from '../../src/schema/memory';
+import { defaultSystem } from '../../src/schema/system';
 
 const CHUNK_BYTES = SR * 2 * 4;
 const rhythmOn = (core: LooperCore): void => core.command({ t: 'rhythmStartStop' });
+
+/** Guide-default memory with track 1 synced (AUTO) and the given memory tempo, for a direct settings command. */
+function defaultMemoryWith(tempo: number) {
+  const m = defaultMemory();
+  m.tempo = tempo;
+  m.track[0].loopSyncSw = true;
+  m.track[0].measure = 'AUTO';
+  return m;
+}
 
 function runTo(core: LooperCore, frame: number, input?: (f: number) => number) {
   return run(core, frame - core.frame, input);
@@ -111,6 +122,82 @@ describe('an armed recording', () => {
     expect(core.status().rhythm).toBe('on');
     rhythmOn(core);
     expect(core.status().rhythm).toBe('off');
+  });
+});
+
+describe('interrupt', () => {
+  it('cancels an armed recording, so it cannot start on a stale line when audio resumes', () => {
+    const core = armed();
+    at(core, 1000, { t: 'interrupt' });
+    expect(trk(core).pending).toBeNull();
+    runTo(core, 4000, dc(0.5));
+    expect(trk(core).state).toBe('empty');
+    expect(trk(core).lengthFrames).toBe(0);
+  });
+
+  it('cancels an armed start', () => {
+    const core = makeCore({ track: [{ loopSyncSw: true }, { loopSyncSw: true, loopSyncMode: 'MEASURE' }] });
+    at(core, 0, recPlay(0), dc(0.5));
+    at(core, 4000, recPlay(0), dc(0.5));
+    const L = new Float32Array(2000).fill(0.25);
+    core.setTrackAudio(1, { L, R: L, sampleRate: SR, recordedTempo: 120, measures: 1 });
+    at(core, 4500, recPlay(1));
+    expect(trk(core, 1).pending).toBe('play');
+    at(core, 5000, { t: 'interrupt' });
+    expect(trk(core, 1).pending).toBeNull();
+    runTo(core, 7000);
+    expect(trk(core, 1).state).toBe('stopped');
+  });
+});
+
+describe('pending for a REC->DUB end on a track that cannot overdub', () => {
+  it.each([['REVERSE', { reverse: true }], ['1SHOT', { oneShot: true }]] as const)(
+    '%s: a waiting end press shows pending play, which is what it ends in',
+    (_name, flags) => {
+      const core = makeCore({ rec: { recAction: 'REC->DUB' }, track: [{ loopSyncSw: true, ...flags }] });
+      rhythmOn(core);
+      at(core, 500, recPlay(), dc(0.5));
+      at(core, 3000, recPlay(), dc(0.5)); // snaps to 1 measure: waits for 4000
+      expect(trk(core).pending).toBe('play');
+      runTo(core, 4000, dc(0.5));
+      expect(trk(core).state).toBe('playing');
+    },
+  );
+
+  it('an ordinary track still shows pending dub', () => {
+    const core = makeCore({ rec: { recAction: 'REC->DUB' }, track: [{ loopSyncSw: true }] });
+    rhythmOn(core);
+    at(core, 500, recPlay(), dc(0.5));
+    at(core, 3000, recPlay(), dc(0.5));
+    expect(trk(core).pending).toBe('dub');
+  });
+});
+
+describe('settings pushes and the derived tempo (ruling R31)', () => {
+  /** Track 1 synced AUTO, recorded 0 -> 3737 with no reference: 2 measures, tempo 480000 / 3737 = 128.4453 bpm. */
+  function derived(): LooperCore {
+    const core = makeCore({ track: [{ loopSyncSw: true, measure: 'AUTO' }] });
+    at(core, 0, recPlay(), dc(0.5));
+    at(core, 3737, recPlay(), dc(0.5));
+    expect(core.status().tempo).toBeCloseTo(128.4453, 4);
+    return core;
+  }
+
+  it('a push of the memory tempo at its 0.1 step (128.4) keeps the derived 128.4453', () => {
+    const core = derived();
+    configure(core, { tempo: 128.4 });
+    expect(core.status().tempo).toBe(480000 / 3737);
+    core.command({ t: 'settings', memory: structuredClone(defaultMemoryWith(128.4)), system: defaultSystem() });
+    expect(core.status().tempo).toBe(480000 / 3737);
+  });
+
+  it('a push of a different tempo (130.0) still retimes, keeping the musical position', () => {
+    const core = derived();
+    runTo(core, 4500, dc(0.5));
+    const phase = core.status().measurePhase;
+    configure(core, { tempo: 130 });
+    expect(core.status().tempo).toBe(130);
+    expect(core.status().measurePhase).toBeCloseTo(phase, 9);
   });
 });
 

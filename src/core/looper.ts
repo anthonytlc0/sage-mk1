@@ -105,8 +105,11 @@ export class LooperCore {
 
   /**
    * Take new settings. Tracks read them live; the tempo and beat go to the transport, keeping the musical position.
-   * The memory tempo is applied every time, so after a recording sets the tempo the caller must copy `status().tempo`
-   * into the memory it sends, or the next settings push puts the old tempo back.
+   *
+   * The memory stores the tempo at 0.1 BPM, so a derived tempo (128.4453 from a first synced loop) comes back in later
+   * pushes as 128.4. A memory tempo within 0.05 of the transport tempo rounded to 0.1 is that same tempo and is not
+   * re-applied (controller ruling R31); any other value is a real change and is applied. The caller should still copy
+   * `status().tempo` into the memory it sends, or a stale memory tempo puts the old tempo back.
    */
   setSettings(memory: MemorySettings, system: SystemSettings): void {
     this.applySettings(memory, system, this._frame);
@@ -283,6 +286,10 @@ export class LooperCore {
 
   /** The memory tempo and beat, applied at `frame` without moving the musical position (armed actions follow). */
   private applyTransportSettings(frame: number): void {
-    this.sync.retime(this.memory.tempo, this.memory.rhythm.beat, frame);
+    const bpm = this.transport.bpm;
+    const tempo = this.memory.tempo;
+    // R31: the transport's own tempo at the memory's 0.1 BPM step is not a change.
+    const same = Math.abs(tempo - Math.round(bpm * 10) / 10) < 0.05;
+    this.sync.retime(same ? bpm : tempo, this.memory.rhythm.beat, frame);
   }
 }
