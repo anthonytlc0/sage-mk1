@@ -88,6 +88,16 @@ export class MemoryStore {
     });
   }
 
+  /**
+   * Whether the slot holds a recorded phrase (WRITE's NOT EMPTY check). Reads only the slot record's track metadata,
+   * never the audio chunks, so it costs no audio RAM. False for a slot that was never saved or holds only settings.
+   */
+  async hasAudio(slot: number): Promise<boolean> {
+    checkSlot(slot);
+    const rec = await reqP<MemoryRecord | undefined>(this.db.transaction(MEMORIES, 'readonly').objectStore(MEMORIES).get(slot));
+    return rec !== undefined && rec.tracks.some((t) => t !== null);
+  }
+
   async isEmpty(slot: number): Promise<boolean> {
     checkSlot(slot);
     return (await reqP(this.db.transaction(MEMORIES, 'readonly').objectStore(MEMORIES).count(slot))) === 0;
