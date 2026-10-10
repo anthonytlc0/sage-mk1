@@ -32,6 +32,7 @@ import { MEMORY_PARAMS, defaultMemory } from './memory';
 import { SYSTEM_PARAMS, defaultSystem } from './system';
 import { parseBeat } from './format';
 import { reconcile } from './reconcile';
+import type { AcceptVerdict } from './reconcile';
 import { NOTE_VALUES } from './types';
 import type { MemorySettings, ParamDef, SystemSettings } from './types';
 
@@ -39,7 +40,7 @@ export { MEMORY_PARAMS, defaultMemory } from './memory';
 export { SYSTEM_PARAMS, defaultSystem } from './system';
 export { concreteIds, TRACK_INDICES } from './define';
 export { reconcile } from './reconcile';
-export type { ReconcileOptions } from './reconcile';
+export type { AcceptVerdict, ReconcileOptions } from './reconcile';
 export {
   PANEL_FUNCTIONS, CTL_FUNCTIONS, EXP_FUNCTIONS, KNOB_FUNCS, ASSIGN_SOURCES, ASSIGN_TARGETS, expand,
 } from './functions';
@@ -197,21 +198,24 @@ function coerceBeat(d: ParamDef, v: unknown): unknown {
 // ---------------------------------------------------------------------------------------------------------------------
 
 /**
- * Params whose value can have more than one type: a number or a keyword (loopLength 'AUTO', master.comp 'OFF', loCut
- * 'FLAT', txCh 'RX CTL'), or a MEASURE / FADE TIME that is a keyword or a { note } / { measures } object. The type of
- * the default says nothing about these, so the schema decides.
+ * The schema's verdict on one stored leaf. Every leaf the schema defines goes through `coerce`, the same function
+ * `setParam` uses, so a stored value is exactly as valid as one the app could have set: numbers are rounded, snapped
+ * and clamped to the range, text is cut to its length, an unknown enum value or a wrong type is refused (the default is
+ * used), and a MEASURE / FADE TIME / BEAT object comes out with only its own keys. This matters because the settings
+ * of an imported `.sagemk1` file are untrusted.
+ *
+ * It also settles the params whose value can have more than one type, which the type of the default cannot: a number or
+ * a keyword (loopLength 'AUTO', master.comp 'OFF', loCut 'FLAT', txCh 'RX CTL') and a MEASURE / FADE TIME that is a
+ * keyword or a { note } / { measures } object.
+ *
+ * Nodes that are not schema leaves (groups, arrays, anything the schema does not know) return undefined and fall to
+ * the structural rules of `reconcile`.
  */
-function isPolymorphic(d: ParamDef): boolean {
-  if (d.kind === 'note') return true;
-  return (d.kind === 'int' || d.kind === 'float') && ((d.values?.length ?? 0) > 0 || (d.choices?.some((c) => typeof c === 'string') ?? false));
-}
-
-function acceptPolymorphic(path: readonly string[], stored: unknown): boolean | undefined {
+function acceptSchema(path: readonly string[], stored: unknown): AcceptVerdict {
   const hit = findParam(path.join('.'));
-  if (!hit || !isPolymorphic(hit.def)) return undefined;
+  if (!hit) return undefined;
   try {
-    coerce(hit.def, stored);
-    return true;
+    return { value: coerce(hit.def, stored) };
   } catch {
     return false;
   }
@@ -219,7 +223,7 @@ function acceptPolymorphic(path: readonly string[], stored: unknown): boolean | 
 
 /** Stored system settings completed and corrected against the current schema; the defaults when `stored` is absent. */
 export function reconcileSystem(stored: unknown): SystemSettings {
-  return reconcile(stored, defaultSystem(), { accept: acceptPolymorphic });
+  return reconcile(stored, defaultSystem(), { accept: acceptSchema });
 }
 
 /**
@@ -228,13 +232,13 @@ export function reconcileSystem(stored: unknown): SystemSettings {
  * matching group of the default system settings, and a group the system no longer has is dropped.
  */
 export function reconcileMemory(stored: unknown): MemorySettings {
-  const memory = reconcile(stored, defaultMemory(), { accept: acceptPolymorphic });
+  const memory = reconcile(stored, defaultMemory(), { accept: acceptSchema });
   const prefs = (stored as { prefs?: unknown } | null | undefined)?.prefs;
   if (prefs !== null && typeof prefs === 'object' && !Array.isArray(prefs)) {
     const groups = defaultSystem() as unknown as Record<string, unknown>;
     const known: Record<string, unknown> = {};
     for (const key of Object.keys(prefs)) if (Object.prototype.hasOwnProperty.call(groups, key)) known[key] = groups[key];
-    memory.prefs = reconcile(prefs, known, { accept: acceptPolymorphic }) as Partial<SystemSettings>;
+    memory.prefs = reconcile(prefs, known, { accept: acceptSchema }) as Partial<SystemSettings>;
   }
   return memory;
 }
