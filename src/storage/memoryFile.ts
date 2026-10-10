@@ -15,14 +15,17 @@
  *    wrong-typed values are corrected exactly as if they had been set through the schema;
  *  - a track's `memory.json` entry must be null (the track is absent, whatever `trackN.wav` holds) or well formed (a
  *    finite `recordedTempo`, clamped to the tempo range; `measures` null or a positive number; a `sampleRate` that is
- *    the WAV's own). The WAV must be stereo float32 / pcm16 / pcm24 with channels of equal length, at 8-384 kHz;
- *  - the zip is read with a filter: only the entries the format defines are inflated, JSON entries are capped, and the
- *    uncompressed sizes of the WAV entries are capped before anything is inflated (a zip bomb); sizes are taken from the
- *    archive and bound the inflate buffer, they are not trusted past that;
+ *    the WAV's own). The WAV must be stereo 32-bit float, the only format the app writes, at 8-384 kHz. It is judged
+ *    from its header before anything is decoded (pcm16 / pcm24 would decode to 2x / 1.33x their size, past the cap);
+ *  - the zip is read with a filter: only the entries the format defines are inflated, a name that appears twice is
+ *    refused, JSON entries are capped, and the uncompressed sizes of the WAV entries are capped before anything is
+ *    inflated (a zip bomb); sizes are taken from the archive and bound the inflate buffer, they are not trusted past that;
  *  - the decoded audio of the whole file (frames x 2 channels x 4 bytes, counted at the larger of the file's and the
- *    target rate, so a resample that grows a track counts as grown) may not exceed `MAX_DECODED_BYTES`, to keep a bad
- *    file from taking the iPad's memory down. A restore holds every memory in RAM, so a backup this big is also near what
- *    a tablet can load.
+ *    target rate, so a resample that grows a track counts as grown) may not exceed the cap, to keep a bad file from
+ *    taking the iPad's memory down. The cap is taken from the header's frame count and charged BEFORE `decodeWav`
+ *    allocates. It is `defaultMaxDecodedBytes()`: 384 MiB on a touch device (the iPad budget), 1 GiB elsewhere.
+ *    `packMemory` / `packBackup` enforce the same cap (`FileTooLarge`), so the app never writes a file its own unpack
+ *    would refuse. A restore holds every memory in RAM; restoring slot by slot would lift that limit.
  */
 
 import { strFromU8, strToU8, unzipSync, zipSync } from 'fflate';
@@ -34,6 +37,7 @@ import { TRACKS } from '../shared/ids';
 import type { TrackAudio } from '../shared/protocol';
 import { SLOT_COUNT } from './memoryStore';
 import { StreamingResampler } from './resample';
+import { isTouchDevice } from './share';
 import { decodeWav, encodeWav } from './wav';
 
 export const MEMORY_FORMAT = 'sage-mk1-memory';
@@ -41,8 +45,15 @@ export const BACKUP_FORMAT = 'sage-mk1-backup';
 /** The newest file version this build writes and reads. A newer file is refused rather than half understood. */
 export const FILE_VERSION = 1;
 
-/** Default cap on the decoded audio of one file: summed track frames x 2 channels x 4 bytes. */
+/** Cap on the decoded audio of one file on a desktop: summed track frames x 2 channels x 4 bytes. */
 export const MAX_DECODED_BYTES = 1024 * 1024 * 1024;
+/** The same cap on a touch device (iPad): the 384 MiB memory budget. */
+export const TOUCH_MAX_DECODED_BYTES = 384 * 1024 * 1024;
+/**
+ * Slack on the zip-bomb check of the WAV entries: it compares file bytes (frames x 8 plus a header, at most 495 entries)
+ * where the real cap compares frames x 8, so it must not trip on headers alone.
+ */
+const WAV_ENTRY_SLACK = 64 * 1024;
 /** Cap on one JSON entry (a real memory.json is about 3 kB, a backup.json about 8 kB). */
 export const MAX_JSON_BYTES = 2 * 1024 * 1024;
 /** Sample rates a track WAV may have. Anything else is not a recording this app made (and would resample to absurd sizes). */
@@ -51,6 +62,11 @@ export const MAX_FILE_RATE = 384000;
 
 const BYTES_PER_FRAME = 2 * 4;
 const RESAMPLE_BLOCK = 65536;
+
+/** The cap on decoded audio for this device: `TOUCH_MAX_DECODED_BYTES` when `maxTouchPoints > 1`, else `MAX_DECODED_BYTES`. */
+export function defaultMaxDecodedBytes(nav: { maxTouchPoints?: number } | undefined = globalThis.navigator): number {
+  return isTouchDevice(nav) ? TOUCH_MAX_DECODED_BYTES : MAX_DECODED_BYTES;
+}
 
 /** The file is not a memory file / backup this build can read. The LCD shows UNSUPPORTED FILE; `reason` says why. */
 export class UnsupportedFile extends Error {
@@ -74,10 +90,29 @@ export interface BackupContents {
   memories: (MemoryContents | null)[];
 }
 
-export interface UnpackOptions {
-  /** Overrides `MAX_DECODED_BYTES` (tests; a device with less memory). */
-  maxDecodedBytes?: number;
+/** The file is bigger than this device can hold, so `packMemory` / `packBackup` will not write it. */
+export class FileTooLarge extends Error {
+  constructor(
+    /** Decoded audio of the file: summed frames x 8 bytes. */
+    readonly bytes: number,
+    /** The cap it exceeded. */
+    readonly limit: number,
+  ) {
+    super('FILE TOO LARGE');
+    this.name = 'FileTooLarge';
+  }
 }
+
+export interface SizeOptions {
+  /** The cap on decoded audio. Default: `defaultMaxDecodedBytes(nav)`. */
+  maxDecodedBytes?: number;
+  /** What to read `maxTouchPoints` from for the default cap. Default: the global `navigator`. */
+  nav?: { maxTouchPoints?: number };
+}
+export type UnpackOptions = SizeOptions;
+export type PackOptions = SizeOptions;
+
+const capFor = (options: SizeOptions): number => options.maxDecodedBytes ?? defaultMaxDecodedBytes(options.nav);
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Writing
@@ -97,7 +132,9 @@ function memoryFiles(prefix: string, settings: MemorySettings, tracks: (TrackAud
     if (!Number.isFinite(t.sampleRate) || t.sampleRate < MIN_FILE_RATE || t.sampleRate > MAX_FILE_RATE) {
       throw new RangeError(`track ${i + 1}: sample rate ${t.sampleRate} is outside ${MIN_FILE_RATE}-${MAX_FILE_RATE}`);
     }
-    if (!Number.isFinite(t.recordedTempo)) throw new RangeError(`track ${i + 1}: recorded tempo is not a number`);
+    if (!Number.isFinite(t.recordedTempo) || t.recordedTempo < TEMPO_MIN || t.recordedTempo > TEMPO_MAX) {
+      throw new RangeError(`track ${i + 1}: recorded tempo ${t.recordedTempo} is outside ${TEMPO_MIN}-${TEMPO_MAX}`);
+    }
     if (t.measures !== null && !(Number.isFinite(t.measures) && t.measures > 0)) {
       throw new RangeError(`track ${i + 1}: measures must be null or a positive number`);
     }
@@ -108,17 +145,31 @@ function memoryFiles(prefix: string, settings: MemorySettings, tracks: (TrackAud
   return { [`${prefix}memory.json`]: [jsonBytes(doc), { level: 6 }], ...wavs };
 }
 
-/** Packs one memory (settings and up to 5 tracks) as the bytes of a `.sagemk1` file. */
-export function packMemory(settings: MemorySettings, tracks: (TrackAudio | null)[]): Uint8Array {
+/** Throws `FileTooLarge` when the tracks' summed frames x 8 bytes exceed the cap (at the rate they are written at). */
+function checkPackSize(memories: (readonly (TrackAudio | null)[])[], options: PackOptions): void {
+  const limit = capFor(options);
+  let bytes = 0;
+  for (const tracks of memories) for (const t of tracks) if (t) bytes += t.L.length * BYTES_PER_FRAME;
+  if (bytes > limit) throw new FileTooLarge(bytes, limit);
+}
+
+/**
+ * Packs one memory (settings and up to 5 tracks) as the bytes of a `.sagemk1` file.
+ * Throws `FileTooLarge` when the audio is more than `unpackMemory` would accept on this device.
+ */
+export function packMemory(settings: MemorySettings, tracks: (TrackAudio | null)[], options: PackOptions = {}): Uint8Array {
+  checkPackSize([tracks], options);
   return zipSync(memoryFiles('', settings, tracks));
 }
 
 /**
  * Packs a backup: `memories[i]` is slot i + 1 (null = an empty slot) and there are at most 99.
  * `backup.json` lists every slot given, so a restore can tell an empty slot from one past the end.
+ * Throws `FileTooLarge` when the audio of all memories together is more than `unpackBackup` would accept on this device.
  */
-export function packBackup(memories: (MemoryContents | null)[], system: SystemSettings): Uint8Array {
+export function packBackup(memories: (MemoryContents | null)[], system: SystemSettings, options: PackOptions = {}): Uint8Array {
   if (memories.length > SLOT_COUNT) throw new RangeError(`at most ${SLOT_COUNT} memories, got ${memories.length}`);
+  checkPackSize(memories.map((m) => m?.tracks ?? []), options);
   const files: Zippable = {};
   const slots = memories.map((m, i) => {
     if (m) Object.assign(files, memoryFiles(`m${pad2(i + 1)}/`, m.settings, m.tracks));
@@ -144,10 +195,17 @@ function checkTargetRate(rate: number): void {
  * Unzips only the entries `kindOf` names. Entries it does not name are neither inflated nor kept. The sizes come from
  * the archive's directory: they are checked before anything is inflated, and fflate inflates into a buffer of exactly
  * the declared size, so an entry that claims to be small cannot expand past its claim.
+ *
+ * A name that appears twice anywhere in the archive is refused: no zip tool writes one, which entry should win is
+ * ambiguous, and thousands of copies of one name would each be inflated. fflate calls the filter for an entry just
+ * before inflating it, so the second copy is refused before it costs anything.
  */
 function unzipEntries(bytes: Uint8Array, kindOf: (name: string) => Kind | null, maxWavBytes: number): Record<string, Uint8Array> {
   let wavBytes = 0;
+  const seen = new Set<string>();
   const filter = (file: UnzipFileInfo): boolean => {
+    if (seen.has(file.name)) throw new UnsupportedFile(`${file.name} appears twice in the archive`);
+    seen.add(file.name);
     const kind = kindOf(file.name);
     if (!kind) return false;
     const size = Math.max(file.originalSize, file.size);
@@ -242,24 +300,84 @@ function resample(L: Float32Array, R: Float32Array, from: number, to: number): [
   return [concat(outL), concat(outR)];
 }
 
+/** What a WAV header says about its audio; see `peekWav`. */
+interface WavInfo {
+  tag: number;
+  channels: number;
+  bits: number;
+  sr: number;
+  /** Frames `decodeWav` will return per channel. */
+  frames: number;
+}
+
+const WAV_FORMAT_IEEE_FLOAT = 3;
+const WAV_FORMAT_EXTENSIBLE = 0xfffe;
+
+const tagAt = (v: DataView, off: number): string =>
+  String.fromCharCode(v.getUint8(off), v.getUint8(off + 1), v.getUint8(off + 2), v.getUint8(off + 3));
+
+/**
+ * Reads format, channel count, rate, bit depth and frame count from a WAV's header without decoding it, walking the
+ * chunks exactly as `decodeWav` does (last `fmt ` before the first `data`, odd chunks padded, a data chunk cut short by
+ * the end of the file counts as what is there), so the frame count is the one `decodeWav` will allocate for.
+ */
+function peekWav(bytes: Uint8Array, n: number): WavInfo {
+  const bad = (what: string) => new UnsupportedFile(`track ${n}: ${what}`);
+  const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (bytes.length < 12 || tagAt(v, 0) !== 'RIFF' || tagAt(v, 8) !== 'WAVE') throw bad('not a RIFF/WAVE file');
+  let fmt: { tag: number; channels: number; bits: number; sr: number } | null = null;
+  let dataLen = -1;
+  let off = 12;
+  while (off + 8 <= bytes.length) {
+    const id = tagAt(v, off);
+    const size = v.getUint32(off + 4, true);
+    const body = off + 8;
+    if (id === 'fmt ') {
+      const avail = Math.min(size, bytes.length - body);
+      if (avail < 16) throw bad('fmt chunk too short');
+      let tag = v.getUint16(body, true);
+      if (tag === WAV_FORMAT_EXTENSIBLE) {
+        if (avail < 26) throw bad('extensible fmt chunk too short');
+        tag = v.getUint16(body + 24, true);
+      }
+      fmt = { tag, channels: v.getUint16(body + 2, true), sr: v.getUint32(body + 4, true), bits: v.getUint16(body + 14, true) };
+    } else if (id === 'data') {
+      dataLen = Math.min(size, bytes.length - body);
+      break;
+    }
+    off = body + size + (size & 1);
+  }
+  if (!fmt) throw bad('no fmt chunk');
+  if (dataLen < 0) throw bad('no data chunk');
+  if (fmt.tag !== WAV_FORMAT_IEEE_FLOAT || fmt.bits !== 32) throw bad('the WAV is not 32-bit float');
+  if (fmt.channels !== 2) throw bad('the WAV is not stereo');
+  return { ...fmt, frames: Math.floor(dataLen / (4 * fmt.channels)) };
+}
+
+/**
+ * One track. Everything that can be judged from the header is, and the audio is charged to the budget, BEFORE
+ * `decodeWav` allocates anything. Only float32 passes: it decodes 1:1, so the header's frame count is the allocation.
+ */
 function readTrack(wav: Uint8Array, meta: TrackMeta, n: number, targetRate: number, budget: Budget): TrackAudio | null {
+  const { sr, frames } = peekWav(wav, n);
+  if (!Number.isInteger(sr) || sr < MIN_FILE_RATE || sr > MAX_FILE_RATE) throw new UnsupportedFile(`track ${n}: sample rate ${sr} is not supported`);
+  if (sr !== meta.sampleRate) throw new UnsupportedFile(`track ${n}: the WAV rate ${sr} disagrees with memory.json (${meta.sampleRate})`);
+  if (frames === 0) return null;
+
+  const outFrames = sr === targetRate ? frames : Math.ceil((frames * targetRate) / sr) + 1;
+  budget.take(Math.max(frames, outFrames) * BYTES_PER_FRAME);
+
   let decoded: ReturnType<typeof decodeWav>;
   try {
     decoded = decodeWav(wav);
   } catch (e) {
     throw new UnsupportedFile(`track ${n}: the WAV cannot be decoded`, { cause: e });
   }
-  const { sr, chs } = decoded;
+  const { chs } = decoded;
   if (chs.length !== 2) throw new UnsupportedFile(`track ${n}: the WAV is not stereo`);
   const [L, R] = chs as [Float32Array, Float32Array];
   if (L.length !== R.length) throw new UnsupportedFile(`track ${n}: the WAV channels differ in length`);
-  if (!Number.isInteger(sr) || sr < MIN_FILE_RATE || sr > MAX_FILE_RATE) throw new UnsupportedFile(`track ${n}: sample rate ${sr} is not supported`);
-  if (sr !== meta.sampleRate) throw new UnsupportedFile(`track ${n}: the WAV rate ${sr} disagrees with memory.json (${meta.sampleRate})`);
-  const frames = L.length;
-  if (frames === 0) return null;
-
-  const outFrames = sr === targetRate ? frames : Math.ceil((frames * targetRate) / sr) + 1;
-  budget.take(Math.max(frames, outFrames) * BYTES_PER_FRAME);
+  if (L.length !== frames) throw new UnsupportedFile(`track ${n}: the WAV decoded to ${L.length} frames, its header said ${frames}`);
 
   const [outL, outR] = sr === targetRate ? [L, R] : resample(L, R, sr, targetRate);
   return { L: outL, R: outR, sampleRate: targetRate, recordedTempo: meta.recordedTempo, measures: meta.measures };
@@ -275,8 +393,14 @@ function readMemory(doc: Record<string, unknown>, files: Record<string, Uint8Arr
     const raw: unknown = metas[i];
     if (raw === null || raw === undefined) return null; // no metadata: absent, whatever else the zip holds
     const meta = readMeta(raw, i + 1);
-    const wav = files[`${prefix}track${i + 1}.wav`];
-    return wav ? readTrack(wav, meta, i + 1, targetRate, budget) : null;
+    const name = `${prefix}track${i + 1}.wav`;
+    const wav = files[name];
+    if (!wav) return null;
+    try {
+      return readTrack(wav, meta, i + 1, targetRate, budget);
+    } finally {
+      delete files[name]; // the inflated bytes are dead once decoded: do not hold every WAV of a backup next to the audio
+    }
   });
   return { settings, tracks };
 }
@@ -292,8 +416,8 @@ const BACKUP_WAV = /^m(0[1-9]|[1-9]\d)\/track[1-5]\.wav$/;
  */
 export function unpackMemory(bytes: Uint8Array, targetRate: number, options: UnpackOptions = {}): MemoryContents {
   checkTargetRate(targetRate);
-  const cap = options.maxDecodedBytes ?? MAX_DECODED_BYTES;
-  const files = unzipEntries(bytes, (name) => (name === 'memory.json' ? 'json' : MEMORY_ENTRY.test(name) ? 'wav' : null), cap);
+  const cap = capFor(options);
+  const files = unzipEntries(bytes, (name) => (name === 'memory.json' ? 'json' : MEMORY_ENTRY.test(name) ? 'wav' : null), cap + WAV_ENTRY_SLACK);
   const doc = checkHeader(parseJson(files['memory.json'], 'memory.json'), MEMORY_FORMAT, 'memory.json');
   return readMemory(doc, files, '', targetRate, new Budget(cap));
 }
@@ -304,7 +428,7 @@ export function unpackMemory(bytes: Uint8Array, targetRate: number, options: Unp
  */
 export function unpackBackup(bytes: Uint8Array, targetRate: number, options: UnpackOptions = {}): BackupContents {
   checkTargetRate(targetRate);
-  const cap = options.maxDecodedBytes ?? MAX_DECODED_BYTES;
+  const cap = capFor(options);
 
   const index = unzipEntries(bytes, (name) => (name === 'backup.json' ? 'json' : null), cap);
   const doc = checkHeader(parseJson(index['backup.json'], 'backup.json'), BACKUP_FORMAT, 'backup.json');
@@ -331,7 +455,7 @@ export function unpackBackup(bytes: Uint8Array, targetRate: number, options: Unp
       if (!wanted.has(folder)) return null;
       return BACKUP_JSON.test(name) ? 'json' : BACKUP_WAV.test(name) ? 'wav' : null;
     },
-    cap,
+    cap + WAV_ENTRY_SLACK,
   );
 
   const budget = new Budget(cap);
@@ -339,6 +463,7 @@ export function unpackBackup(bytes: Uint8Array, targetRate: number, options: Unp
   for (const slot of present) {
     const prefix = `m${pad2(slot)}/`;
     const memDoc = checkHeader(parseJson(files[`${prefix}memory.json`], `${prefix}memory.json`), MEMORY_FORMAT, `${prefix}memory.json`);
+    delete files[`${prefix}memory.json`];
     memories[slot - 1] = readMemory(memDoc, files, prefix, targetRate, budget);
   }
   return { system, memories };

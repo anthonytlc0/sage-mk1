@@ -4,6 +4,8 @@ import { defaultMemory, defaultSystem } from '../../src/schema/params';
 import type { MemorySettings } from '../../src/schema/types';
 import type { TrackAudio } from '../../src/shared/protocol';
 import {
+  FileTooLarge,
+  TOUCH_MAX_DECODED_BYTES,
   UnsupportedFile,
   packBackup,
   packMemory,
@@ -213,5 +215,70 @@ describe('packBackup / unpackBackup', () => {
     expect(() => unpackBackup(new Uint8Array([9, 9, 9]), 48000)).toThrow(UnsupportedFile);
     expect(() => unpackBackup(packMemory(defaultMemory(), []), 48000)).toThrow(UnsupportedFile);
     expect(() => unpackMemory(packBackup([], defaultSystem()), 48000)).toThrow(UnsupportedFile);
+  });
+});
+
+describe('pack-side limits', () => {
+  it('packMemory refuses a recorded tempo outside the 40-300 range or not finite (unpack would clamp it)', () => {
+    for (const recordedTempo of [39.9, 300.1, 0, -120, NaN, Infinity]) {
+      expect(() => packMemory(defaultMemory(), [track(10, 1, { recordedTempo })])).toThrow(RangeError);
+    }
+    expect(() => packBackup([{ settings: defaultMemory(), tracks: [track(10, 1, { recordedTempo: 500 })] }], defaultSystem())).toThrow(RangeError);
+  });
+
+  it('the ends of the tempo range round-trip exactly', () => {
+    for (const recordedTempo of [40, 300, 97.5]) {
+      const out = unpackMemory(packMemory(defaultMemory(), [track(10, 1, { recordedTempo })]), 48000);
+      expect(out.tracks[0]!.recordedTempo).toBe(recordedTempo);
+    }
+  });
+
+  it('packMemory throws FileTooLarge when the summed frames x 8 bytes exceed the cap, and writes a file unpack accepts at the cap', () => {
+    const one = [track(1000, 1)]; // 8000 bytes of audio
+    const file = packMemory(defaultMemory(), one, { maxDecodedBytes: 8000 });
+    expect(() => unpackMemory(file, 48000, { maxDecodedBytes: 8000 })).not.toThrow();
+    let caught: unknown;
+    try {
+      packMemory(defaultMemory(), one, { maxDecodedBytes: 7999 });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(FileTooLarge);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as FileTooLarge).name).toBe('FileTooLarge');
+    expect((caught as FileTooLarge).bytes).toBe(8000);
+    expect((caught as FileTooLarge).limit).toBe(7999);
+  });
+
+  it('packMemory sums the tracks', () => {
+    const two = [track(1000, 1), null, track(500, 2)]; // 12000 bytes
+    expect(() => packMemory(defaultMemory(), two, { maxDecodedBytes: 12000 })).not.toThrow();
+    expect(() => packMemory(defaultMemory(), two, { maxDecodedBytes: 11999 })).toThrow(FileTooLarge);
+  });
+
+  it('packBackup sums the tracks of all memories', () => {
+    const m = (n: number) => ({ settings: defaultMemory(), tracks: [track(n, n)] });
+    const memories = [m(1000), null, m(500)];
+    const file = packBackup(memories, defaultSystem(), { maxDecodedBytes: 12000 });
+    expect(() => unpackBackup(file, 48000, { maxDecodedBytes: 12000 })).not.toThrow();
+    expect(() => packBackup(memories, defaultSystem(), { maxDecodedBytes: 11999 })).toThrow(FileTooLarge);
+  });
+
+  it('empty tracks and an empty backup never trip it', () => {
+    expect(() => packMemory(defaultMemory(), [], { maxDecodedBytes: 0 })).not.toThrow();
+    expect(() => packBackup([], defaultSystem(), { maxDecodedBytes: 0 })).not.toThrow();
+  });
+
+  it('defaults to the device cap: 384 MiB on a touch device, so the app never writes what the iPad would refuse', () => {
+    // Zero-filled arrays are not touched, and the size check runs before anything is encoded.
+    const frames = TOUCH_MAX_DECODED_BYTES / 8 + 1;
+    const big: TrackAudio = { L: new Float32Array(frames), R: new Float32Array(frames), sampleRate: 48000, recordedTempo: 120, measures: null };
+    expect(() => packMemory(defaultMemory(), [big], { nav: { maxTouchPoints: 5 } })).toThrow(FileTooLarge);
+    expect(() => packBackup([{ settings: defaultMemory(), tracks: [big] }], defaultSystem(), { nav: { maxTouchPoints: 5 } })).toThrow(FileTooLarge);
+    try {
+      packMemory(defaultMemory(), [big], { nav: { maxTouchPoints: 5 } });
+    } catch (e) {
+      expect((e as FileTooLarge).limit).toBe(TOUCH_MAX_DECODED_BYTES);
+    }
   });
 });
