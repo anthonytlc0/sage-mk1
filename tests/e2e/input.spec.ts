@@ -51,24 +51,26 @@ const turns = (evs: readonly ControlEvent[]): number =>
   evs.reduce((n, e) => (e.kind === 'turn' ? n + e.steps : n), 0);
 
 /**
- * One wheel tick over (x, y), negative deltaY = wheel up. Chromium gets a real mouse wheel. Playwright has none for
- * mobile WebKit (the iPad device), so there it is a synthetic WheelEvent on the element under the point.
+ * One wheel notch over (x, y), negative deltaY = wheel up, then a pause so the next notch is past the input layer's
+ * 50 ms per-control step cap (as an ordinary mouse-wheel spin is). Chromium gets a real mouse wheel. Playwright has
+ * none for mobile WebKit (the iPad device), so there it is a synthetic WheelEvent on the element under the point.
  */
 async function wheel(page: Page, browserName: string, at: { x: number; y: number }, deltaY: number): Promise<void> {
   if (browserName === 'chromium') {
     await page.mouse.move(at.x, at.y);
     await page.mouse.wheel(0, deltaY);
-    return;
+  } else {
+    await page.evaluate(
+      ({ x, y, deltaY }) => {
+        const target = document.elementFromPoint(x, y) ?? document.body;
+        target.dispatchEvent(
+          new WheelEvent('wheel', { deltaY, clientX: x, clientY: y, bubbles: true, cancelable: true, composed: true }),
+        );
+      },
+      { ...at, deltaY },
+    );
   }
-  await page.evaluate(
-    ({ x, y, deltaY }) => {
-      const target = document.elementFromPoint(x, y) ?? document.body;
-      target.dispatchEvent(
-        new WheelEvent('wheel', { deltaY, clientX: x, clientY: y, bubbles: true, cancelable: true, composed: true }),
-      );
-    },
-    { ...at, deltaY },
-  );
+  await page.waitForTimeout(70);
 }
 
 interface Finger {
@@ -470,6 +472,29 @@ test.describe('mouse', () => {
     await wheel(page, browserName, await pointOf(page, 'trk1.rec'), -100);
     expect(await events(page)).toEqual([]);
   });
+
+  test('a trackpad-style burst of small wheel deltas moves a control a few steps, not one per event', async ({ page }) => {
+    await page.evaluate(() => window.__panel.view.setPhysical('trk4.fader', 0.1));
+    const at = await pointOf(page, 'trk4.fader');
+    const burst = await page.evaluate(async ({ x, y }) => {
+      const target = document.elementFromPoint(x, y) ?? document.body;
+      const t0 = performance.now();
+      let prevented = 0;
+      for (let i = 0; i < 40; i++) {
+        const ev = new WheelEvent('wheel', { deltaY: -2, clientX: x, clientY: y, bubbles: true, cancelable: true, composed: true });
+        target.dispatchEvent(ev);
+        if (ev.defaultPrevented) prevented++;
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      return { elapsed: performance.now() - t0, prevented };
+    }, at);
+    const v = sets(await events(page));
+    expect(burst.prevented).toBe(40); // every event is ours, even the ones that give no step
+    expect(v.length).toBeGreaterThanOrEqual(2);
+    expect(v.length).toBeLessThanOrEqual(Math.floor(burst.elapsed / 50) + 1); // at most one step per 50 ms
+    expect(v.length).toBeLessThan(10);
+    for (let i = 1; i < v.length; i++) expect(v[i]).toBeCloseTo(v[i - 1] + 0.02, 5); // each is one 0.02 step up
+  });
 });
 
 // ------------------------------------------------------------------------------------------------ keyboard
@@ -705,6 +730,85 @@ test.describe('lifecycle', () => {
     await page.evaluate(() => window.__input.attach());
     await page.keyboard.press('KeyS');
     expect(shape(await events(page))).toEqual(['press:trk2.rec', 'release:trk2.rec']);
+  });
+
+  // Finger ids that cannot collide with the real mouse's pointerId (1 in both engines): WebKit's fingers are synthetic.
+  const FINGER_A = 11;
+  const FINGER_B = 12;
+
+  /** Two fingers on two buttons and a mouse pushing an encoder knob: three things held at once. */
+  async function holdThreeThings(page: Page, browserName: string): Promise<Touch> {
+    const touch = new Touch(page, browserName);
+    const a = await pointOf(page, 'trk1.rec');
+    const b = await pointOf(page, 'trk2.stop');
+    const k = await pointOf(page, 'knob1');
+    await touch.down({ id: FINGER_A, x: a.x, y: a.y });
+    await touch.down({ id: FINGER_B, x: b.x, y: b.y });
+    await page.mouse.move(k.x, k.y);
+    await page.mouse.down();
+    await page.waitForTimeout(350); // the encoder hold is recognised: knob1 is pushed
+    expect(shape(await events(page))).toEqual(['press:trk1.rec', 'press:trk2.stop', 'press:knob1']);
+    return touch;
+  }
+
+  /** After the pointers were cancelled: every hold released once, the late lifts add nothing, and nothing is wedged. */
+  async function expectCancelled(page: Page, touch: Touch): Promise<void> {
+    expect(shape(await events(page)).slice(3).sort()).toEqual(['release:knob1', 'release:trk1.rec', 'release:trk2.stop']);
+    await touch.up(FINGER_A);
+    await touch.up(FINGER_B);
+    await page.mouse.up();
+    expect(await events(page)).toHaveLength(6);
+
+    // The press-count gate is not wedged: the same buttons press and release afresh.
+    await clear(page);
+    const a = await pointOf(page, 'trk1.rec');
+    await page.mouse.click(a.x, a.y);
+    expect(shape(await events(page))).toEqual(['press:trk1.rec', 'release:trk1.rec']);
+  }
+
+  test('window blur cancels every active pointer, like pointercancel', async ({ page, browserName }) => {
+    const touch = await holdThreeThings(page, browserName);
+    await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+    await expectCancelled(page, touch);
+  });
+
+  test('the page going hidden (app switch, lock screen) cancels every active pointer', async ({ page, browserName }) => {
+    const touch = await holdThreeThings(page, browserName);
+    await page.evaluate(() => {
+      Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await expectCancelled(page, touch);
+  });
+
+  test('a visibilitychange to visible leaves held pointers alone', async ({ page, browserName }) => {
+    const touch = await holdThreeThings(page, browserName);
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange'))); // still visible
+    expect(await events(page)).toHaveLength(3);
+    await touch.up(FINGER_A);
+    await touch.up(FINGER_B);
+    await page.mouse.up();
+    expect(shape(await events(page)).slice(3).sort()).toEqual(['release:knob1', 'release:trk1.rec', 'release:trk2.stop']);
+  });
+
+  test('a blur cancels a pending encoder touch and its hold timer: no push appears later', async ({ page }) => {
+    const k = await pointOf(page, 'knob2');
+    await page.mouse.move(k.x, k.y);
+    await page.mouse.down();
+    await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+    await page.waitForTimeout(450); // well past the 300 ms hold
+    await page.mouse.up();
+    expect(await events(page)).toEqual([]);
+  });
+
+  test('detach removes the blur and visibility listeners with the rest', async ({ page }) => {
+    await page.evaluate(() => window.__input.detach());
+    await page.evaluate(() => {
+      window.dispatchEvent(new Event('blur'));
+      Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    expect(await events(page)).toEqual([]);
   });
 
   test('the overlay is removed on detach', async ({ page }) => {

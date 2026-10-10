@@ -6,6 +6,10 @@ import {
   HOLD_MS,
   KNOB_DRAG_PX,
   TAP_MAX_MOVE_PX,
+  WHEEL_IDLE_MS,
+  WHEEL_MIN_INTERVAL_MS,
+  WHEEL_THRESHOLD_PX,
+  WheelStepper,
   createPressGate,
 } from '../../src/ui/input/gestures';
 import type { ControlEvent, EncoderId } from '../../src/shared/ids';
@@ -297,5 +301,67 @@ describe('createPressGate', () => {
       { kind: 'turn', id: 'knob1', steps: 2, t: 2 },
       { kind: 'set', id: 'outputLevel', value: 0.4, t: 3 },
     ]);
+  });
+});
+
+describe('WheelStepper', () => {
+  const run = (deltas: readonly [t: number, deltaY: number, mode?: number][]): number[] => {
+    const w = new WheelStepper();
+    return deltas.map(([t, dy, mode]) => w.feed(t, dy, mode));
+  };
+
+  it('has the tuned limits', () => {
+    expect(WHEEL_THRESHOLD_PX).toBe(4);
+    expect(WHEEL_MIN_INTERVAL_MS).toBe(50);
+    expect(WHEEL_IDLE_MS).toBe(150);
+  });
+
+  it('a notched mouse gives exactly one step per notch, wheel up = more', () => {
+    expect(run([[0, -100]])).toEqual([1]);
+    expect(run([[0, 100]])).toEqual([-1]);
+    expect(run([[0, -100], [80, -100], [160, -100]])).toEqual([1, 1, 1]); // notches an ordinary spin apart
+  });
+
+  it('line- and page-mode notches are scaled to pixels (x16, x100) and still give one step', () => {
+    expect(run([[0, -3, 1]])).toEqual([1]); // 3 lines
+    expect(run([[0, -1, 1]])).toEqual([1]); // 1 line = 16 px, over the threshold
+    expect(run([[0, 1, 2]])).toEqual([-1]); // 1 page
+    // a line-mode delta really is scaled: 0.2 lines = 3.2 px is still under the 4 px threshold
+    expect(run([[0, -0.2, 1]])).toEqual([0]);
+  });
+
+  it('a burst of 40 small trackpad deltas over 200 ms is a handful of steps, not 40', () => {
+    const burst = Array.from({ length: 40 }, (_, i): [number, number] => [i * 5, -1]);
+    const steps = run(burst);
+    const total = steps.reduce((a, b) => a + b, 0);
+    expect(total).toBeGreaterThanOrEqual(3);
+    expect(total).toBeLessThanOrEqual(5);
+    expect(steps.every((s) => s === 0 || s === 1)).toBe(true);
+  });
+
+  it('caps the step rate: one step per 50 ms, even for big deltas', () => {
+    const w = new WheelStepper();
+    expect(w.feed(0, -100)).toBe(1);
+    expect(w.feed(20, -100)).toBe(0);
+    expect(w.feed(49, -100)).toBe(0);
+    expect(w.feed(60, -100)).toBe(1);
+  });
+
+  it('collects sub-threshold deltas until they add up to a step', () => {
+    expect(run([[0, -1], [10, -1], [20, -1], [30, -1]])).toEqual([0, 0, 0, 1]);
+  });
+
+  it('a direction reversal resets the accumulator', () => {
+    // +3 up, then 3 down: without a reset these would cancel to 0 and the next -3 would not reach 4.
+    expect(run([[0, -3], [10, 3], [20, 3]])).toEqual([0, 0, -1]);
+  });
+
+  it('resets after 150 ms idle', () => {
+    expect(run([[0, -3], [200, -3]])).toEqual([0, 0]); // the 3 px from 200 ms ago is forgotten
+    expect(run([[0, -3], [100, -3]])).toEqual([0, 1]); // but 100 ms apart it still adds up
+  });
+
+  it('ignores a zero or non-numeric delta', () => {
+    expect(run([[0, 0], [10, Number.NaN], [20, -100]])).toEqual([0, 0, 1]);
   });
 });

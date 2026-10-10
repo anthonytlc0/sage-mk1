@@ -10,12 +10,14 @@
  *  - encoders [1]-[4]: see EncoderGesture (turn, tap, or push-and-turn);
  *  - absolute knobs and faders: AbsoluteDrag, with `view.setPhysical` drawing the new position.
  * pointercancel is always handled: iPadOS cancels 4-5 finger touches even with its system gestures off, and a
- * cancel releases whatever that pointer was holding so nothing sticks down. The user agent is never sniffed.
+ * cancel releases whatever that pointer was holding so nothing sticks down. A window blur or the page going hidden
+ * (app switch, Control Center, lock screen) can lose a pointerup altogether, so they cancel every active pointer
+ * the same way. The user agent is never sniffed.
  */
 import type { AbsoluteId, ButtonId, EncoderId } from '../../shared/ids';
 import { ALL_ABSOLUTE_IDS, ALL_BUTTON_IDS, LAYOUT, PANEL_VIEWBOX } from '../panelLayout';
 import type { PanelView } from '../panelView';
-import { AbsoluteDrag, EncoderGesture, HOLD_MS, KNOB_DRAG_PX, WHEEL_STEP, type Emit } from './gestures';
+import { AbsoluteDrag, EncoderGesture, HOLD_MS, KNOB_DRAG_PX, WHEEL_STEP, WheelStepper, type Emit } from './gestures';
 
 type Target =
   | { kind: 'button'; id: ButtonId }
@@ -42,7 +44,8 @@ const clamp01 = (v: number): number => (v > 0 ? Math.min(1, v) : 0);
 /** Returns a function that detaches every listener and releases whatever is still held. */
 export function attachPointer(view: PanelView, emit: Emit): () => void {
   const svg = view.rootSvg;
-  const win = svg.ownerDocument.defaultView;
+  const doc = svg.ownerDocument;
+  const win = doc.defaultView;
   if (!win) return () => {};
 
   const active = new Map<number, Active>();
@@ -128,14 +131,28 @@ export function attachPointer(view: PanelView, emit: Emit): () => void {
     finish(e.pointerId, e.timeStamp, null);
   };
 
-  /** Mouse wheel over an encoder is one detent; over a knob or fader, WHEEL_STEP. Wheel up is more. */
+  /** Everything the user's focus leaving the page can strand: cancel every active pointer, as pointercancel does. */
+  const cancelAll = (t: number): void => {
+    for (const id of [...active.keys()]) finish(id, t, null);
+  };
+  const onBlur = (e: Event): void => cancelAll(e.timeStamp);
+  const onVisibility = (e: Event): void => {
+    if (doc.visibilityState === 'hidden') cancelAll(e.timeStamp);
+  };
+
+  /** One WheelStepper per control (its own accumulator and step-rate cap). */
+  const wheels = new Map<string, WheelStepper>();
+
+  /** Wheel over an encoder is one detent; over a knob or fader, WHEEL_STEP. Wheel up is more. See WheelStepper. */
   const onWheel = (e: WheelEvent): void => {
     const hit = controlAt(e);
     if (!hit || hit.target.kind === 'button') return;
-    e.preventDefault();
-    const dir = Math.sign(-e.deltaY);
-    if (dir === 0) return;
+    e.preventDefault(); // every wheel event over a control is ours, including the ones that give no step
     const { target } = hit;
+    let stepper = wheels.get(target.id);
+    if (!stepper) wheels.set(target.id, (stepper = new WheelStepper()));
+    const dir = stepper.feed(e.timeStamp, e.deltaY, e.deltaMode);
+    if (dir === 0) return;
     if (target.kind === 'encoder') {
       emit({ kind: 'turn', id: target.id, steps: dir, t: e.timeStamp });
       return;
@@ -154,6 +171,8 @@ export function attachPointer(view: PanelView, emit: Emit): () => void {
   svg.addEventListener('lostpointercapture', onCancel);
   svg.addEventListener('wheel', onWheel, { passive: false });
   svg.addEventListener('contextmenu', onContextMenu);
+  win.addEventListener('blur', onBlur);
+  doc.addEventListener('visibilitychange', onVisibility);
 
   return () => {
     svg.removeEventListener('pointerdown', onDown);
@@ -163,7 +182,8 @@ export function attachPointer(view: PanelView, emit: Emit): () => void {
     svg.removeEventListener('lostpointercapture', onCancel);
     svg.removeEventListener('wheel', onWheel);
     svg.removeEventListener('contextmenu', onContextMenu);
-    const now = win.performance.now();
-    for (const id of [...active.keys()]) finish(id, now, null);
+    win.removeEventListener('blur', onBlur);
+    doc.removeEventListener('visibilitychange', onVisibility);
+    cancelAll(win.performance.now());
   };
 }

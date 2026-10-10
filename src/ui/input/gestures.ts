@@ -18,6 +18,15 @@ export const HOLD_MS = 300;
 export const KNOB_DRAG_PX = 200;
 /** Mouse wheel over an absolute knob or fader. */
 export const WHEEL_STEP = 0.02;
+/** Wheel: accumulated travel (px, after deltaMode scaling) that makes one step. A notched mouse is well over it. */
+export const WHEEL_THRESHOLD_PX = 4;
+/** Wheel: at most one step per this many ms per control, so a trackpad swipe or inertia tail cannot race a knob. */
+export const WHEEL_MIN_INTERVAL_MS = 50;
+/** Wheel: the accumulator is forgotten after this long with no wheel events. */
+export const WHEEL_IDLE_MS = 150;
+/** Wheel deltaMode scaling: a line is 16 px, a page 100 px. */
+const WHEEL_LINE_PX = 16;
+const WHEEL_PAGE_PX = 100;
 
 const clamp01 = (v: number): number => (v > 0 ? Math.min(1, v) : 0); // also maps NaN to 0
 
@@ -125,6 +134,34 @@ export class AbsoluteDrag {
     if (value === this.last) return;
     this.last = value;
     this.emit({ kind: 'set', id: this.id, value, t });
+  }
+}
+
+/**
+ * Turns a stream of wheel events over one control into steps (-1, 0 or +1 per event; wheel up, a negative deltaY, is
+ * +). deltaY is scaled by deltaMode (lines x16, pages x100) and accumulated; each WHEEL_THRESHOLD_PX of it is a step,
+ * so a notched mouse gives one step per notch. A macOS trackpad or Magic Mouse sends dozens of small deltas plus
+ * inertia, so steps are also capped at one per WHEEL_MIN_INTERVAL_MS. The accumulator restarts when the direction
+ * reverses and after WHEEL_IDLE_MS without events. Keep one per control.
+ */
+export class WheelStepper {
+  private acc = 0;
+  private lastT = Number.NEGATIVE_INFINITY;
+  private lastStepT = Number.NEGATIVE_INFINITY;
+
+  feed(t: number, deltaY: number, deltaMode = 0): -1 | 0 | 1 {
+    const px = deltaMode === 1 ? deltaY * WHEEL_LINE_PX : deltaMode === 2 ? deltaY * WHEEL_PAGE_PX : deltaY;
+    const up = -px; // wheel up is more
+    const idle = t - this.lastT > WHEEL_IDLE_MS;
+    this.lastT = t;
+    if (up === 0 || Number.isNaN(up)) return 0;
+    if (idle || this.acc * up < 0) this.acc = 0; // a long pause or a reversal starts afresh
+    this.acc += up;
+    if (Math.abs(this.acc) < WHEEL_THRESHOLD_PX || t - this.lastStepT < WHEEL_MIN_INTERVAL_MS) return 0;
+    const step = this.acc > 0 ? 1 : -1;
+    this.acc = 0;
+    this.lastStepT = t;
+    return step;
   }
 }
 
