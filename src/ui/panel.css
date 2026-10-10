@@ -1,0 +1,72 @@
+/* Sage MK1 panel: the SVG replica on a dark tabletop, with the LCD canvas overlaid. */
+
+#tabletop {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse 80% 70% at 50% 42%, #141416 0%, #0d0d0e 55%, #0a0a0b 100%),
+    #0b0b0c;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#tabletop .panel-svg {
+  display: block;
+  width: 100vw;
+  height: 100%;
+}
+
+#tabletop .panel-lcd {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+}
+
+/* Printed legends: a clean condensed sans from the system, never a downloaded font. */
+#tabletop .panel-svg text {
+  font-family: 'Avenir Next Condensed', 'DIN Alternate', 'Roboto Condensed', 'Arial Narrow', 'Helvetica Neue', Arial,
+    sans-serif;
+  font-weight: 600;
+  font-stretch: condensed;
+  fill: #b7bbc1;
+}
+
+#tabletop .panel-svg .lbl-red {
+  fill: #e2252d;
+  font-weight: 700;
+}
+
+#tabletop .panel-svg .lbl-cap {
+  fill: #eceef0;
+  font-weight: 700;
+}
+
+#tabletop .panel-svg .lbl-num {
+  font-family: 'DIN Alternate', 'Avenir Next Condensed', 'Roboto Condensed', 'Arial Narrow', Arial, sans-serif;
+  font-weight: 700;
+  fill: #c3c6cb;
+}
+
+#tabletop .panel-svg .lbl-brand {
+  font-family: 'Avenir Next', 'Helvetica Neue', Arial, sans-serif;
+  font-weight: 800;
+  font-stretch: normal;
+  fill: #d9dce0;
+}
+
+/* Only controls take pointer input; legends, rings, glows and shadows never steal a touch. */
+#tabletop .panel-svg .deco,
+#tabletop .panel-svg .nohit {
+  pointer-events: none;
+}
+
+#tabletop .panel-svg .ctl {
+  cursor: pointer;
+}
