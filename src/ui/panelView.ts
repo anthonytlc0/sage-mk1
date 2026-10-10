@@ -23,7 +23,7 @@ import {
   ledPaint,
   ringLevels,
 } from './leds';
-import { DEFAULT_PALETTE, drawToCanvas, type LcdContext } from '../lcd/canvas';
+import { DEFAULT_PALETTE, drawToCanvas, lcdColors, type LcdContext } from '../lcd/canvas';
 import { Framebuffer } from '../lcd/framebuffer';
 import { LCD_H, LCD_W, RING_SEGMENTS } from '../shared/constants';
 import type { AbsoluteId, ButtonId } from '../shared/ids';
@@ -83,9 +83,12 @@ const LEVEL_ATTR = ['0', '1', '2'];
  * An LcdContext for drawToCanvas that gathers each run of same-colour fillRects into one Path2D and fills it in a
  * single call. drawToCanvas issues one fillRect per dark pixel; batching them is ~5x cheaper in Chromium and ~2x in
  * WebKit, and pixel-identical because every rect is integer-aligned. Call flush() after drawToCanvas.
+ * `multiplier` scales every rect by an integer, so drawToCanvas can paint at scale 1 (solid pixels, no grid) onto
+ * a canvas of 128*m x 64*m.
  */
 class BatchedLcdContext implements LcdContext {
   fillStyle: string | CanvasGradient | CanvasPattern = '#000';
+  multiplier = 1;
   private path: Path2D | null = null;
   private style: string | CanvasGradient | CanvasPattern = '';
 
@@ -97,7 +100,8 @@ class BatchedLcdContext implements LcdContext {
       this.path = new Path2D();
       this.style = this.fillStyle;
     }
-    this.path.rect(x, y, w, h);
+    const m = this.multiplier;
+    this.path.rect(x * m, y * m, w * m, h * m);
   }
 
   flush(): void {
@@ -204,10 +208,10 @@ export function mountPanel(root: HTMLElement): PanelView {
 
   function drawLegends(g: SVGGElement): void {
     // Rear-panel jack legends along the top edge.
-    const jack = (x: number, s: string) => text(g, x, 50, s, 9.5, { fill: '#8e9298' });
+    const jack = (x: number, s: string) => text(g, x, 50, s, 9.5, { class: 'lbl-jack' });
     const group = (x0: number, x1: number, name: string, mid: number, gap: number) => {
       el('path', { d: `M ${x0} 54 H ${mid - gap} M ${mid + gap} 54 H ${x1}`, stroke: '#8e9298', 'stroke-width': 1 }, g);
-      text(g, mid, 58.5, name, 8.5, { fill: '#8e9298' });
+      text(g, mid, 58.5, name, 8.5, { class: 'lbl-jack' });
     };
     jack(178, 'MIC 1'); jack(306, 'MIC 2'); jack(475, 'L — INST 1 — R'); jack(606, 'L — INST 2 — R');
     group(160, 652, 'INPUT', 409, 18);
@@ -283,19 +287,20 @@ export function mountPanel(root: HTMLElement): PanelView {
 
     // Track columns: CLEAR: HOLD over ■, and the track number.
     TRACK_X.forEach((x, i) => {
-      text(g, x + TRACK_COL.buttons, TRACK_ROW.clearLabel + 3, 'CLEAR: HOLD', 9.5, { fill: '#a3a7ad' });
+      text(g, x + TRACK_COL.buttons, TRACK_ROW.clearLabel + 3, 'CLEAR: HOLD', 9.5, { class: 'lbl-small' });
       text(g, x + TRACK_COL.number, TRACK_ROW.number + 11, String(i + 1), 31, { class: 'lbl-num' });
     });
   }
 
   // ---------------------------------------------------------------- LCD bezel (the canvas is laid over the glass)
   const lcdG = el('g', { class: 'deco' }, svg);
+  let lcdGlass: SVGRectElement;
   {
     const L = LAYOUT.lcd;
     el('rect', { x: L.x - 37, y: L.y - 11, width: L.w + 74, height: L.h + 24, rx: 6, fill: '#000', opacity: 0.5, transform: 'translate(0 3)' }, lcdG);
     el('rect', { x: L.x - 37, y: L.y - 11, width: L.w + 74, height: L.h + 24, rx: 6, fill: 'url(#g-bezel)' }, lcdG);
     el('rect', { x: L.x - 10, y: L.y - 7, width: L.w + 20, height: L.h + 15, rx: 3, fill: '#0a0b0c' }, lcdG);
-    el('rect', { x: L.x, y: L.y, width: L.w, height: L.h, fill: DEFAULT_PALETTE.pixelOff }, lcdG);
+    lcdGlass = el('rect', { x: L.x, y: L.y, width: L.w, height: L.h, fill: DEFAULT_PALETTE.pixelOff }, lcdG);
   }
 
   // ---------------------------------------------------------------- controls
@@ -423,7 +428,7 @@ export function mountPanel(root: HTMLElement): PanelView {
 
   // Glyphs on caps.
   const letter = (s: string, size = 19) => (g: SVGGElement, cx: number, cy: number) => {
-    text(g, cx, cy + size * 0.35, s, size, { class: 'lbl-cap', 'font-weight': 800 });
+    text(g, cx, cy + size * 0.35, s, size, { class: 'lbl-cap lbl-glyph' });
   };
   const stopGlyph = (g: SVGGElement, cx: number, cy: number) => {
     el('rect', { x: cx - 9.5, y: cy - 9.5, width: 19, height: 19, rx: 1, fill: '#eceef0' }, g);
@@ -483,27 +488,38 @@ export function mountPanel(root: HTMLElement): PanelView {
   function paintLcd(): void {
     if (!lcdCtx || lcdScale === 0 || !lcdHasState) return;
     fb.data = lastLcd;
-    drawToCanvas(fb, lcdCtx, lcdScale, lcdContrast, DEFAULT_PALETTE);
+    // drawToCanvas adds its 1-px pixel grid from scale 3; we only want it from 4, where it reads as a grid rather
+    // than as stripes. Below 4, paint at scale 1 and let the context multiply up to solid s x s pixels.
+    const grid = lcdScale >= 4;
+    lcdCtx.multiplier = grid ? 1 : lcdScale;
+    drawToCanvas(fb, lcdCtx, grid ? lcdScale : 1, lcdContrast, DEFAULT_PALETTE);
     lcdCtx.flush();
     lcdPainted = true;
   }
 
+  /**
+   * Fits the canvas to the glass so each LCD pixel is exactly s x s device pixels with no browser resampling:
+   * s = max(1, floor(glass device width / 128)), the canvas is 128s x 64s device pixels (backing and display),
+   * centred in the glass and snapped to the device-pixel grid. The glass shows around it as backlight.
+   */
   function layoutLcd(): void {
     const tt = tabletop.getBoundingClientRect();
     const sr = svg.getBoundingClientRect();
     if (sr.width <= 0 || sr.height <= 0) return;
     const k = Math.min(sr.width / VB_W, sr.height / VB_H);
-    const ox = sr.left - tt.left + (sr.width - VB_W * k) / 2;
-    const oy = sr.top - tt.top + (sr.height - VB_H * k) / 2;
     const L = LAYOUT.lcd;
-    const cssW = L.w * k;
-    const style = canvas.style;
-    style.left = `${ox + L.x * k}px`;
-    style.top = `${oy + L.y * k}px`;
-    style.width = `${cssW}px`;
-    style.height = `${L.h * k}px`;
+    const glassW = L.w * k, glassH = L.h * k;
+    const glassLeft = sr.left + (sr.width - VB_W * k) / 2 + L.x * k;
+    const glassTop = sr.top + (sr.height - VB_H * k) / 2 + L.y * k;
     const dpr = doc.defaultView?.devicePixelRatio || 1;
-    const scale = Math.max(1, Math.ceil((cssW * dpr) / LCD_W - 1e-6));
+    const scale = Math.max(1, Math.floor((glassW * dpr) / LCD_W + 1e-6));
+    const cssW = (LCD_W * scale) / dpr, cssH = (LCD_H * scale) / dpr;
+    const snap = (v: number) => Math.round(v * dpr) / dpr;
+    const style = canvas.style;
+    style.left = `${snap(glassLeft + (glassW - cssW) / 2) - tt.left}px`;
+    style.top = `${snap(glassTop + (glassH - cssH) / 2) - tt.top}px`;
+    style.width = `${cssW}px`;
+    style.height = `${cssH}px`;
     if (scale !== lcdScale) {
       lcdScale = scale;
       canvas.width = LCD_W * scale; // resizing clears the canvas
@@ -526,6 +542,10 @@ export function mountPanel(root: HTMLElement): PanelView {
     }
     if (!changed) return;
     lastLcd.set(lcd.length > n ? lcd.subarray(0, n) : lcd);
+    if (!Object.is(contrast, lcdContrast)) {
+      const glass = lcdColors(contrast, DEFAULT_PALETTE).pixelOff;
+      if (glass !== lcdGlass.getAttribute('fill')) lcdGlass.setAttribute('fill', glass);
+    }
     lcdContrast = contrast;
     lcdHasState = true;
     paintLcd();

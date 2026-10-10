@@ -194,22 +194,38 @@ test('setPhysical moves fader caps and knob pointers', async ({ page }) => {
   expect(r.k0.x).toBeLessThan(r.k1.x); // pointer swings from lower-left (0) to lower-right (1)
 });
 
-test('the LCD canvas sits on LAYOUT.lcd at an integer multiple of 128 x 64, and follows resizes', async ({ page }) => {
+test('the LCD shows each LCD pixel as exactly s x s device pixels, centred in the glass, and follows resizes', async ({ page }) => {
   const measure = () => page.evaluate(() => {
     const p = window.__panel;
     const c = p.view.lcdCanvas;
+    const dpr = devicePixelRatio;
     const sr = p.view.rootSvg.getBoundingClientRect();
     const k = Math.min(sr.width / p.PANEL_VIEWBOX.w, sr.height / p.PANEL_VIEWBOX.h);
     const ox = sr.left + (sr.width - p.PANEL_VIEWBOX.w * k) / 2;
     const oy = sr.top + (sr.height - p.PANEL_VIEWBOX.h * k) / 2;
     const L = p.LAYOUT.lcd;
+    const glass = { left: ox + L.x * k, top: oy + L.y * k, width: L.w * k, height: L.h * k };
     const cr = c.getBoundingClientRect();
-    const px = c.getContext('2d')!.getImageData(c.width >> 1, c.height >> 1, 1, 1).data;
+    const g = c.getContext('2d')!;
+    const centre = g.getImageData(c.width >> 1, c.height >> 1, 1, 1).data;
+    // Row 0 of the demo screen is solid dark (the inverted header bar): with no grid every device pixel matches.
+    const row = g.getImageData(0, 0, c.width, 1).data;
+    let rowColours = 0;
+    for (let i = 0, prev = ''; i < row.length; i += 4) {
+      const key = `${row[i]},${row[i + 1]},${row[i + 2]}`;
+      if (key !== prev) { rowColours++; prev = key; }
+    }
+    const frac = (v: number) => Math.abs(v - Math.round(v));
     return {
-      w: c.width, h: c.height, dpr: devicePixelRatio,
-      dx: Math.abs(cr.left - (ox + L.x * k)), dy: Math.abs(cr.top - (oy + L.y * k)),
-      dw: Math.abs(cr.width - L.w * k), dh: Math.abs(cr.height - L.h * k),
-      cssW: cr.width, alpha: px[3],
+      w: c.width, h: c.height, dpr, s: c.width / 128,
+      expectedS: Math.max(1, Math.floor((glass.width * dpr) / 128)),
+      clientDev: c.clientWidth * dpr, rectDevW: cr.width * dpr, rectDevH: cr.height * dpr,
+      leftFrac: frac(cr.left * dpr), topFrac: frac(cr.top * dpr),
+      dcx: Math.abs(cr.left + cr.width / 2 - (glass.left + glass.width / 2)),
+      dcy: Math.abs(cr.top + cr.height / 2 - (glass.top + glass.height / 2)),
+      inside: cr.left >= glass.left - 0.01 && cr.top >= glass.top - 0.01 &&
+        cr.right <= glass.left + glass.width + 0.01 && cr.bottom <= glass.top + glass.height + 0.01,
+      alpha: centre[3], rowColours,
     };
   });
   await page.evaluate(() => window.__panel.render({ lcd: 'demo' }, 0));
@@ -220,13 +236,43 @@ test('the LCD canvas sits on LAYOUT.lcd at an integer multiple of 128 x 64, and 
       await page.evaluate(() => new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res))));
     }
     const m = await measure();
-    expect(m.w % 128, JSON.stringify(m)).toBe(0);
-    expect(m.h * 2).toBe(m.w);
-    expect(m.w).toBeGreaterThanOrEqual(Math.floor(m.cssW * m.dpr));
-    expect(m.w).toBeLessThan(m.cssW * m.dpr + 128);
-    expect(Math.max(m.dx, m.dy, m.dw, m.dh), JSON.stringify(m)).toBeLessThan(1);
-    expect(m.alpha).toBe(255); // painted, not blank
+    const info = JSON.stringify({ size, ...m });
+    expect(m.w % 128, info).toBe(0);
+    expect(m.h * 2, info).toBe(m.w);
+    expect(m.s, info).toBe(m.expectedS); // s = max(1, floor(glass device width / 128))
+    // Displayed at exactly the backing size in device pixels: an integer multiple of 128 x 64, no resampling.
+    const mult = m.clientDev / 128;
+    expect(Math.abs(mult - Math.round(mult)), info).toBeLessThan(0.01);
+    expect(Math.abs(m.rectDevW - m.w), info).toBeLessThan(0.01);
+    expect(Math.abs(m.rectDevH - m.h), info).toBeLessThan(0.01);
+    expect(Math.max(m.leftFrac, m.topFrac), info).toBeLessThan(0.01); // on the device-pixel grid
+    expect(m.inside, info).toBe(true);
+    expect(Math.max(m.dcx, m.dcy), info).toBeLessThan(1); // centred in the glass
+    expect(m.alpha, info).toBe(255); // painted, not blank
+    if (m.s < 4) expect(m.rowColours, info).toBe(1); // solid pixels below scale 4: no grid lines
   }
+});
+
+test('legend tones and weights from CSS classes reach the rendered text', async ({ page }) => {
+  const r = await page.evaluate(() => {
+    const p = window.__panel;
+    const texts = [...p.view.rootSvg.querySelectorAll('text')];
+    const style = (s: string) => {
+      const t = texts.find((e) => e.textContent === s);
+      return t ? getComputedStyle(t) : null;
+    };
+    const letter = p.view.elementFor('in.A').querySelector('text');
+    return {
+      jack: style('MIC 1')?.fill, group: style('MIDI')?.fill, clear: style('CLEAR: HOLD')?.fill,
+      menu: style('MENU')?.fill, red: style('INPUT FX')?.fill,
+      letterWeight: letter ? getComputedStyle(letter).fontWeight : null,
+      pillWeight: style('TRACK')?.fontWeight,
+    };
+  });
+  expect(r).toEqual({
+    jack: 'rgb(142, 146, 152)', group: 'rgb(142, 146, 152)', clear: 'rgb(163, 167, 173)',
+    menu: 'rgb(183, 187, 193)', red: 'rgb(226, 37, 45)', letterWeight: '800', pillWeight: '700',
+  });
 });
 
 test('render() x600 stays under 200 ms', async ({ page }, testInfo) => {

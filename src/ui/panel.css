@@ -48,6 +48,19 @@
   font-weight: 700;
 }
 
+/* Tones and weights live here, not in SVG attributes: the `text` rule above would override presentation attributes. */
+#tabletop .panel-svg .lbl-glyph {
+  font-weight: 800;
+}
+
+#tabletop .panel-svg .lbl-jack {
+  fill: #8e9298;
+}
+
+#tabletop .panel-svg .lbl-small {
+  fill: #a3a7ad;
+}
+
 #tabletop .panel-svg .lbl-num {
   font-family: 'DIN Alternate', 'Avenir Next Condensed', 'Roboto Condensed', 'Arial Narrow', Arial, sans-serif;
   font-weight: 700;
