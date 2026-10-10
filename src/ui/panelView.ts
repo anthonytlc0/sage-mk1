@@ -36,6 +36,8 @@ export interface PanelView {
   elementFor(id: ButtonId | AbsoluteId): SVGElement;
   /** Moves a fader cap (0 = bottom, 1 = top) or knob pointer (0 = fully left, 1 = fully right). Clamped to 0..1. */
   setPhysical(id: AbsoluteId, value: number): void;
+  /** What setPhysical last drew (faders rest at 1, knob pointers at 0.5). The input layer drags relative to it. */
+  getPhysical(id: AbsoluteId): number;
   lcdCanvas: HTMLCanvasElement;
   rootSvg: SVGSVGElement;
 }
@@ -638,6 +640,9 @@ export function mountPanel(root: HTMLElement): PanelView {
       return e;
     },
     setPhysical,
+    getPhysical(id) {
+      return faderCaps.get(id)?.value ?? knobPointers.get(id)?.value ?? 0;
+    },
     lcdCanvas: canvas,
     rootSvg: svg,
   };
