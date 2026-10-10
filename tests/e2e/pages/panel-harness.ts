@@ -1,6 +1,7 @@
 /**
- * Playwright harness for the panel (tests/e2e/panel.spec.ts). Mounts the SVG panel full-screen and exposes
- * `window.__panel` so specs can drive it with plain JSON from `page.evaluate`.
+ * Playwright harness for the panel (tests/e2e/panel.spec.ts, tests/e2e/input.spec.ts). Mounts the SVG panel
+ * full-screen and exposes `window.__panel` so specs can drive it with plain JSON from `page.evaluate`. It also attaches
+ * the input layer and records what it emits in `window.__events`.
  */
 import { mountPanel, type PanelView } from '../../../src/ui/panelView';
 import { ALL_ABSOLUTE_IDS, ALL_BUTTON_IDS, LAYOUT, PANEL_VIEWBOX } from '../../../src/ui/panelLayout';
@@ -9,6 +10,8 @@ import { bar, fillRect, hline, rect, text } from '../../../src/lcd/draw';
 import { FONT_MEDIUM, FONT_SMALL } from '../../../src/lcd/fonts';
 import { LCD_H, LCD_W } from '../../../src/shared/constants';
 import type { PanelState, RingState } from '../../../src/shared/panel';
+import type { ControlEvent } from '../../../src/shared/ids';
+import { attachInput, showKeyOverlay } from '../../../src/ui/input';
 
 /** A JSON-friendly PanelState: anything left out is off / blank / default. */
 export interface HarnessState {
@@ -64,9 +67,21 @@ export interface PanelHarness {
   ALL_ABSOLUTE_IDS: typeof ALL_ABSOLUTE_IDS;
 }
 
+/** The input layer (tests/e2e/input.spec.ts), attached to the panel with its events recorded in `window.__events`. */
+export interface InputHarness {
+  attach(): void;
+  detach(): void;
+  showKeyOverlay: typeof showKeyOverlay;
+}
+
 declare global {
   interface Window {
     __panel: PanelHarness;
+    /** Every ControlEvent the input layer has emitted, in order. A spec empties it with `__events.length = 0`. */
+    __events: ControlEvent[];
+    /** The special keys seen: 'recorder' (Backquote) and 'overlay' (?). */
+    __special: string[];
+    __input: InputHarness;
   }
 }
 
@@ -85,3 +100,18 @@ window.__panel = {
   ALL_BUTTON_IDS,
   ALL_ABSOLUTE_IDS,
 };
+
+window.__events = [];
+window.__special = [];
+let detachInput: (() => void) | null = null;
+window.__input = {
+  attach() {
+    detachInput ??= attachInput(view, (e) => window.__events.push(e), { onSpecialKey: (k) => window.__special.push(k) });
+  },
+  detach() {
+    detachInput?.();
+    detachInput = null;
+  },
+  showKeyOverlay,
+};
+window.__input.attach();
