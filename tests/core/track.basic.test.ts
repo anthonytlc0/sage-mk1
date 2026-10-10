@@ -53,7 +53,8 @@ describe('track basics (free loop, LOOP SYNC OFF)', () => {
     run(core, 1);
     expect(trk(core).state).toBe('empty');
     expect(trk(core).lengthFrames).toBe(0);
-    expect(run(core, 500).tracks[0].every((v) => v === 0)).toBe(true);
+    // Frame 1200 began a 5 ms ramp-out (frames 1200..1204); silent after it.
+    expect(run(core, 500).tracks[0].subarray(XF - 1).every((v) => v === 0)).toBe(true);
     expect(core.status().memoryBytes).toBe(0);
   });
 

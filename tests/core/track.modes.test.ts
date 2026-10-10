@@ -28,6 +28,38 @@ describe('DUB MODE', () => {
     expect(after[500]).toBe(0.25);
   });
 
+  it.each(['REPLACE1', 'REPLACE2'] as const)(
+    'REC->DUB into %s has no seam dip: the replaced loop start is exactly the input',
+    (dubMode) => {
+      // Record silence, then replace it with 0.5 straight from the recording. The recording's seam crossfade already
+      // fades the input in over the loop start, so the pass must not ramp it in a second time (which gave
+      // 0.5 0.42 0.38 0.38 0.42 0.5, a 1 - u + u^2 dip).
+      const core = makeCore({ rec: { recAction: 'REC->DUB' }, track: [{ dubMode }] });
+      const input = (f: number): number => (f < 1000 ? 0 : 0.5);
+      at(core, 0, recPlay(), input);
+      at(core, 1000, recPlay(), input); // overdubbing (replacing) from position 0
+      at(core, 2000, recPlay(), input); // a whole pass replaced
+      run(core, 10, input);
+      const a = core.getTrackAudio(0)!.L;
+      expect(Array.from(a.subarray(0, XF + 1))).toEqual([0.5, 0.5, 0.5, 0.5, 0.5, 0.5]);
+      expect(a.every((v) => v === 0.5)).toBe(true);
+    },
+  );
+
+  it('a REPLACE pass from playback still ramps in over XF frames', () => {
+    const core = makeCore({ track: [{ dubMode: 'REPLACE1' }] });
+    const input = (f: number): number => (f < 1000 ? 0 : 0.5);
+    at(core, 0, recPlay(), input);
+    at(core, 1000, recPlay(), input);
+    at(core, 2500, recPlay(), input); // punch in at position 500
+    at(core, 2700, recPlay(), input);
+    run(core, 10, input);
+    const a = core.getTrackAudio(0)!.L;
+    expect(a[500]).toBe(0);
+    expect(a[502]).toBeCloseTo(0.5 * (2 / XF), 6);
+    expect(a[600]).toBe(0.5);
+  });
+
   it('OVERDUB adds; the output during the pass is the old audio', () => {
     const core = makeCore({ track: [{ dubMode: 'OVERDUB' }] });
     at(core, 0, recPlay(), layered);

@@ -1,7 +1,11 @@
 /**
- * The looper core: five tracks, the transport, the settings, and a queue of timed commands applied at exact frames
- * inside each render block. Pure TypeScript with no browser APIs; the engine runs it inside an AudioWorklet and the
- * tests run it sample by sample in Node.
+ * The looper core: five tracks, the transport and loop sync, the settings, and a queue of timed commands applied at
+ * exact frames inside each render block. Pure TypeScript with no browser APIs; the engine runs it inside an AudioWorklet
+ * and the tests run it sample by sample in Node.
+ *
+ * Presses that wait for a measure line (QUANTIZE, LOOP SYNC MODE MEASURE) are not queued commands: each track holds
+ * its own armed slot and fires it at the exact frame as it renders (see track.ts), so the queue only ever holds
+ * presses dated by the caller.
  *
  * `process` allocates nothing apart from the tracks' 1-second recording chunks. Command and settings handling may
  * allocate a little (a fresh take shell when a track is cleared), but only once per user action.
@@ -9,6 +13,7 @@
 import { ChunkPool } from './chunks';
 import { Transport } from './transport';
 import { xfadeFrames } from './fade';
+import { LoopSync } from './sync';
 import { Track } from './track';
 import type { TrackHost } from './track';
 import { defaultMemory } from '../schema/memory';
@@ -46,6 +51,7 @@ export class LooperCore {
   private readonly budget: number;
   private readonly pool: ChunkPool;
   private readonly transport: Transport;
+  private readonly sync: LoopSync;
   private memory: MemorySettings;
   /** Kept for the input routing and the click (Task 9). */
   private system: SystemSettings;
@@ -67,10 +73,11 @@ export class LooperCore {
     this.budget = cfg.memoryBudgetBytes;
     this.pool = new ChunkPool(cfg.sampleRate, cfg.memoryBudgetBytes);
     this.transport = new Transport(cfg.sampleRate);
+    this.sync = new LoopSync(this.transport);
     // Guide defaults until the engine hands over the real settings.
     this.memory = defaultMemory();
     this.system = defaultSystem();
-    this.applyTransportSettings();
+    this.applyTransportSettings(0);
 
     const core = this; // the host's getter reads the live settings
     const host: TrackHost = {
@@ -78,6 +85,7 @@ export class LooperCore {
       xfade: xfadeFrames(cfg.sampleRate),
       pool: this.pool,
       transport: this.transport,
+      sync: this.sync,
       get memory(): MemorySettings {
         return core.memory;
       },
@@ -87,6 +95,7 @@ export class LooperCore {
       },
     };
     this.tracks = TRACKS.map((i) => new Track(i, host));
+    this.sync.attach(this.tracks);
   }
 
   /** The timeline frame at the start of the next block. */
@@ -94,11 +103,13 @@ export class LooperCore {
     return this._frame;
   }
 
-  /** Take new settings. Tracks read them live; the tempo and beat go to the transport. */
+  /**
+   * Take new settings. Tracks read them live; the tempo and beat go to the transport, keeping the musical position.
+   * The memory tempo is applied every time, so after a recording sets the tempo the caller must copy `status().tempo`
+   * into the memory it sends, or the next settings push puts the old tempo back.
+   */
   setSettings(memory: MemorySettings, system: SystemSettings): void {
-    this.memory = memory;
-    this.system = system;
-    this.applyTransportSettings();
+    this.applySettings(memory, system, this._frame);
   }
 
   setLatency(roundTripFrames: number, outputLatencyFrames: number): void {
@@ -118,7 +129,7 @@ export class LooperCore {
    */
   command(cmd: EngineCommand, at?: number | null): void {
     const f = at === null || at === undefined || !Number.isFinite(at) ? this._frame : Math.round(at);
-    if (this.queueLength === QUEUE_CAPACITY) this.apply(this.dequeue());
+    if (this.queueLength === QUEUE_CAPACITY) this.apply(this.dequeue(), this._frame);
     let i = this.queueLength;
     while (i > 0 && this.queueAt[i - 1] > f) {
       this.queueAt[i] = this.queueAt[i - 1];
@@ -155,7 +166,7 @@ export class LooperCore {
       if (this.queueLength > 0) end = Math.min(n, this.queueAt[0] - this._frame);
       for (let i = 0; i < tracks.length; i++) {
         const o = out.tracks[i];
-        tracks[i].render(inL, inR, o[0], o[1], pos, end);
+        tracks[i].render(inL, inR, o[0], o[1], pos, end, this._frame);
       }
       pos = end;
     }
@@ -177,7 +188,7 @@ export class LooperCore {
       beat: { num: t.beat.num, den: t.beat.den },
       beatPhase: t.beatPhaseAt(this._frame),
       measurePhase: t.measureAt(this._frame).phase,
-      rhythm: 'off', // the rhythm flag arrives with loop sync (Task 6)
+      rhythm: this.sync.rhythm,
       tracks: this.tracks.map((tr) => tr.status()),
       memoryBytes: this.pool.usedBytes(),
       memoryBudget: this.budget,
@@ -202,10 +213,11 @@ export class LooperCore {
     this.tracks[i]?.load(a);
   }
 
-  private apply(cmd: EngineCommand): void {
+  /** Apply `cmd` at timeline frame `now`. */
+  private apply(cmd: EngineCommand, now: number): void {
     switch (cmd.t) {
       case 'recPlay':
-        this.tracks[cmd.track]?.recPlay();
+        this.tracks[cmd.track]?.recPlay(now);
         return;
       case 'stop':
         this.tracks[cmd.track]?.stop();
@@ -214,16 +226,19 @@ export class LooperCore {
         this.tracks[cmd.track]?.clear();
         return;
       case 'clearAll':
-        for (const tr of this.tracks) tr.clear();
+        for (let i = 0; i < this.tracks.length; i++) this.tracks[i].clear();
         return;
       case 'interrupt':
-        for (const tr of this.tracks) tr.interrupt();
+        for (let i = 0; i < this.tracks.length; i++) this.tracks[i].interrupt();
         return;
       case 'tempo':
-        this.transport.setTempo(cmd.bpm);
+        this.sync.retime(cmd.bpm, this.transport.beat, now);
+        return;
+      case 'rhythmStartStop':
+        this.sync.toggleRhythm(now);
         return;
       case 'settings':
-        this.setSettings(cmd.memory, cmd.system);
+        this.applySettings(cmd.memory, cmd.system, now);
         return;
       case 'loadTrack':
         this.setTrackAudio(cmd.track, cmd.audio);
@@ -231,7 +246,7 @@ export class LooperCore {
       case 'latency':
         this.setLatency(cmd.roundTripFrames, cmd.outputLatencyFrames);
         return;
-      // Not yet: undo/redo, marks and ALL START/STOP (Task 8), speedMoment (Task 7), rhythmStartStop (Task 6).
+      // Not yet: undo/redo, marks and ALL START/STOP (Task 8), speedMoment (Task 7).
       // Engine-only, handled outside the core: fader (the mixer), exportTracks, recorder, calibrate.
       default:
         return;
@@ -240,7 +255,7 @@ export class LooperCore {
 
   /** Apply, in order, every queued command dated at or before `frame`. */
   private applyDue(frame: number): void {
-    while (this.queueLength > 0 && this.queueAt[0] <= frame) this.apply(this.dequeue());
+    while (this.queueLength > 0 && this.queueAt[0] <= frame) this.apply(this.dequeue(), frame);
   }
 
   private dequeue(): EngineCommand {
@@ -260,9 +275,14 @@ export class LooperCore {
     if (this.messageCount < MESSAGE_CAPACITY) this.messages[this.messageCount++] = msg;
   }
 
-  private applyTransportSettings(): void {
-    this.transport.setTempo(this.memory.tempo);
-    const b = this.memory.rhythm.beat;
-    this.transport.beat = { num: b.num, den: b.den };
+  private applySettings(memory: MemorySettings, system: SystemSettings, now: number): void {
+    this.memory = memory;
+    this.system = system;
+    this.applyTransportSettings(now);
+  }
+
+  /** The memory tempo and beat, applied at `frame` without moving the musical position (armed actions follow). */
+  private applyTransportSettings(frame: number): void {
+    this.sync.retime(this.memory.tempo, this.memory.rhythm.beat, frame);
   }
 }

@@ -6,7 +6,7 @@
  * (or 2A between opposite peaks), while a 5 ms ramp moves at most 2A / XF per frame. The bound is 2.5 * A / XF.
  */
 import { describe, expect, it } from 'vitest';
-import { dc, makeCore, recPlay, run, stop, trk, XF } from './harness';
+import { clear, dc, makeCore, recPlay, run, SR, stop, trk, XF } from './harness';
 import type { LooperCore } from '../../src/core/looper';
 import type { EngineCommand } from '../../src/shared/protocol';
 
@@ -94,6 +94,39 @@ describe('smooth stops (XF ramp, then silence)', () => {
     const core = makeCore({ tempo: 120, track: [{ stopMode: 'FADE' }], play: { fadeOut: { measures: 1 } } });
     const out = play(core, 2300, [[0, recPlay()], [1000, recPlay()], [1500, stop()], [2000, stop()]], wave);
     expect(out.subarray(2000 + XF).every((v) => v === 0)).toBe(true);
+    expect(maxStep(out)).toBeLessThanOrEqual(BOUND);
+  });
+
+  it('clear on a playing track ramps out over XF frames; the track is empty at once and its memory freed', () => {
+    const core = makeCore();
+    const out = play(core, 1700, [[0, recPlay()], [1000, recPlay()], [1500, clear()]], wave); // clear on a peak
+    expect(trk(core).state).toBe('empty');
+    expect(core.status().memoryBytes).toBe(0);
+    expect(out[1500]).toBeCloseTo(A, 3);
+    expect(out[1500 + XF - 1]).not.toBe(0);
+    expect(out.subarray(1500 + XF).every((v) => v === 0)).toBe(true);
+    expect(maxStep(out)).toBeLessThanOrEqual(BOUND);
+  });
+
+  it('loadTrack on a playing track ramps the old loop out over XF frames', () => {
+    const core = makeCore();
+    const L = new Float32Array(800);
+    const loaded: EngineCommand = { t: 'loadTrack', track: 0, audio: { L, R: L, sampleRate: SR, recordedTempo: 120, measures: null } };
+    const out = play(core, 1700, [[0, recPlay()], [1000, recPlay()], [1500, loaded]], wave);
+    expect(trk(core).state).toBe('stopped');
+    expect(trk(core).lengthFrames).toBe(800);
+    expect(out[1500]).toBeCloseTo(A, 3);
+    expect(out[1500 + XF - 1]).not.toBe(0);
+    expect(out.subarray(1500 + XF).every((v) => v === 0)).toBe(true);
+    expect(maxStep(out)).toBeLessThanOrEqual(BOUND);
+  });
+
+  it('a recording begun just after a clear lets the cleared loop finish its ramp-out', () => {
+    const core = makeCore();
+    const out = play(core, 1700, [[0, recPlay()], [1000, recPlay()], [1500, clear()], [1502, recPlay()]], wave);
+    expect(trk(core).state).toBe('recording');
+    expect(out[1503]).not.toBe(0);
+    expect(out.subarray(1500 + XF).every((v) => v === 0)).toBe(true);
     expect(maxStep(out)).toBeLessThanOrEqual(BOUND);
   });
 
