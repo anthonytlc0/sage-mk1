@@ -10,8 +10,10 @@
  *  - exit / enter / in.edit / tr.edit act on release, so they can form chords: EXIT + ENTER = WRITE screen, EDIT + A-D =
  *    edit that effect. When the partner goes down while one is held the chord fires and neither single action runs.
  *    EDIT held EDIT_HOLD_MS = bank select.
- *  - Encoder pushes (knob1-4) also act on release, and only when the knob was not turned while held: a turn while the
- *    knob is held is a coarse turn (steps x COARSE_STEPS), not a push.
+ *  - Encoder pushes (knob1-4) also act on release, and only when the knob was not turned while held: turning a pushed
+ *    knob is a press-and-turn, not a push. Turns reach the LCD host with their raw steps either way; each screen reads
+ *    `ctx.isHeld(knob)` and applies its own press-and-turn rule (larger steps in general, 0.1 BPM decimals on the TAP
+ *    TEMPO screen's knob [4], Owner's Manual p. 11; ruling R30).
  *  - trkN.fader: `fader` with `faderGain`. outputLevel: MASTER OUT (or PHONES OUT) per the OUTPUT KNOB setting.
  *  - Everything else (MENU, LOOP, ◀ ▶, RHYTHM EDIT, A-D, knob turns, the FX knobs) goes to the LCD host.
  *
@@ -37,8 +39,6 @@ export const TAP_REVERT_MS = 1500;
 /** Hold time of the PANEL functions that have a HOLD action (MARK SET2, MARK BACK2, CUR.TRK INC/DEC). */
 // INFERRED: the guide gives no time for HOLD; one second, like EDIT's long-press.
 export const PANEL_HOLD_MS = 1000;
-/** Detent multiplier for an encoder turned while pushed. */
-export const COARSE_STEPS = 10;
 
 export type FxSide = 'in' | 'tr';
 export type FxSlot = 'A' | 'B' | 'C' | 'D';
@@ -69,15 +69,17 @@ export interface ButtonHost {
 type Act = (h: ButtonHost, track: TrackIndex, t: number) => void;
 
 /**
- * What one PANEL function does. A function without `hold` acts on press (`push`). A function with `hold` waits:
- * released before PANEL_HOLD_MS it does `push` (on release), held that long it does `hold` instead, so a long press
- * never runs both (CUR.TRK DEC holds to INC, which would otherwise cancel out). `release` runs on every release
- * (the MOMENT speeds).
+ * What one PANEL function does. `push` runs on press; `hold` runs once the button has been held PANEL_HOLD_MS, after
+ * the push, and supersedes it (MARK SET2: the mark is set at the press, a hold then clears it; MARK BACK2: a hold then
+ * restores the post-recording state). With `deferPush` the push waits instead: released before PANEL_HOLD_MS it runs
+ * on release, held that long only `hold` runs. That is for CUR.TRK DEC, whose hold is INC, so a long press must not
+ * run both. `release` runs on every release (the MOMENT speeds).
  */
 export interface PanelAction {
   readonly fn: PanelFunction;
   readonly push?: Act;
   readonly hold?: Act;
+  readonly deferPush?: true;
   readonly release?: Act;
 }
 type Template = Omit<PanelAction, 'fn'>;
@@ -139,7 +141,7 @@ const TEMPLATES: Readonly<Record<string, Template>> = {
   'TRACK EDIT': { push: trackEdit },
   'TRACK FX': { push: toggleTrack('fx') },
   INC: { push: stepCurrent(1), hold: stepCurrent(1) },
-  DEC: { push: stepCurrent(-1), hold: stepCurrent(1) },   // the guide: DEC holds to INC
+  DEC: { push: stepCurrent(-1), hold: stepCurrent(1), deferPush: true },   // the guide: DEC holds to INC
   'TEMPO UP': { push: scaleTempo(2) },
   'TEMPO DOWN': { push: scaleTempo(0.5) },
   // TODO(phase 2): INPUT FX / TRACK FX section on/off arrive with the effects framework.
@@ -244,8 +246,8 @@ export class ButtonRouter {
           this.host.lcdEvent(e);
           return;
         }
-        h.turned = true;
-        this.host.lcdEvent({ kind: 'turn', id: e.id, steps: e.steps * COARSE_STEPS, t: e.t });
+        h.turned = true; // press-and-turn: the push will not fire on release
+        this.host.lcdEvent(e);
         return;
       }
       case 'set':
@@ -344,19 +346,18 @@ export class ButtonRouter {
         return;
       case 'track':
       case 'fx': {
-        // TODO(phase 1, unassigned): with CTL FUNC PREFERENCE MODE PLAY / MODE UNDO = MEMORY the functions come from the
-        // memory (memory.prefs.ctl); nothing writes those per-memory copies yet, so the system settings are used.
+        // TODO(T21: PREFERENCE=MEMORY, ruling R26): with CTL FUNC PREFERENCE MODE PLAY / MODE UNDO = MEMORY the
+        // functions come from the memory (memory.prefs.ctl); nothing writes those copies yet, so the system ones are used.
         const table = this.undo ? 'panelUndo' : 'panelPlay';
         const fnId = this.host.session.get(`ctl.${table}.${part}.${track}`) as string;
         const action = PANEL_ACTIONS.get(fnId) ?? OFF_ACTION;
         const target = (action.fn.track ?? host.session.memory.play.currentTrack) as TrackIndex;
         h.action = action;
         h.track = target;
+        if (!action.deferPush) action.push?.(host, target, t);
         if (action.hold) {
           const hold = action.hold;
           this.hold(id, h, PANEL_HOLD_MS, () => hold(host, target, t + PANEL_HOLD_MS));
-        } else {
-          action.push?.(host, target, t);
         }
         return;
       }
@@ -372,7 +373,7 @@ export class ButtonRouter {
 
     const action = h.action;
     if (action) {
-      if (action.hold && !h.consumed) action.push?.(host, h.track!, t);
+      if (action.deferPush && !h.consumed) action.push?.(host, h.track!, t);
       action.release?.(host, h.track!, t);
       return;
     }
@@ -390,7 +391,7 @@ export class ButtonRouter {
       host.lcdEvent(e);
       return;
     }
-    if (KNOBS.has(id)) return; // turned while held: that was a coarse turn, not a push
+    if (KNOBS.has(id)) return; // turned while held: a press-and-turn, not a push
     host.lcdEvent(e);
   }
 

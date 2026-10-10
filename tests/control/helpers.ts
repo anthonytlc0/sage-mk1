@@ -15,7 +15,10 @@ export class MemMemories {
   /** When true, `save` rejects with QuotaError (MEMORY FULL). */
   full = false;
   saves = 0;
+  /** How many times the (audio-loading) `load` ran. */
+  loads = 0;
   async load(slot: number): Promise<{ settings: MemorySettings; tracks: (TrackAudio | null)[] } | null> {
+    this.loads++;
     const rec = this.slots.get(slot);
     return rec ? { settings: structuredClone(rec.settings), tracks: rec.tracks.slice() } : null;
   }
@@ -29,6 +32,9 @@ export class MemMemories {
   }
   async isEmpty(slot: number): Promise<boolean> {
     return !this.slots.has(slot);
+  }
+  async hasAudio(slot: number): Promise<boolean> {
+    return this.slots.get(slot)?.tracks.some((t) => t !== null) ?? false;
   }
 }
 

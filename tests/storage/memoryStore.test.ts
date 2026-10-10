@@ -134,6 +134,20 @@ describe('MemoryStore', () => {
     expect(await store.load(12)).toBeNull();
   });
 
+  it('hasAudio answers from the slot record alone and never opens the audio store', async () => {
+    await store.save(4, settings('PHRASE'), [null, track(1)]);
+    await store.save(5, settings('SETTINGS ONLY'), [null, null, null, null, null]);
+    const tx = vi.spyOn(db, 'transaction');
+    const cursor = vi.spyOn(IDBObjectStore.prototype, 'openCursor');
+    expect(await store.hasAudio(4)).toBe(true);
+    expect(await store.hasAudio(5)).toBe(false);
+    expect(await store.hasAudio(6)).toBe(false); // never saved
+    expect(cursor).not.toHaveBeenCalled();
+    expect(tx).toHaveBeenCalledTimes(3);
+    for (const [scope] of tx.mock.calls) expect([scope].flat()).toEqual(['memories']);
+    await expect(store.hasAudio(100)).rejects.toThrow(RangeError);
+  });
+
   it('clear empties the slot and removes its chunks', async () => {
     await store.save(7, settings('SONG'), [track(25)]);
     expect(await store.isEmpty(7)).toBe(false);

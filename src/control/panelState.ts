@@ -38,8 +38,8 @@ function stateColor(state: TrackState): LedColor {
 }
 
 /** The REC/DUB/PLAY colour of a track outside undo mode, written into `out`. */
-// TODO(phase 1, unassigned): SETUP LOOP STATUS COLOR (REC/PLAY/DUB/STOP/BLANK) recolours these states; its CYAN and
-// WHITE have no LedColor yet, so the fixed manual colours (its defaults) are used.
+// deferred: LOOP STATUS COLOR (ruling R27). SETUP LOOP STATUS COLOR (REC/PLAY/DUB/STOP/BLANK) recolours these states;
+// its CYAN and WHITE have no LedColor, so the fixed manual colours (its defaults) are used.
 function trackLed(out: LedState, ts: TrackStatus | undefined): void {
   if (!ts) return setLed(out, 'off', 'none');
   if (ts.autoRecWaiting) return setLed(out, 'red', 'fast');

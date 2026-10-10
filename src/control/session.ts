@@ -71,12 +71,15 @@ export class Session {
     this.audioDirty = false;
   }
 
-  /** The current memory was just written to `slot`. */
-  markSaved(slot: number): void {
+  /**
+   * `saved`, a snapshot of the current memory, was just written to `slot`. Edits made after the snapshot stay unsaved,
+   * and so does the audio when `audioChangedSince` (the engine reported a change after the tracks were requested).
+   */
+  markSaved(slot: number, saved: MemorySettings, audioChangedSince: boolean): void {
     this.slot = slot;
-    this.savedTempo = this.memory.tempo;
-    this.paramsDirty = false;
-    this.audioDirty = false;
+    this.savedTempo = saved.tempo;
+    this.paramsDirty = JSON.stringify(saved) !== JSON.stringify(this.memory);
+    this.audioDirty = audioChangedSince;
   }
 
   private objectFor(scope: SettingsScope): MemorySettings | SystemSettings {

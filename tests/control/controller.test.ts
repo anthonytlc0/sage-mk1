@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { CHECKPOINT_DEBOUNCE_MS, MESSAGE_MS, SYSTEM_SAVE_DEBOUNCE_MS } from '../../src/control/controller';
+import { CHECKPOINT_DEBOUNCE_MS, EXPORT_TIMEOUT_MS, MESSAGE_MS, SYSTEM_SAVE_DEBOUNCE_MS, TEMPO_SETTLE_STATUSES } from '../../src/control/controller';
 import { makeStatus } from '../../src/control/fakeEngine';
 import { defaultMemory, defaultSystem } from '../../src/schema/params';
 import type { EngineCommand } from '../../src/shared/protocol';
@@ -91,16 +91,92 @@ describe('setParam and the session', () => {
     expect(c.status!.audioDirty).toBe(false);
   });
 
-  it('adopts a tempo the engine set by itself, so the next settings push does not revert it', () => {
+});
+
+describe('engine-set tempo adoption', () => {
+  const status = (engine: ReturnType<typeof setup>['engine'], tempo: number, extra: Parameters<typeof makeStatus>[0] = {}) =>
+    engine.emit({ t: 'status', status: makeStatus({ tempo, ...extra }) });
+
+  it('a genuine engine-derived tempo (first free recording) is adopted, without a settings push', () => {
     const { c, engine } = setup();
-    engine.emit({ t: 'status', status: makeStatus({ tempo: 120 }) });
-    engine.emit({ t: 'status', status: makeStatus({ tempo: 93.42 }) });
+    status(engine, 120);
+    status(engine, 120, { audioDirty: true });
+    status(engine, 93.42);
     expect(c.session.memory.tempo).toBe(93.4);
+    expect(c.session.paramsDirty).toBe(true);
     expect(engine.sent).toEqual([]);
-    // a stale status still carrying the old tempo after our own change is not adopted
+    status(engine, 93.42);
+    expect(c.session.memory.tempo).toBe(93.4);
+  });
+
+  it('two tempo changes in flight: an echo of the first does not undo the second', () => {
+    const { c, engine } = setup();
+    status(engine, 120);
+    c.setParam('tempo', 120.1);
+    c.setParam('tempo', 120.2);
+    status(engine, 120); // still the old value
+    status(engine, 120.1); // echo of the first change
+    expect(c.session.memory.tempo).toBe(120.2);
+    status(engine, 120.2);
+    expect(c.session.memory.tempo).toBe(120.2);
+    c.setParam('tempo', 120.3); // the next detent builds on 120.2
+    expect(engine.last('tempo')).toEqual({ t: 'tempo', bpm: 120.3 });
+    // after the echoes, a real engine change is adopted again
+    status(engine, 120.3);
+    status(engine, 77.77);
+    expect(c.session.memory.tempo).toBe(77.8);
+  });
+
+  it('a change back to an earlier value is not mistaken for an engine change by its stale echo', () => {
+    const { c, engine } = setup();
+    status(engine, 120);
+    c.setParam('tempo', 120.1);
+    c.setParam('tempo', 120);
+    status(engine, 120); // stale (before both sends)
+    status(engine, 120.1); // echo of the first
+    status(engine, 120); // echo of the second
+    expect(c.session.memory.tempo).toBe(120);
+  });
+
+  it('two memory loads in quick succession: the first one\'s tempo is not adopted into the second', async () => {
+    const { c, engine, stores } = setup();
+    stores.memories.slots.set(2, { settings: { ...defaultMemory(), tempo: 100 }, tracks: [null, null, null, null, null] });
+    stores.memories.slots.set(3, { settings: { ...defaultMemory(), tempo: 90 }, tracks: [null, null, null, null, null] });
+    status(engine, 120);
+    await c.selectMemory(2);
+    await c.selectMemory(3);
+    status(engine, 120);
+    status(engine, 100); // memory 2 reached the engine before memory 3 did
+    expect(c.session.memory.tempo).toBe(90);
+    expect(c.session.dirty).toBe(false);
+    status(engine, 90);
+    // a tap right after the load is not reverted by a late echo either
+    for (const t of [0, 400]) {
+      c.handle({ kind: 'press', id: 'tapTempo', t });
+      c.handle({ kind: 'release', id: 'tapTempo', t: t + 50 });
+    }
+    expect(c.session.memory.tempo).toBe(150);
+    status(engine, 90);
+    status(engine, 100);
+    expect(c.session.memory.tempo).toBe(150);
+  });
+
+  it('adopting a value the memory already has (after snapping) does not dirty it', () => {
+    const { c, engine } = setup();
+    status(engine, 120);
+    status(engine, 120.04);
+    expect(c.session.memory.tempo).toBe(120);
+    expect(c.session.dirty).toBe(false);
+  });
+
+  it('a send the engine overtook (it changed tempo right after applying ours) does not block adoption for long', () => {
+    const { c, engine } = setup();
+    status(engine, 120);
     c.setParam('tempo', 100);
-    engine.emit({ t: 'status', status: makeStatus({ tempo: 93.42 }) });
+    for (let i = 0; i < TEMPO_SETTLE_STATUSES - 1; i++) status(engine, 93.42);
     expect(c.session.memory.tempo).toBe(100);
+    status(engine, 93.42);
+    expect(c.session.memory.tempo).toBe(93.4);
   });
 });
 
@@ -173,9 +249,41 @@ describe('memories', () => {
     stores.memories.slots.set(6, { settings: defaultMemory(), tracks: [null, null, null, null, null] });
     expect(await c.write(2)).toBe('NOT EMPTY');
     expect(stores.memories.saves).toBe(0);
+    expect(stores.memories.loads).toBe(0); // checked from the record's metadata, the audio is never loaded
     expect(await c.write(6)).toBe('ok'); // settings only, no phrase: may be overwritten
     await c.selectMemory(2);
     expect(await c.write(2)).toBe('ok');
+  });
+
+  it('write aborts when the memory is reloaded while it waits for the tracks', async () => {
+    const { c, engine, stores } = setup();
+    c.setParam('name', 'TAKE ONE');
+    engine.exportReply = null;
+    const p = c.write(4);
+    const outcome = p.then(() => 'resolved', (e: Error) => e.message);
+    await vi.advanceTimersByTimeAsync(0);
+    const { reqId } = engine.last('exportTracks')!;
+    await c.selectMemory(9);
+    engine.emit({ t: 'tracks', reqId, tracks: [take(1), null, null, null, null] });
+    expect(await outcome).toMatch(/memory changed/i);
+    expect(stores.memories.saves).toBe(0);
+    expect(c.session.slot).toBe(9);
+  });
+
+  it('write saves the settings as they were when it started; edits made while it waits stay unsaved', async () => {
+    const { c, engine, stores } = setup();
+    c.setParam('name', 'BEFORE');
+    engine.exportReply = null;
+    const p = c.write(1);
+    await vi.advanceTimersByTimeAsync(0);
+    const { reqId } = engine.last('exportTracks')!;
+    c.setParam('name', 'DURING');
+    engine.emit({ t: 'status', status: makeStatus({ audioDirty: true }) });
+    engine.emit({ t: 'tracks', reqId, tracks: [null, null, null, null, null] });
+    expect(await p).toBe('ok');
+    expect(stores.memories.slots.get(1)!.settings.name).toBe('BEFORE');
+    expect(c.session.paramsDirty).toBe(true);
+    expect(c.session.audioDirty).toBe(true);
   });
 
   it('write returns MEMORY FULL when storage refuses, and the session stays dirty', async () => {
@@ -252,6 +360,38 @@ describe('recovery checkpoint', () => {
     engine.emit({ t: 'tracks', reqId, tracks: [take(1), null, null, null, null] });
     await vi.advanceTimersByTimeAsync(0);
     expect(stores.recovery.checkpoints).toHaveLength(0);
+  });
+
+  it('after powerOff no checkpoint is written: not later, not on pagehide, not one already in flight', async () => {
+    const { c, engine, events, stores } = setup();
+    engine.exportReply = null;
+    c.setParam('name', 'UNSAVED');
+    events.dispatchEvent(new Event('pagehide')); // a checkpoint now waits for the engine
+    const { reqId } = engine.last('exportTracks')!;
+    await c.powerOff();
+    engine.emit({ t: 'tracks', reqId, tracks: [take(1), null, null, null, null] });
+    engine.exportReply = [null, null, null, null, null];
+    engine.emit({ t: 'status', status: makeStatus({ audioDirty: true }) });
+    await vi.advanceTimersByTimeAsync(CHECKPOINT_DEBOUNCE_MS * 2);
+    events.dispatchEvent(new Event('pagehide'));
+    await c.checkpointNow();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stores.recovery.checkpoints).toHaveLength(0);
+    expect(stores.recovery.cleanShutdowns).toBe(1);
+  });
+
+  it('dispose drops pending track requests without a later rejection, and saves pending system settings at once', async () => {
+    const { c, engine, stores } = setup();
+    engine.exportReply = null;
+    const rejected = vi.fn();
+    c.requestTracks().catch(rejected);
+    c.setParam('setup.contrast', 7);
+    c.dispose();
+    expect(stores.system.saves).toBe(1);
+    expect(stores.system.stored!.setup.contrast).toBe(7);
+    await vi.advanceTimersByTimeAsync(EXPORT_TIMEOUT_MS * 2);
+    expect(rejected).not.toHaveBeenCalled();
+    expect(stores.system.saves).toBe(1);
   });
 
   it('a saved or reloaded memory drops the stale checkpoint', async () => {

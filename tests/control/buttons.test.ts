@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { PANEL_ACTIONS, EDIT_HOLD_MS, PANEL_HOLD_MS, TAP_REVERT_MS, COARSE_STEPS } from '../../src/control/buttons';
+import { PANEL_ACTIONS, EDIT_HOLD_MS, PANEL_HOLD_MS, TAP_REVERT_MS } from '../../src/control/buttons';
 import { PANEL_FUNCTIONS, findParam } from '../../src/schema/params';
 import { CLEAR_HOLD_MS, TEMPO_MIN } from '../../src/shared/constants';
 import { faderGain } from '../../src/dsp/mixer';
@@ -152,40 +152,44 @@ describe('PANEL functions', () => {
     ]);
   });
 
-  it('HOLD functions: MARK SET2 is MARK SET on a short press (on release) and only MARK CLEAR when held', () => {
+  it('MARK SET2 marks on press; held, MARK CLEAR follows and supersedes it', () => {
     const { c, engine } = setup();
     c.setParam('ctl.panelPlay.track.1', 'TRK2 MARK SET2');
     engine.reset();
-    press(c, 'trk2.track', 0);
-    expect(engine.sent).toEqual([]);
+    press(c, 'trk2.track', 100);
+    expect(engine.sent).toEqual([{ cmd: { t: 'markSet', track: 1 }, eventTime: 100 }]);
     vi.advanceTimersByTime(PANEL_HOLD_MS - 1);
-    expect(engine.sent).toEqual([]);
-    vi.advanceTimersByTime(1);
-    expect(engine.sent).toEqual([{ cmd: { t: 'markClear', track: 1 }, eventTime: PANEL_HOLD_MS }]);
-    release(c, 'trk2.track', PANEL_HOLD_MS + 200);
     expect(engine.sent).toHaveLength(1);
-    // a short press does only the push, at its release
+    vi.advanceTimersByTime(1);
+    expect(engine.sent.at(-1)).toEqual({ cmd: { t: 'markClear', track: 1 }, eventTime: 100 + PANEL_HOLD_MS });
+    release(c, 'trk2.track', 100 + PANEL_HOLD_MS + 200);
+    expect(engine.sent).toHaveLength(2);
+    // a short press marks at the press, not at the release
     engine.reset();
     press(c, 'trk2.track', 5000);
     release(c, 'trk2.track', 5300);
     vi.advanceTimersByTime(PANEL_HOLD_MS * 2);
-    expect(engine.sent).toEqual([{ cmd: { t: 'markSet', track: 1 }, eventTime: 5300 }]);
+    expect(engine.sent).toEqual([{ cmd: { t: 'markSet', track: 1 }, eventTime: 5000 }]);
   });
 
-  it('MARK BACK2 holds to REC BACK; CUR.TRK DEC holds to INC (never both push and hold)', () => {
+  it('MARK BACK2 marks back on press and holds to REC BACK; CUR.TRK DEC still waits (hold = INC, never both)', () => {
     const { c, engine } = setup();
     c.setParam('ctl.panelPlay.fx.2', 'TRK3 MARK BACK2');
     c.setParam('ctl.panelPlay.fx.3', 'CUR.TRK DEC');
     engine.reset();
     press(c, 'trk3.fx', 0);
+    expect(engine.types()).toEqual(['markBack']);
     vi.advanceTimersByTime(PANEL_HOLD_MS);
     release(c, 'trk3.fx', PANEL_HOLD_MS);
-    expect(engine.types()).toEqual(['recBack']);
+    expect(engine.types()).toEqual(['markBack', 'recBack']);
     press(c, 'trk4.fx', 0);
+    expect(c.session.memory.play.currentTrack).toBe(0); // DEC is deferred: nothing yet
     vi.advanceTimersByTime(PANEL_HOLD_MS);
     release(c, 'trk4.fx', PANEL_HOLD_MS);
     expect(c.session.memory.play.currentTrack).toBe(1);
-    click(c, 'trk4.fx', 3000);
+    press(c, 'trk4.fx', 3000);
+    expect(c.session.memory.play.currentTrack).toBe(1);
+    release(c, 'trk4.fx', 3050);
     expect(c.session.memory.play.currentTrack).toBe(0);
   });
 
@@ -380,14 +384,29 @@ describe('EXIT / ENTER / EDIT act on release; chords', () => {
 });
 
 describe('knobs, faders and the rest', () => {
-  it('a turn while the knob is held is coarse (x10); a push with no turn reaches the host on release', () => {
+  it('turns reach the host with raw steps, held or not (each screen applies its own press-and-turn rule)', () => {
     const { c, lcd } = setup();
+    const heldDuringTurn: boolean[] = [];
+    lcd.onEvent = (e) => {
+      lcd.events.push(e);
+      if (e.kind === 'turn') heldDuringTurn.push(c.isHeld(e.id));
+      return true;
+    };
     turn(c, 'knob1', 2, 0);
     press(c, 'knob2', 10);
     turn(c, 'knob2', -1, 20);
     release(c, 'knob2', 30);
+    expect(lcd.log()).toEqual(['turn:knob1:2', 'turn:knob2:-1']);
+    expect(heldDuringTurn).toEqual([false, true]);
+  });
+
+  it('a knob push with no turn reaches the host on release; one turned while held is not a push', () => {
+    const { c, lcd } = setup();
     click(c, 'knob3', 40);
-    expect(lcd.log()).toEqual(['turn:knob1:2', `turn:knob2:${-COARSE_STEPS}`, 'press:knob3', 'release:knob3']);
+    press(c, 'knob4', 100);
+    turn(c, 'knob4', 3, 110);
+    release(c, 'knob4', 120);
+    expect(lcd.log()).toEqual(['press:knob3', 'release:knob3', 'turn:knob4:3']);
     expect(c.isHeld('knob3')).toBe(false);
   });
 
