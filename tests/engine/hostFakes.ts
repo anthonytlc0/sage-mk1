@@ -163,6 +163,8 @@ export interface Rig {
   processor: SageProcessor;
   /** The host's end of the worklet port: `posted` holds every TimedCommand the host sent. */
   hostPort: FakePort;
+  /** The processor's end: `posted` holds every event the processor sent the host. */
+  procPort: FakePort;
   /** Everything the host passed to `log`. */
   logs: [string, unknown][];
   /** Every event the host delivered to its handlers (subscribed right after start). */
@@ -195,7 +197,7 @@ export async function startHost(
   });
   const events: EngineEvent[] = [];
   host.on((e) => events.push(e));
-  return { host, ctx, nav, doc, node: node!, processor: processor!, hostPort, logs, events };
+  return { host, ctx, nav, doc, node: node!, processor: processor!, hostPort, procPort, logs, events };
 }
 
 /** The commands the host has sent through the worklet port, in order. */

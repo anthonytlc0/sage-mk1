@@ -129,7 +129,7 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
   private readonly undelivered: EngineEvent[] = [];
   private readonly resumeHandlers = new Set<(needsResume: boolean) => void>();
   /** Streamed exports being put back together (ruling R47). */
-  private readonly assembler = new ExportAssembler();
+  private readonly assembler: ExportAssembler;
   private _needsResume = false;
   /** A mic has been open since power-on, so losing it is a loss to recover from. */
   private micExpected = false;
@@ -158,6 +158,7 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
     this.system = system;
     this.micEcho = system.setup.micProcess;
     this.touch = isTouch(nav);
+    this.assembler = new ExportAssembler(log);
   }
 
   /**
@@ -227,6 +228,11 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
     return { ...this.lat };
   }
 
+  /** Streamed exports being reassembled (diagnostics; their full-length arrays are held until they end). */
+  get exportsInFlight(): number {
+    return this.assembler.inProgress;
+  }
+
   /** Audio was lost and could not be brought back: the app shell shows TAP POWER TO RESUME while this is true. */
   get needsResume(): boolean {
     return this._needsResume;
@@ -268,6 +274,7 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
     this.doc?.removeEventListener('visibilitychange', this.onVisibility);
     this.ctx.onstatechange = null;
     this.node.port.onmessage = null;
+    this.assembler.clear(); // drop any half-built export and its arrays
     this.detachMic();
     this.node.disconnect();
     try {

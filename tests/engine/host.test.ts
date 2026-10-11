@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { AudioTake } from '../../src/core/chunks';
 import { EngineHost, eventFrame } from '../../src/engine/host';
 import { DESKTOP_MEMORY_BUDGET, PROCESSOR_NAME, TOUCH_MEMORY_BUDGET, memoryBudgetBytes } from '../../src/engine/config';
 import type { EngineLike } from '../../src/control/controller';
@@ -238,6 +239,46 @@ describe('EngineHost export reassembly (ruling R47)', () => {
     expect(replies.map((r) => r.reqId)).toEqual([1, 2]);
     expect(replies[0]!.tracks[0]!.L).toEqual(a.L);
     expect(replies[1]!.tracks[0]).toBeNull();
+  });
+});
+
+describe('EngineHost export failures', () => {
+  it('an export the processor abandons (tracksAbort) frees the host arrays and delivers nothing', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const real = AudioTake.prototype.read;
+    let reads = 0;
+    // Loaded tracks are stopped, so the export's are the only reads: the second one fails.
+    const spy = vi.spyOn(AudioTake.prototype, 'read').mockImplementation(function (this: AudioTake, ...args: Parameters<AudioTake['read']>) {
+      if (++reads === 2) throw new Error('read failed');
+      real.apply(this, args);
+    });
+    try {
+      const rig = await startHost();
+      rig.host.send({ t: 'loadTrack', track: 0, audio: audioOf(120000, 1) });
+      rig.host.send({ t: 'exportTracks', reqId: 1 });
+      run(rig.processor, 128);
+      expect(rig.host.exportsInFlight).toBe(1);
+      run(rig.processor, 128); // the second part fails
+      expect(rig.procPort.events('tracksAbort').map((e) => e.reqId)).toEqual([1]);
+      expect(rig.host.exportsInFlight).toBe(0);
+      for (let i = 0; i < 4; i++) run(rig.processor, 128);
+      expect(trackReplies(rig)).toHaveLength(0);
+      expect(rig.events.filter((e) => e.t === 'message').map((e) => (e as { text: string }).text)).toEqual(['ENGINE ERROR']);
+    } finally {
+      spy.mockRestore();
+      errors.mockRestore();
+    }
+  });
+
+  it('stop() in the middle of an export clears the reassembly state', async () => {
+    const rig = await startHost();
+    rig.host.send({ t: 'loadTrack', track: 2, audio: audioOf(150000, 2) });
+    rig.host.send({ t: 'exportTracks', reqId: 1 });
+    run(rig.processor, 128);
+    expect(rig.host.exportsInFlight).toBe(1);
+    await rig.host.stop();
+    expect(rig.host.exportsInFlight).toBe(0);
+    expect(trackReplies(rig)).toHaveLength(0);
   });
 });
 

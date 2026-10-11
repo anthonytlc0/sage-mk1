@@ -25,7 +25,8 @@ export interface TrackStatus {
   position: number; lengthFrames: number; measures: number | null; peak: number;
   canUndo: boolean; canRedo: boolean; hasMark: boolean; speed: 'HALF' | 'NORMAL' | 'DOUBLE';
 }
-export type EngineMessage = 'MEMORY FULL' | 'TEMPO TOO FAST' | 'TEMPO TOO SLOW' | 'NO INPUT' | 'ENGINE ERROR'; // ENGINE ERROR: a command failed and was dropped
+// ENGINE ERROR: the engine dropped a command that failed, or its looper failed a block.
+export type EngineMessage = 'MEMORY FULL' | 'TEMPO TOO FAST' | 'TEMPO TOO SLOW' | 'NO INPUT' | 'ENGINE ERROR';
 export interface EngineStatus {
   frame: number; sampleRate: number; tempo: number; beat: Beat; beatPhase: number; measurePhase: number;
   rhythm: 'off' | 'on' | 'standby'; tracks: TrackStatus[]; inputPeak: number; outputPeak: number;
@@ -41,8 +42,10 @@ export type EngineEvent =
   | { t: 'message'; text: EngineMessage }
   // Internal between SageProcessor and EngineHost (ruling R47): `exportTracks` is streamed so the audio thread never
   // allocates or copies a whole export in one block. A header with every track's length (the host allocates the full
-  // arrays on the main thread), parts of at most the per-block budget (buffers transferred), then the end. EngineHost
-  // reassembles them into the `tracks` event; EngineLike handlers never see these three.
+  // arrays on the main thread), parts of at most the per-block budget (buffers transferred), then the end, or an abort
+  // when the processor gave the export up (the host frees it and answers nothing). EngineHost reassembles them into the
+  // `tracks` event, only when every frame arrived; EngineLike handlers never see these four.
   | { t: 'tracksStart'; reqId: number; tracks: (TrackExportMeta | null)[] }
   | { t: 'tracksPart'; reqId: number; track: TrackIndex; offset: number; L: Float32Array; R: Float32Array }
-  | { t: 'tracksEnd'; reqId: number };
+  | { t: 'tracksEnd'; reqId: number }
+  | { t: 'tracksAbort'; reqId: number };

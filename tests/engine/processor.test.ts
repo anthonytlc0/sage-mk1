@@ -5,6 +5,7 @@ import { MasterFx } from '../../src/dsp/master';
 import { defaultMemory } from '../../src/schema/memory';
 import type { TrackAudio } from '../../src/shared/protocol';
 import { AudioTake } from '../../src/core/chunks';
+import { LooperCore } from '../../src/core/looper';
 import { BLOCK, SR, assembled, awaitTracks, exportTracks, freeSettings, makeProcessor, maxAbs, minOf, run, send } from './helpers';
 
 /** Deterministic stereo audio whose every sample differs. */
@@ -356,6 +357,32 @@ describe('SageProcessor exportTracks (streamed, ruling R47)', () => {
     expect(order).toEqual([...order].sort((x, y) => x - y));
   });
 
+  it('a failure while streaming abandons the export and tells the host (tracksAbort)', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const real = AudioTake.prototype.read;
+    let reads = 0;
+    const spy = vi.spyOn(AudioTake.prototype, 'read').mockImplementation(function (this: AudioTake, ...args: Parameters<AudioTake['read']>) {
+      if (++reads === 2) throw new Error('read failed');
+      real.apply(this, args);
+    });
+    try {
+      const { p, port } = loaded();
+      send(port, { t: 'exportTracks', reqId: 6 });
+      run(p, BLOCK);
+      run(p, BLOCK);
+      expect(port.events('tracksAbort').map((e) => e.reqId)).toEqual([6]);
+      expect(port.events('tracksEnd')).toHaveLength(0);
+      expect(port.events('message').map((e) => e.text)).toEqual(['ENGINE ERROR']);
+      spy.mockRestore();
+      for (const track of [0, 2, 4] as const) send(port, { t: 'clear', track });
+      run(p, 1600);
+      expect(port.events('status').at(-1)!.status.memoryBytes).toBe(0); // its snapshots were released
+    } finally {
+      spy.mockRestore();
+      errors.mockRestore();
+    }
+  });
+
   it('a snapshot failing part-way releases the snapshots already taken (all or nothing)', () => {
     const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const real = AudioTake.prototype.snapshot;
@@ -499,6 +526,70 @@ describe('SageProcessor robustness and CPU', () => {
       expect(exportTracks(p, port)[1]!.L.length).toBe(2400);
     } finally {
       errors.mockRestore();
+    }
+  });
+
+  it('no failure puts a stale memory tempo back over a tempo the engine derived (R31)', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const { p, port } = makeProcessor();
+      send(port, freeSettings((m) => {
+        for (const t of m.track) t.loopSyncSw = true; // the first loop defines the tempo
+      }));
+      send(port, { t: 'recPlay', track: 0 });
+      run(p, 72000, 0.5);
+      send(port, { t: 'recPlay', track: 0 });
+      run(p, 1600, 0.5);
+      const derived = port.events('status').at(-1)!.status.tempo;
+      expect(Math.abs(derived - 120)).toBeGreaterThan(1);
+      // The controller adopts the derived tempo without a push, so the processor's last settings still say 120.
+      // (i) A dated command that throws inside the core's render: nothing is restored (no settings are re-applied).
+      const setSettings = vi.spyOn(LooperCore.prototype, 'setSettings');
+      port.receive({ cmd: { t: 'loadTrack', track: 1, audio: { L: null, R: null, sampleRate: SR, recordedTempo: 120, measures: null } }, at: 74000 });
+      run(p, 3200, 0);
+      expect(setSettings).not.toHaveBeenCalled();
+      setSettings.mockRestore();
+      expect(port.events('status').at(-1)!.status.tempo).toBeCloseTo(derived, 9);
+      // (ii) A settings command the core refuses: the last good settings come back, at the live tempo.
+      port.receive({ cmd: { t: 'settings', memory: {}, system: freeSettings().system }, at: null });
+      run(p, 1600, 0);
+      expect(port.events('status').at(-1)!.status.tempo).toBeCloseTo(derived, 9);
+      expect(port.events('message').map((e) => e.text)).toEqual(['ENGINE ERROR', 'ENGINE ERROR']);
+      expect(port.events('status').at(-1)!.status.tracks[0]!.state).toBe('playing');
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it('a looper that fails every block is reported at most once a second and logged once per burst', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const broken = vi.spyOn(LooperCore.prototype, 'process');
+    try {
+      const { p, port } = makeProcessor();
+      send(port, freeSettings((_m, s) => {
+        s.output.routing.inputThru = true;
+      }));
+      run(p, BLOCK);
+      broken.mockImplementation(() => {
+        throw new Error('broken');
+      });
+      const out = run(p, 3 * SR, 0.5); // 3 s of failing blocks
+      const reports = port.events('message').filter((e) => e.text === 'ENGINE ERROR').length;
+      expect(reports).toBeGreaterThanOrEqual(2);
+      expect(reports).toBeLessThanOrEqual(3);
+      expect(errors).toHaveBeenCalledTimes(1);
+      expect(out.L[3 * SR - 1]).toBeCloseTo(0.5, 4); // the block still renders (the monitored mic) and statuses go on
+      expect(port.events('status').length).toBeGreaterThanOrEqual(180);
+      // Healthy again, then a new burst: logged again.
+      broken.mockRestore();
+      run(p, SR, 0.5);
+      vi.spyOn(LooperCore.prototype, 'process').mockImplementation(() => {
+        throw new Error('broken again');
+      });
+      run(p, BLOCK, 0.5);
+      expect(errors).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.restoreAllMocks();
     }
   });
 

@@ -15,8 +15,12 @@
  *     cannot stop the processor (a browser never calls a processor again after it throws);
  *  2. the mic input chain (MIC 1 IN gain and mute, EQ, comp, noise suppressor);
  *  3. the looper core (each track after PLAY LEVEL, PAN and fades; the guide click). Its RHYTHM inputs are silent
- *     until input routing lands (Task 9). A dated command the core applies inside its render that throws is caught
- *     there: the tracks are silent for that block and ENGINE ERROR is reported;
+ *     until input routing lands (Task 9). If its render throws (a dated command it applies there, which is then out of
+ *     its queue), that block's tracks are silent and the rest of the block renders; the first failure of a run is
+ *     logged and ENGINE ERROR is reported at most once a second, with nothing allocated per failed block. The core's
+ *     frame counter is private and only a completed render advances it, so a failed block leaves it one block behind;
+ *     the per-block offset (currentFrame - core.frame) keeps dated commands right, and the skew inside the core is at
+ *     most the frames it rendered before the failure (a core `skip(n)` would remove it: a lane-a follow-up);
  *  4. the mixer: `out`, what is heard, and, only while the recorder is on, `perf`, the recorder bus with the mic always
  *     in. The core's click goes in as the rhythm. The core has already panned the tracks (ruling R19), so the mixer
  *     does not pan again;
@@ -125,8 +129,15 @@ export class SageProcessor {
   private buf = makeBuffers(QUANTUM);
   /** The last settings the DSP and the core both took: put back when a settings command fails part-way. */
   private good: { memory: MemorySettings; system: SystemSettings };
-  /** A failure inside the core's render, to report with the next status (at most one ENGINE ERROR per status). */
-  private renderFailed = false;
+  /** The core's render failed in the last block (a run of failures is logged once). */
+  private failing = false;
+  /** Frames until a render failure may be reported again (ENGINE ERROR at most once a second). */
+  private errorCooldown = 0;
+  /** The tempo in the last status: the fallback for the live tempo if the core cannot report it. */
+  private lastTempo: number;
+  /** Pulses a status() read outside postStatus took from the core, handed on with the next status. */
+  private carriedDirty = false;
+  private readonly carriedPeaks = new Float64Array(TRACKS.length);
   /** AudioContext frame minus core frame, from the worklet's `currentFrame` (0 until one is given). */
   private offset = 0;
 
@@ -170,6 +181,7 @@ export class SageProcessor {
     this.masterPerf = new MasterFx(sr);
     // The core starts on the guide defaults; the DSP matches it until the host sends the real settings.
     this.good = { memory: defaultMemory(), system: defaultSystem() };
+    this.lastTempo = this.good.memory.tempo;
     this.configureDsp(this.good.system);
     this.exportBudget = Math.max(1, Math.round(sr * EXPORT_SECONDS_PER_BLOCK));
     this.statusEvery = Math.max(1, Math.round(sr / STATUS_HZ));
@@ -220,18 +232,9 @@ export class SageProcessor {
     }
     try {
       this.core.process(recL, recR, b.silence, b.silence, b.core, n);
+      this.failing = false;
     } catch (e) {
-      // A dated command the core applied inside its render threw (it is out of the queue now). Silence the tracks for
-      // this block, put the core back on the last good settings, and keep rendering.
-      console.error('engine: the looper failed this block', e);
-      for (let i = 0; i < b.core.tracks.length; i++) {
-        b.core.tracks[i]![0].fill(0, 0, n);
-        b.core.tracks[i]![1].fill(0, 0, n);
-      }
-      b.core.click[0].fill(0, 0, n);
-      b.core.click[1].fill(0, 0, n);
-      this.restoreCore();
-      this.renderFailed = true;
+      this.renderFailed(e, b, n);
     }
 
     // 4.-5. Mix and run MASTER FX: `out` always, the recorder bus only while the recorder is on.
@@ -267,6 +270,8 @@ export class SageProcessor {
       this.postStatus();
     }
 
+    if (this.errorCooldown > 0) this.errorCooldown -= n;
+
     // 9. Exports.
     if (this.exports.length > 0) {
       try {
@@ -281,6 +286,28 @@ export class SageProcessor {
   }
 
   // -------------------------------------------------------------------------------------------------------------------
+
+  /**
+   * The core's render threw. Drop this block's track output and keep rendering; nothing to restore (settings never sit
+   * in the core's queue). Logged once per run of failures, reported at most once a second, nothing allocated otherwise.
+   */
+  private renderFailed(e: unknown, b: Buffers, n: number): void {
+    if (!this.failing) {
+      this.failing = true;
+      console.error('engine: the looper failed (repeats in a row are not logged)', e);
+    }
+    const tracks = b.core.tracks;
+    for (let i = 0; i < tracks.length; i++) {
+      tracks[i]![0].fill(0, 0, n);
+      tracks[i]![1].fill(0, 0, n);
+    }
+    b.core.click[0].fill(0, 0, n);
+    b.core.click[1].fill(0, 0, n);
+    if (this.errorCooldown <= 0) {
+      this.errorCooldown = this.sr;
+      this.post({ t: 'message', text: 'ENGINE ERROR' });
+    }
+  }
 
   private receive(data: unknown): void {
     if (isTimedCommand(data)) this.inbox.push(data);
@@ -338,22 +365,44 @@ export class SageProcessor {
    * settings and the error goes on to the caller.
    */
   private applySettings(cmd: Extract<EngineCommand, { t: 'settings' }>): void {
+    let coreTouched = false;
     try {
       this.configureDsp(cmd.system);
+      coreTouched = true;
       this.core.command(cmd);
     } catch (e) {
       this.configureDsp(this.good.system);
-      this.restoreCore();
+      if (coreTouched) this.restoreCore(); // the core may hold the bad settings now; otherwise it never saw them
       throw e;
     }
     this.good = { memory: cmd.memory, system: cmd.system };
   }
 
+  /**
+   * After a settings command failed inside the core: the last good settings again, at the core's live tempo. The last
+   * good memory may carry a tempo the engine has since replaced (a first loop derives one, which the controller adopts
+   * without a push), and putting that back would retime the loops (R31).
+   */
   private restoreCore(): void {
+    this.good = { memory: { ...this.good.memory, tempo: this.liveTempo() }, system: this.good.system };
     try {
       this.core.setSettings(this.good.memory, this.good.system);
     } catch (e) {
       console.error('engine: the looper refused the last good settings', e); // they applied before; never expected
+    }
+  }
+
+  /** The transport's tempo now, from a core status (its pulses are kept for the next status) or the last status. */
+  private liveTempo(): number {
+    try {
+      const cs = this.core.status();
+      if (cs.audioDirty) this.carriedDirty = true;
+      for (let i = 0; i < cs.tracks.length && i < this.carriedPeaks.length; i++) {
+        this.carriedPeaks[i] = Math.max(this.carriedPeaks[i]!, cs.tracks[i]!.peak);
+      }
+      return cs.tempo;
+    } catch {
+      return this.lastTempo;
     }
   }
 
@@ -416,6 +465,7 @@ export class SageProcessor {
    */
   private startExport(reqId: number): void {
     const takes: (AudioTake | null)[] = [];
+    let headerSent = false;
     try {
       const meta: (TrackExportMeta | null)[] = [];
       for (const tr of this.core.tracks) {
@@ -430,11 +480,13 @@ export class SageProcessor {
         meta.push({ frames: take.length, sampleRate: this.sr, recordedTempo: tr.recordedTempo, measures: tr.measures });
       }
       this.post({ t: 'tracksStart', reqId, tracks: meta });
+      headerSent = true;
+      this.exports.push({ reqId, takes, part: 0, pos: 0 });
     } catch (e) {
       for (const t of takes) t?.release();
+      if (headerSent) this.post({ t: 'tracksAbort', reqId }); // the host has allocated for it: let it go
       throw e;
     }
-    this.exports.push({ reqId, takes, part: 0, pos: 0 });
   }
 
   /** Streams up to `exportBudget` frames of the pending exports as parts, and ends each one that is complete. */
@@ -466,15 +518,32 @@ export class SageProcessor {
     }
   }
 
-  /** Abandons every pending export, releasing its snapshots (the controller's request times out). */
+  /**
+   * Abandons every pending export: its snapshots are released and the host is told (`tracksAbort`), so it frees the
+   * arrays it allocated; the controller's request then times out.
+   */
   private dropExports(): void {
-    for (const job of this.exports) for (const t of job.takes) t?.release();
-    this.exports.length = 0;
+    const jobs = this.exports.splice(0);
+    for (const job of jobs) {
+      for (const t of job.takes) t?.release();
+      this.post({ t: 'tracksAbort', reqId: job.reqId });
+    }
   }
 
   private postStatus(): void {
+    const cs = this.core.status();
+    if (this.carriedDirty) {
+      cs.audioDirty = true;
+      this.carriedDirty = false;
+    }
+    for (let i = 0; i < cs.tracks.length && i < this.carriedPeaks.length; i++) {
+      const t = cs.tracks[i]!;
+      if (this.carriedPeaks[i]! > t.peak) t.peak = this.carriedPeaks[i]!;
+      this.carriedPeaks[i] = 0;
+    }
+    this.lastTempo = cs.tempo;
     const status: EngineStatus = {
-      ...this.core.status(),
+      ...cs,
       frame: this.core.frame + this.offset,
       sampleRate: this.sr,
       inputPeak: this.inPeak,
@@ -484,10 +553,6 @@ export class SageProcessor {
     this.inPeak = 0;
     this.outPeak = 0;
     this.post({ t: 'status', status });
-    if (this.renderFailed) {
-      this.renderFailed = false;
-      this.post({ t: 'message', text: 'ENGINE ERROR' });
-    }
     const messages = this.core.takeMessages();
     for (let i = 0; i < messages.length; i++) this.post({ t: 'message', text: messages[i]! });
   }
