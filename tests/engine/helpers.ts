@@ -6,7 +6,8 @@ import { FakePort } from '../../src/engine/fakePort';
 import { defaultMemory } from '../../src/schema/memory';
 import { defaultSystem } from '../../src/schema/system';
 import type { MemorySettings, SystemSettings } from '../../src/schema/types';
-import type { EngineCommand, TrackAudio } from '../../src/shared/protocol';
+import { ExportAssembler } from '../../src/engine/assemble';
+import type { EngineCommand, EngineEvent, TrackAudio } from '../../src/shared/protocol';
 
 export const SR = 48000;
 export const BLOCK = 128;
@@ -70,11 +71,23 @@ export function run(
   return { L, R };
 }
 
-/** Runs blocks of silence until the processor answers `reqId` (the export copies a bounded amount per block). */
+/** The export `reqId` reassembled from the parts the processor posted so far, as EngineHost does; null if unfinished. */
+export function assembled(port: FakePort, reqId: number): (TrackAudio | null)[] | null {
+  const asm = new ExportAssembler();
+  for (const { data } of port.posted) {
+    const e = data as EngineEvent;
+    if (e.t !== 'tracksStart' && e.t !== 'tracksPart' && e.t !== 'tracksEnd') continue;
+    const done = asm.take(e);
+    if (done !== null && done.reqId === reqId) return done.tracks;
+  }
+  return null;
+}
+
+/** Runs blocks of silence until the processor has streamed all of export `reqId`, and returns it reassembled. */
 export function awaitTracks(p: SageProcessor, port: FakePort, reqId: number, maxBlocks = 10000): (TrackAudio | null)[] {
   for (let i = 0; i < maxBlocks; i++) {
-    const reply = port.events('tracks').find((e) => e.reqId === reqId);
-    if (reply) return reply.tracks;
+    const tracks = assembled(port, reqId);
+    if (tracks !== null) return tracks;
     run(p, BLOCK);
   }
   throw new Error(`no tracks reply for request ${reqId}`);

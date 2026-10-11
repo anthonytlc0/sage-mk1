@@ -4,7 +4,8 @@ import { DESKTOP_MEMORY_BUDGET, PROCESSOR_NAME, RECORDER_BLOCK } from '../../src
 import { MasterFx } from '../../src/dsp/master';
 import { defaultMemory } from '../../src/schema/memory';
 import type { TrackAudio } from '../../src/shared/protocol';
-import { BLOCK, SR, awaitTracks, exportTracks, freeSettings, makeProcessor, maxAbs, minOf, run, send } from './helpers';
+import { AudioTake } from '../../src/core/chunks';
+import { BLOCK, SR, assembled, awaitTracks, exportTracks, freeSettings, makeProcessor, maxAbs, minOf, run, send } from './helpers';
 
 /** Deterministic stereo audio whose every sample differs. */
 function noiseAudio(frames: number, seed: number): TrackAudio {
@@ -151,7 +152,7 @@ describe('SageProcessor', () => {
     expect(frames).toBeLessThanOrEqual(1664);
   });
 
-  it('answers exportTracks with the five tracks, transferring the copies', () => {
+  it('answers exportTracks with the five tracks, streamed in transferred parts', () => {
     const { p, port } = makeProcessor();
     send(port, freeSettings());
     send(port, { t: 'recPlay', track: 1 });
@@ -165,8 +166,10 @@ describe('SageProcessor', () => {
     expect(t.L.length).toBe(4800);
     expect(t.sampleRate).toBe(SR);
     expect(t.L[2400]).toBeCloseTo(0.5, 5);
-    const post = port.posted.find((m) => (m.data as { t: string }).t === 'tracks')!;
-    expect(post.transfer).toHaveLength(2);
+    const parts = port.posted.filter((m) => (m.data as { t: string }).t === 'tracksPart');
+    expect(parts.length).toBeGreaterThan(0);
+    for (const m of parts) expect(m.transfer).toHaveLength(2);
+    expect(port.events('tracks')).toHaveLength(0); // the processor never posts the assembled event: the host builds it
   });
 
   it('loads a track sent with loadTrack', () => {
@@ -260,31 +263,36 @@ describe('SageProcessor timeline', () => {
   });
 });
 
-describe('SageProcessor exportTracks', () => {
-  it('copies across blocks, at most one second of audio per block, and returns the audio exactly', () => {
+describe('SageProcessor exportTracks (streamed, ruling R47)', () => {
+  /** Loads 2.5 s of distinct audio on tracks 1, 3 and 5. */
+  function loaded(): { p: SageProcessor; port: ReturnType<typeof makeProcessor>['port']; srcs: [number, TrackAudio][] } {
     const { p, port } = makeProcessor();
     send(port, freeSettings());
-    const a = noiseAudio(SR, 1);
-    const b = noiseAudio(SR, 2);
-    const c = noiseAudio(SR / 2, 3);
-    send(port, { t: 'loadTrack', track: 0, audio: a });
-    send(port, { t: 'loadTrack', track: 2, audio: b });
-    send(port, { t: 'loadTrack', track: 4, audio: c });
+    const srcs: [number, TrackAudio][] = [[0, noiseAudio(SR, 1)], [2, noiseAudio(SR, 2)], [4, noiseAudio(SR / 2, 3)]];
+    for (const [track, audio] of srcs) send(port, { t: 'loadTrack', track: track as 0 | 2 | 4, audio });
     run(p, BLOCK);
+    return { p, port, srcs };
+  }
+
+  it('streams at most one second of audio per block as parts, and the parts reassemble sample-exact', () => {
+    const { p, port, srcs } = loaded();
     send(port, { t: 'exportTracks', reqId: 3 });
-    // 2.5 s of audio at 1 s per block: no answer after one or two blocks, the answer after the third.
-    run(p, BLOCK);
-    expect(port.events('tracks')).toHaveLength(0);
-    run(p, BLOCK);
-    expect(port.events('tracks')).toHaveLength(0);
-    run(p, BLOCK);
-    const reply = port.events('tracks');
-    expect(reply).toHaveLength(1);
-    const tracks = reply[0]!.tracks;
-    expect(reply[0]!.reqId).toBe(3);
+    // The header goes at once; 2.5 s of audio at 1 s per block ends after the third block.
+    const perBlock: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const before = port.events('tracksPart').length;
+      run(p, BLOCK);
+      perBlock.push(port.events('tracksPart').slice(before).reduce((n, e) => n + e.L.length, 0));
+      expect(port.events('tracksEnd')).toHaveLength(i < 2 ? 0 : 1);
+    }
+    expect(perBlock).toEqual([SR, SR, SR / 2]);
+    const head = port.events('tracksStart')[0]!;
+    expect(head.reqId).toBe(3);
+    expect(head.tracks.map((m) => m?.frames ?? null)).toEqual([SR, null, SR, null, SR / 2]);
+    const tracks = assembled(port, 3)!;
     expect(tracks[1]).toBeNull();
     expect(tracks[3]).toBeNull();
-    for (const [i, src] of [[0, a], [2, b], [4, c]] as const) {
+    for (const [i, src] of srcs) {
       expect(tracks[i]!.L).toEqual(src.L);
       expect(tracks[i]!.R).toEqual(src.R);
       expect(tracks[i]!.sampleRate).toBe(SR);
@@ -293,7 +301,34 @@ describe('SageProcessor exportTracks', () => {
     }
   });
 
-  it('exports the audio as it was when asked, even if the track changes while it copies', () => {
+  it('allocates nothing on the audio thread in proportion to the whole export: at most the per-block budget', () => {
+    const { p, port } = loaded();
+    const sizes: number[] = [];
+    const Real = Float32Array;
+    vi.stubGlobal('Float32Array', new Proxy(Real, {
+      construct(target, args: unknown[]) {
+        sizes.push(typeof args[0] === 'number' ? args[0] : -1);
+        return Reflect.construct(target, args) as object;
+      },
+    }));
+    try {
+      const perBlock: number[] = [];
+      send(port, { t: 'exportTracks', reqId: 1 });
+      for (let i = 0; i < 4; i++) {
+        sizes.length = 0;
+        run(p, BLOCK);
+        perBlock.push(sizes.filter((n) => n > BLOCK).reduce((a, b) => a + b, 0));
+      }
+      // Two channels of at most one second each per block; never the 2.5 s total at once.
+      for (const n of perBlock) expect(n).toBeLessThanOrEqual(2 * SR);
+      expect(Math.max(...perBlock)).toBeGreaterThan(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(assembled(port, 1)).not.toBeNull();
+  });
+
+  it('exports the audio as it was when asked, even if the track changes while it streams', () => {
     const { p, port } = makeProcessor();
     send(port, freeSettings());
     const a = noiseAudio(3 * SR, 4);
@@ -306,21 +341,48 @@ describe('SageProcessor exportTracks', () => {
     expect(exportTracks(p, port, 2)[1]).toBeNull();
   });
 
-  it('answers requests in order, sharing the per-block budget', () => {
+  it('streams requests in order, sharing the per-block budget', () => {
     const { p, port } = makeProcessor();
     send(port, freeSettings());
     send(port, { t: 'loadTrack', track: 0, audio: noiseAudio(SR, 5) });
     send(port, { t: 'exportTracks', reqId: 1 });
     send(port, { t: 'exportTracks', reqId: 2 });
     run(p, BLOCK);
-    expect(port.events('tracks').map((e) => e.reqId)).toEqual([1]);
+    expect(port.events('tracksEnd').map((e) => e.reqId)).toEqual([1]);
     run(p, BLOCK);
-    expect(port.events('tracks').map((e) => e.reqId)).toEqual([1, 2]);
+    expect(port.events('tracksEnd').map((e) => e.reqId)).toEqual([1, 2]);
+    // Every part of request 1 comes before any part of request 2.
+    const order = port.events('tracksPart').map((e) => e.reqId);
+    expect(order).toEqual([...order].sort((x, y) => x - y));
+  });
+
+  it('a snapshot failing part-way releases the snapshots already taken (all or nothing)', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const real = AudioTake.prototype.snapshot;
+    let calls = 0;
+    const spy = vi.spyOn(AudioTake.prototype, 'snapshot').mockImplementation(function (this: AudioTake) {
+      if (++calls === 2) throw new Error('snapshot failed');
+      return real.call(this);
+    });
+    try {
+      const { p, port } = loaded();
+      send(port, { t: 'exportTracks', reqId: 1 });
+      run(p, BLOCK);
+      expect(port.events('message').map((e) => e.text)).toEqual(['ENGINE ERROR']);
+      expect(port.events('tracksStart')).toHaveLength(0);
+      for (const track of [0, 2, 4] as const) send(port, { t: 'clear', track });
+      run(p, 1600);
+      expect(port.events('status').at(-1)!.status.memoryBytes).toBe(0); // no chunk kept alive by a lost snapshot
+    } finally {
+      spy.mockRestore();
+      errors.mockRestore();
+    }
   });
 });
 
 describe('SageProcessor robustness and CPU', () => {
-  it('drops a command that throws, reports ENGINE ERROR, and keeps rendering', () => {
+  it('drops a command that throws, reports ENGINE ERROR (and logs it), and keeps rendering', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const { p, port } = makeProcessor();
     port.receive({ cmd: { t: 'settings', memory: defaultMemory() }, at: null }); // no system: configure throws
     send(port, freeSettings((_m, s) => {
@@ -330,6 +392,114 @@ describe('SageProcessor robustness and CPU', () => {
     expect(port.events('message').map((e) => e.text)).toEqual(['ENGINE ERROR']);
     expect(out.L[1599]).toBeCloseTo(0.5, 4); // the command after it applied, and the blocks kept coming
     expect(port.events('status')).toHaveLength(2);
+    expect(errors).toHaveBeenCalledTimes(1);
+    errors.mockRestore();
+  });
+
+  it('a settings command that fails part-way leaves every DSP block and the core on the last good settings', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const { p, port } = makeProcessor();
+      send(port, freeSettings((_m, s) => {
+        s.output.routing.inputThru = true;
+        s.mixer.loopOut = 50;
+      }));
+      send(port, { t: 'recPlay', track: 0 });
+      run(p, 4800, 0.5);
+      send(port, { t: 'recPlay', track: 0 });
+      run(p, 1600, 0);
+      const good = run(p, 800, 0).L[799]!;
+      expect(good).toBeCloseTo(0.25, 4); // the loop at LOOP OUT 50
+      // INPUT and MIXER would configure (LOOP OUT 200), then MASTER FX finds no `master` and throws.
+      const bad = freeSettings((m, s) => {
+        s.mixer.loopOut = 200;
+        m.tempo = 200;
+      });
+      delete (bad.system as { master?: unknown }).master;
+      send(port, bad);
+      const after = run(p, 1600, 0).L[1599]!;
+      expect(after).toBeCloseTo(good, 6);
+      expect(port.events('message').map((e) => e.text)).toEqual(['ENGINE ERROR']);
+      expect(port.events('status').at(-1)!.status.tempo).not.toBeCloseTo(200, 3);
+      expect(errors).toHaveBeenCalled();
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it('a bad memory leaves the core on the last good settings, so it keeps rendering', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const { p, port } = makeProcessor();
+      send(port, freeSettings());
+      send(port, { t: 'recPlay', track: 0 });
+      run(p, 4800, 0.5);
+      send(port, { t: 'recPlay', track: 0 });
+      port.receive({ cmd: { t: 'settings', memory: {}, system: freeSettings().system }, at: null });
+      const out = run(p, 4800, 0);
+      expect(out.L[4799]).toBeCloseTo(0.5, 4);
+      expect(port.events('message').map((e) => e.text)).toEqual(['ENGINE ERROR']);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it('probe B: after a bad settings command the recorder still starts and records', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const { p, port } = makeProcessor();
+      port.receive({ cmd: { t: 'settings', memory: defaultMemory() }, at: null }); // no system
+      send(port, { t: 'recorder', on: true });
+      run(p, RECORDER_BLOCK, 0.25);
+      const blocks = port.events('recorderBlock');
+      expect(blocks).toHaveLength(1);
+      expect(blocks[0]!.L[RECORDER_BLOCK - 1]).toBeCloseTo(0.25, 4);
+      expect(port.events('message').map((e) => e.text)).toEqual(['ENGINE ERROR']);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it('probe C: a bad settings command dated in a later block is caught too, and the blocks keep coming', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const { p, port } = makeProcessor();
+      send(port, freeSettings((_m, s) => {
+        s.output.routing.inputThru = true;
+      }));
+      // A valid system but a broken memory, dated: the core would queue it and apply it inside its render.
+      port.receive({ cmd: { t: 'settings', memory: {}, system: freeSettings().system }, at: 1000 });
+      const out = run(p, 3200, 0.5);
+      expect(out.L[3199]).toBeCloseTo(0.5, 4);
+      expect(port.events('message').map((e) => e.text)).toEqual(['ENGINE ERROR']);
+      expect(port.events('status')).toHaveLength(4);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it('a bad command the core applies later, inside its render, is caught: ENGINE ERROR, and rendering goes on', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const { p, port } = makeProcessor();
+      send(port, freeSettings((_m, s) => {
+        s.output.routing.inputThru = true;
+      }));
+      // Dated: the core queues it and applies it at frame 1000, inside its process().
+      port.receive({ cmd: { t: 'loadTrack', track: 0, audio: { L: null, R: null, sampleRate: SR, recordedTempo: 120, measures: null } }, at: 1000 });
+      const out = run(p, 3200, 0.5);
+      expect(out.L[3199]).toBeCloseTo(0.5, 4);
+      expect(port.events('message').map((e) => e.text)).toEqual(['ENGINE ERROR']);
+      expect(errors).toHaveBeenCalled();
+      // And the core still works.
+      send(port, { t: 'recPlay', track: 1 });
+      run(p, 2400, 0.5);
+      send(port, { t: 'recPlay', track: 1 });
+      run(p, BLOCK, 0.5);
+      expect(exportTracks(p, port)[1]!.L.length).toBe(2400);
+    } finally {
+      errors.mockRestore();
+    }
   });
 
   it('skips the recorder bus MASTER FX while the recorder is off', () => {

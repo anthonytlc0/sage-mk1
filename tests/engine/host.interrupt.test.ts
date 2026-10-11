@@ -248,6 +248,21 @@ describe('EngineHost interrupts (ruling R37)', () => {
     expect(messages(rig)).toEqual([]);
   });
 
+  it('running again while the page is hidden leaves the mic to the visible resume', async () => {
+    const rig = await startHost({ nav: touchNav() });
+    rig.doc.set('hidden');
+    rig.ctx.setState('interrupted');
+    rig.nav.streams[0]!.track.readyState = 'ended';
+    rig.ctx.setState('running'); // still hidden: no getUserMedia from the background
+    await settle();
+    expect(rig.nav.streams).toHaveLength(1);
+    rig.doc.set('visible');
+    await settle();
+    expect(rig.nav.streams).toHaveLength(2);
+    expect(rig.ctx.sources[1]!.node.connections).toEqual([rig.node]);
+    expect(rig.host.micAvailable).toBe(true);
+  });
+
   it('a mic that cannot be had again gives NO INPUT and needsResume', async () => {
     const rig = await startHost();
     rig.nav.streams[0]!.track.readyState = 'ended';

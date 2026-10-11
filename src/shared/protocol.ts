@@ -31,9 +31,18 @@ export interface EngineStatus {
   rhythm: 'off' | 'on' | 'standby'; tracks: TrackStatus[]; inputPeak: number; outputPeak: number;
   memoryBytes: number; memoryBudget: number; recorderFrames: number | null; audioDirty: boolean;
 }
+/** One track of a streamed export (`tracksStart`): its length and metadata, or null when the track has no loop. */
+export interface TrackExportMeta { frames: number; sampleRate: number; recordedTempo: number; measures: number | null }
 export type EngineEvent =
   | { t: 'status'; status: EngineStatus }
   | { t: 'tracks'; reqId: number; tracks: (TrackAudio | null)[] }
   | { t: 'recorderBlock'; L: Float32Array; R: Float32Array }
   | { t: 'calibration'; reqId: number; capture: Float32Array; clickFrames: number[] }
-  | { t: 'message'; text: EngineMessage };
+  | { t: 'message'; text: EngineMessage }
+  // Internal between SageProcessor and EngineHost (ruling R47): `exportTracks` is streamed so the audio thread never
+  // allocates or copies a whole export in one block. A header with every track's length (the host allocates the full
+  // arrays on the main thread), parts of at most the per-block budget (buffers transferred), then the end. EngineHost
+  // reassembles them into the `tracks` event; EngineLike handlers never see these three.
+  | { t: 'tracksStart'; reqId: number; tracks: (TrackExportMeta | null)[] }
+  | { t: 'tracksPart'; reqId: number; track: TrackIndex; offset: number; L: Float32Array; R: Float32Array }
+  | { t: 'tracksEnd'; reqId: number };

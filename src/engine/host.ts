@@ -32,6 +32,7 @@ import type { EngineLike } from '../control/controller';
 import { defaultSystem } from '../schema/system';
 import type { SystemSettings } from '../schema/types';
 import type { EngineCommand, EngineEvent, TimedCommand } from '../shared/protocol';
+import { ExportAssembler, isExportEvent } from './assemble';
 import { PROCESSOR_NAME, isTouch, memoryBudgetBytes } from './config';
 import type { MessagePortLike } from './processor';
 
@@ -127,6 +128,8 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
   /** Messages raised while nobody listened (NO INPUT during `start`), for the first subscriber. */
   private readonly undelivered: EngineEvent[] = [];
   private readonly resumeHandlers = new Set<(needsResume: boolean) => void>();
+  /** Streamed exports being put back together (ruling R47). */
+  private readonly assembler = new ExportAssembler();
   private _needsResume = false;
   /** A mic has been open since power-on, so losing it is a loss to recover from. */
   private micExpected = false;
@@ -309,9 +312,12 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
     return track === undefined || track.readyState === 'ended' || (mutedToo && track.muted);
   }
 
-  /** The context runs again by itself: reopen an ended mic, and clear `needsResume` once audio is back. */
+  /**
+   * The context runs again by itself: reopen an ended mic, and clear `needsResume` once audio is back. Only while the
+   * page is visible: from the background getUserMedia is refused or prompts unseen, and the visible resume does it.
+   */
   private async recheck(): Promise<void> {
-    if (this.stopped || this.ctx.state !== 'running') return;
+    if (this.stopped || this.ctx.state !== 'running' || (this.doc !== null && this.doc.visibilityState !== 'visible')) return;
     if (this.micLost(false) && !(await this.reopenMic())) {
       if (!this.stopped) this.lostAudio();
       return;
@@ -415,7 +421,14 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
 
   private receive(data: unknown): void {
     if (typeof data !== 'object' || data === null || typeof (data as { t?: unknown }).t !== 'string') return;
-    this.dispatch(data as EngineEvent);
+    const e = data as EngineEvent;
+    if (isExportEvent(e)) {
+      // Internal parts of an export: handlers get only the finished `tracks` event.
+      const done = this.assembler.take(e);
+      if (done !== null) this.dispatch(done);
+      return;
+    }
+    this.dispatch(e);
   }
 
   private dispatch(e: EngineEvent): void {
