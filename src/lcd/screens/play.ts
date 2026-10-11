@@ -22,7 +22,7 @@ import { applyKnobPush, applyKnobTurn, knobAction } from '../knobFunc';
 import type { MenuSystem, Screen, ScreenResult } from '../menu';
 import { PeakHolds, levelFraction } from '../meter';
 import { WrapCache } from '../wrap';
-import { KNOBS, KNOB_LABELS, PLAIN, drawLabelLines, drawStatusRow, knobIndex, turnSteps } from './common';
+import { ICON_DRAW, ICON_ERASE, KNOBS, KNOB_LABELS, PLAIN, drawLabelLines, drawStatusRow, knobIndex, turnSteps } from './common';
 
 /** Turns of knob 1 (MEMORY) are collected for this long before the memory is loaded. */
 export const MEMORY_DEBOUNCE_MS = 150;
@@ -37,8 +37,6 @@ const NAME_CENTER = { align: 'center', width: 128 } as const;
 const TILE_ON = { align: 'center', width: 30, invert: true } as const;
 const TILE_OFF = { align: 'center', width: 30, invert: false } as const;
 
-const ERASE = { invert: true } as const;
-const DRAW = { invert: false } as const;
 const TRACK_X = (i: number): number => 1 + 21 * i;
 const ICON_Y = 25;
 
@@ -84,6 +82,10 @@ const FX_LABEL = {
   tr: { A: 'TRACK FX-A', B: 'TRACK FX-B', C: 'TRACK FX-C', D: 'TRACK FX-D' },
 } as const;
 const TILE_NAMES = new WrapCache(FONT_SMALL, 30, 2, true);
+/** A flashed value and the label line above it must stay inside their knob's column: at most 31 px, clipped. */
+const FLASH_WIDTH = 31;
+const FLASH_VALUE = new WrapCache(FONT_SMALL, FLASH_WIDTH, 2, false);
+const FLASH_LABEL = new WrapCache(FONT_SMALL, FLASH_WIDTH, 2, false);
 
 const BAR_BASE = 46;
 const BAR_MAX = 24;
@@ -224,12 +226,17 @@ export class PlayScreen implements Screen {
     return 'unhandled';
   }
 
-  /** Shows `value` under knob `col` in place of the second line of its label, for a moment. */
+  /**
+   * Shows `value` under knob `col` for a moment, fitted to the column (31 px, clipped, never wider). A value that fits on
+   * one line replaces the label's second line; a longer one (a play screen name, REPLACE1) wraps onto two lines and
+   * replaces the whole label.
+   */
   private flash(col: number, label: string, value: string | null, t: number): void {
     if (value === null) return;
+    const lines = FLASH_VALUE.get(value);
     this.flashCol = col;
     this.flashUntil = t + FLASH_MS;
-    this.flashLines = [KNOB_LABELS.get(label)[0] ?? '', value];
+    this.flashLines = lines.length >= 2 ? lines : [FLASH_LABEL.get(label)[0] ?? '', lines[0] ?? ''];
   }
 
   // ---- drawing ------------------------------------------------------------------------------------------------------
@@ -300,14 +307,14 @@ export class PlayScreen implements Screen {
       const x = TRACK_X(i);
       const s = this.trackState(ctx, i);
       if (progress && (s === 'playing' || s === 'recording' || s === 'overdubbing')) {
-        icon(fb, x, ICON_Y, 'trkStop');
+        icon(fb, x, ICON_Y, 'trkStop', ICON_DRAW);
         const p = ctx.status!.tracks[i]!.position;
         for (let j = 2; j < 18; j++) for (let k = 2; k < 18; k++) if (PIE[j * 20 + k]! >= p) fb.set(x + k, ICON_Y + j, 0);
       } else {
-        icon(fb, x, ICON_Y, BASE_ICON[s]);
+        icon(fb, x, ICON_Y, BASE_ICON[s], ICON_DRAW);
       }
       // the current track's dot: dark on a light icon, light on a dark one
-      if (i === current) icon(fb, x + 7, ICON_Y + 7, 'current', fb.get(x + 9, ICON_Y + 9) === 1 ? ERASE : DRAW);
+      if (i === current) icon(fb, x + 7, ICON_Y + 7, 'current', fb.get(x + 9, ICON_Y + 9) === 1 ? ICON_ERASE : ICON_DRAW);
     }
     const rhythm = ctx.status?.rhythm ?? 'off';
     const on = rhythm === 'on' || (rhythm === 'standby' && (Math.floor(ctx.now / 250) & 1) === 1);

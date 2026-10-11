@@ -19,6 +19,10 @@ export function turnSteps(e: Extract<ControlEvent, { kind: 'turn' }>, ctx: Contr
 /** Passed where a draw call takes no options, so the default `{}` is not allocated on every frame. */
 export const PLAIN = {} as const;
 
+/** Passed to `icon()` so its default options object is not allocated on every frame. */
+export const ICON_DRAW = { invert: false } as const;
+export const ICON_ERASE = { invert: true } as const;
+
 export const KNOBS = ['knob1', 'knob2', 'knob3', 'knob4'] as const;
 export function knobIndex(id: string): number {
   return id === 'knob1' ? 0 : id === 'knob2' ? 1 : id === 'knob3' ? 2 : id === 'knob4' ? 3 : -1;
@@ -42,19 +46,19 @@ export function tempoLabel(bpm: number): string {
 export function drawStatusRow(fb: Framebuffer, ctx: Controller, bpm: number, knobLock: boolean): void {
   const label = tempoLabel(bpm);
   let x = 127 - (6 + 1 + textWidth(label, FONT_SMALL));
-  icon(fb, x, 0, 'note');
+  icon(fb, x, 0, 'note', ICON_DRAW);
   text(fb, x + 7, 1, label, FONT_SMALL, PLAIN);
   const phantom = ctx.session.system.input.phantom;
   if (phantom.MIC1 || phantom.MIC2) {
     x -= 2 + 23;
-    icon(fb, x, 1, 'phantom');
+    icon(fb, x, 1, 'phantom', ICON_DRAW);
     // the artwork holds both boxes; an input that is off loses its own
     if (!phantom.MIC1) fillRect(fb, x, 1, 12, 7, 0);
     if (!phantom.MIC2) fillRect(fb, x + 12, 1, 11, 7, 0);
   }
   if (knobLock) {
     x -= 2 + 7;
-    icon(fb, x, 0, 'lock');
+    icon(fb, x, 0, 'lock', ICON_DRAW);
   }
 }
 

@@ -575,6 +575,76 @@ describe('knob functions on the play screens (KNOB FUNC 1-4)', () => {
     expect(sameRegion(fb, want, 0, 49, 128, 15)).toBe(true);
   });
 
+  /**
+   * Flashes a value on knob `col` (by turning `label`'s function once) with another label on every other knob, and
+   * returns the number of pixels that differ between the flash and the same screen with knob `col`'s label blank,
+   * inside and outside that knob's quarter of the screen. So `outside` counts what the flash draws beyond its column
+   * (the neighbours' labels are on screen in both frames).
+   */
+  function flashDiff(col: number, label: string, prep: (r: ReturnType<typeof rig>) => void, steps: number): { inside: number; outside: number } {
+    const r = rig();
+    for (let i = 0; i < 4; i++) r.c.setParam(`setup.knobFunc.${i}`, i === col ? label : 'TRK2 PAN');
+    prep(r);
+    turn(r, `knob${col + 1}` as 'knob1', steps, 1000);
+    const during = frame(r.c, 1100);
+    r.c.setParam(`setup.knobFunc.${col}`, 'OFF'); // nothing in this column once the flash is over
+    const after = frame(r.c, 1000 + 1500 + 1);
+    let inside = 0, outside = 0;
+    for (let y = 0; y < 64; y++) {
+      for (let x = 0; x < 128; x++) {
+        if (during.get(x, y) === after.get(x, y)) continue;
+        if (x >= 32 * col && x < 32 * col + 32) inside++;
+        else outside++;
+      }
+    }
+    return { inside, outside };
+  }
+
+  it('a flashed MEMORY NUMBER on knob [1] stays inside knob [1]\'s column, next to the label of knob [2]', () => {
+    const d = flashDiff(0, 'DISPLAY MODE', (r) => push(r, 'right'), -1); // TRACK STATUS -> MEMORY NUMBER (75 px wide in one line)
+    expect(d.outside).toBe(0);
+    expect(d.inside).toBeGreaterThan(0);
+  });
+
+  it.each([
+    [1, 'DISPLAY MODE', 'TRACK STATUS', 1],
+    [2, 'DISPLAY MODE', 'TRACK STATUS', 1],
+    [3, 'DISPLAY MODE', 'TRACK STATUS', 1],
+    [3, 'TRK1 DUB', 'REPLACE1', 1],
+  ] as const)('a long value (column index %d: %s -> %s) is clipped to its own column', (col, label, _value, steps) => {
+    const d = flashDiff(col, label, () => {}, steps);
+    expect(d.outside).toBe(0);
+    expect(d.inside).toBeGreaterThan(0);
+  });
+
+  it('a long label line above a short value is clipped to the column too', () => {
+    for (const col of [0, 1, 2, 3]) {
+      const d = flashDiff(col, 'INST1(R), 2(R) LEVEL', () => {}, 1);
+      expect(d.outside, `knob ${col + 1}`).toBe(0);
+      expect(d.inside, `knob ${col + 1}`).toBeGreaterThan(0);
+    }
+  });
+
+  it('a value too wide for one line wraps onto the two label lines; one that fits keeps the label above it', () => {
+    const r = rig();
+    r.c.setParam('setup.knobFunc.0', 'DISPLAY MODE');
+    push(r, 'right');
+    turn(r, 'knob1', -1, 1000); // MEMORY NUMBER
+    const want = blank();
+    statusRow(want);
+    bigNumber(want, '01');
+    footer(want, [['MEMOR', 'NUMBE'], null, null, ['MFX', 'REVERB']]);
+    expectScreen(frame(r.c, 1100), want.toAscii());
+
+    const r2 = rig();
+    turn(r2, 'knob4', 5, 1000); // the value fits: MFX over 5
+    const want2 = blank();
+    statusRow(want2);
+    bigNumber(want2, '01');
+    footer(want2, [['MEMORY'], null, null, ['MFX', '5']]);
+    expectScreen(frame(r2.c, 1100), want2.toAscii());
+  });
+
   it('knob lock ignores the knobs on a play screen', () => {
     const r = rig();
     r.menu.knobLock = true;
