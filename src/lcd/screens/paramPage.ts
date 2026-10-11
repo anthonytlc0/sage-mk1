@@ -189,7 +189,8 @@ function bind(def: ParamDef, index: string | number | undefined): Bound {
 }
 
 function read(p: Bound, ctx: Controller): unknown {
-  let node: unknown = p.system ? ctx.session.system : ctx.session.memory;
+  // the settings in effect: a PREFERENCE = MEMORY group shows (and steps from) the memory's value
+  let node: unknown = p.system ? ctx.session.effectiveSystem : ctx.session.memory;
   for (const key of p.path) node = (node as Record<string, unknown>)[key];
   return node;
 }

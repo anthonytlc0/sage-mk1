@@ -131,6 +131,8 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
   private stopped = false;
   /** Mic and context restarts run one at a time (a second getUserMedia mutes the first on iOS). */
   private chain: Promise<unknown> = Promise.resolve();
+  /** A `restartMic` that is queued and has not started yet. */
+  private micRestart: Promise<void> | null = null;
 
   private constructor(
     readonly ctx: C,
@@ -230,6 +232,24 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
     });
   }
 
+  /**
+   * Closes the mic and opens it again with the current SETUP MIC PROCESS (echoCancellation): the old tracks are
+   * stopped first (a second getUserMedia mutes the first on iOS), then the new stream is connected to the worklet.
+   * Emits NO INPUT if no mic can be had. A `settings` command with a new MIC PROCESS calls it too, and the controller
+   * calls it through its `restartMic` hook: a request made while one is queued and not yet started joins it, so the
+   * two give one reopen; a request made while one runs queues another, so the last setting always wins.
+   */
+  restartMic(): Promise<void> {
+    if (this.micRestart !== null) return this.micRestart;
+    const run = this.serial(async () => {
+      this.micRestart = null; // started: a later request queues a new restart
+      if (this.stopped) return;
+      if (!(await this.reopenMic())) this.dispatch(NO_INPUT);
+    });
+    this.micRestart = run;
+    return run;
+  }
+
   /** Powers the engine off: stops listening, releases the mic and closes the context. */
   async stop(): Promise<void> {
     if (this.stopped) return;
@@ -290,13 +310,8 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
     const before = this.system;
     this.system = system;
     if (system.setup.latency !== before.setup.latency) this.pushLatency();
-    if (system.setup.micProcess !== this.micEcho && this.stream !== null) {
-      // MENU > SETUP > MIC PROCESS: the stream must be reopened for the new echoCancellation.
-      void this.serial(async () => {
-        if (this.stopped || this.stream === null || this.system.setup.micProcess === this.micEcho) return;
-        if (!(await this.reopenMic())) this.dispatch(NO_INPUT);
-      });
-    }
+    // MENU > SETUP > MIC PROCESS: the stream must be reopened for the new echoCancellation.
+    if (system.setup.micProcess !== this.micEcho && this.stream !== null) void this.restartMic();
   }
 
   /** Re-estimates the latency and sends it when it changed. */
