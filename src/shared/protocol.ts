@@ -16,7 +16,8 @@ export type EngineCommand =
   | { t: 'latency'; roundTripFrames: number; outputLatencyFrames: number }
   | { t: 'recorder'; on: boolean }
   | { t: 'calibrate'; reqId: number }
-  | { t: 'interrupt' };                                      // host lost audio: end rec/dub passes
+  | { t: 'interrupt' }                                       // host lost audio: end rec/dub passes
+  | { t: 'micMute'; on: boolean };                           // MIC (MIC1/MIC2) IN MUTE: the one mic, ahead of the input chain
 export interface TimedCommand { cmd: EngineCommand; at: number | null } // heard-timeline frame; null = now
 export type TrackState = 'empty' | 'stopped' | 'recording' | 'overdubbing' | 'playing';
 export interface TrackStatus {
