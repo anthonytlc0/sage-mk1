@@ -274,9 +274,33 @@ describe('PANEL functions', () => {
     expect(engine.last('tempo')).toEqual({ t: 'tempo', bpm: TEMPO_MIN });
   });
 
-  it('OFF, LED, MIC mute and the phase-2 FX switches do nothing yet', () => {
+  it('MIC IN MUTE toggles the mic mute on press; MIC1 and MIC2 IN MUTE switch the same single mic (ruling R34)', () => {
     const { c, engine, lcd } = setup();
-    const fns = ['OFF', 'LED', 'MIC IN MUTE', 'INPUT FX ON/OFF', 'TRACK FX ON/OFF'];
+    c.setParam('ctl.panelPlay.track.0', 'MIC IN MUTE');
+    c.setParam('ctl.panelPlay.track.1', 'MIC1 IN MUTE');
+    c.setParam('ctl.panelPlay.fx.0', 'MIC2 IN MUTE');
+    engine.reset();
+    expect(c.micMuted).toBe(false);
+    press(c, 'trk1.track', 100);
+    expect(engine.sent).toEqual([{ cmd: { t: 'micMute', on: true }, eventTime: 100 }]);
+    expect(c.micMuted).toBe(true);
+    vi.advanceTimersByTime(PANEL_HOLD_MS * 3);
+    release(c, 'trk1.track', 100 + PANEL_HOLD_MS * 3);
+    click(c, 'trk2.track', 5000);
+    expect(c.micMuted).toBe(false);
+    click(c, 'trk1.fx', 6000);
+    expect(c.micMuted).toBe(true);
+    expect(engine.sent.map((s) => s.cmd)).toEqual([
+      { t: 'micMute', on: true },
+      { t: 'micMute', on: false },
+      { t: 'micMute', on: true },
+    ]);
+    expect(lcd.shows).toEqual([]);
+  });
+
+  it('OFF, LED and the phase-2 FX switches do nothing yet', () => {
+    const { c, engine, lcd } = setup();
+    const fns = ['OFF', 'LED', 'INPUT FX ON/OFF', 'TRACK FX ON/OFF', 'OFF'];
     for (const [i, fn] of fns.entries()) c.setParam(`ctl.panelPlay.track.${i}`, fn);
     engine.reset();
     const before = JSON.stringify(c.session.memory);

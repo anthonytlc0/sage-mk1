@@ -60,6 +60,8 @@ export interface ButtonHost {
   /** Offers an event to the LCD host; true when it used it. */
   lcdEvent(e: ControlEvent): boolean;
   lcdShow(req: ScreenRequest): void;
+  /** MIC (MIC1 / MIC2) IN MUTE: flips the mic mute and sends `micMute`. */
+  toggleMicMute(t: number): void;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -113,6 +115,8 @@ const stepCurrent = (d: 1 | -1): Act => (h) => {
   h.setParam('play.currentTrack', (h.session.memory.play.currentTrack + d + n) % n);
 };
 
+const micMute: Act = (h, _track, t) => h.toggleMicMute(t);
+
 /** TEMPO UP / DOWN double / halve the tempo; setParam clamps it to the range. Shows the tempo popup (INFERRED). */
 const scaleTempo = (factor: number): Act => (h) => {
   h.setParam('tempo', h.session.memory.tempo * factor);
@@ -147,10 +151,10 @@ const TEMPLATES: Readonly<Record<string, Template>> = {
   // TODO(phase 2): INPUT FX / TRACK FX section on/off arrive with the effects framework.
   'INPUT FX ON/OFF': {},
   'TRACK FX ON/OFF': {},
-  // TODO(T17): MIC mute needs InputChain.setMute, which the engine exposes.
-  'MIC IN MUTE': {},
-  'MIC1 IN MUTE': {},
-  'MIC2 IN MUTE': {},
+  // The app has one mic, MIC1; MIC2 maps to it too, so all three switch the same mute (ruling R34).
+  'MIC IN MUTE': { push: micMute },
+  'MIC1 IN MUTE': { push: micMute },
+  'MIC2 IN MUTE': { push: micMute },
   // LED (TOGGLE COLOR) changes only the button's lit colour; nothing to do.
   LED: {},
 };

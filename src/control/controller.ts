@@ -136,6 +136,8 @@ export class Controller {
   private _status: EngineStatus | null = null;
   private _message: string | null = null;
   private _now = 0;
+  /** MIC IN MUTE is on (the engine was last sent `micMute` on). */
+  private _micMuted = false;
 
   private readonly buttons: ButtonRouter;
   private readonly fb = new Framebuffer();
@@ -171,6 +173,10 @@ export class Controller {
       setParam: (id, value, track) => this.setParam(id, value, track),
       lcdEvent: (e) => this.lcd.onEvent(e, this),
       lcdShow: (req) => this.lcd.show(req, this),
+      toggleMicMute: (t) => {
+        this._micMuted = !this._micMuted;
+        this.engine.send({ t: 'micMute', on: this._micMuted }, t);
+      },
     };
     this.buttons = new ButtonRouter(host);
     this.panel = new PanelStateBuilder(this.fb.data);
@@ -196,6 +202,11 @@ export class Controller {
 
   get undoMode(): boolean {
     return this.buttons.undoMode;
+  }
+
+  /** The mic is muted by a MIC IN MUTE function. */
+  get micMuted(): boolean {
+    return this._micMuted;
   }
 
   isHeld(id: ButtonId): boolean {
