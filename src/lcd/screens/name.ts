@@ -89,7 +89,7 @@ export class NameBuffer {
 
 // ---- the screen -----------------------------------------------------------------------------------------------------
 
-// The cells use the small font: the medium one has no lower case or symbols, which a name needs (it would show "a" as "A").
+// The cells use the small font (5 x 7, every ASCII character): a name is easier to read cell by cell at that size.
 const CELL_X = 4;
 const CELL_W = 10;
 const BOX_Y = 24;
@@ -98,7 +98,9 @@ const CELL_Y = 26;
 const CELL = { align: 'center', width: CELL_W } as const;
 const CURSOR = { align: 'center', width: CELL_W, invert: true } as const;
 
-const LABELS: readonly (readonly string[])[] = [['JUMP', 'DELETE'], ['CASE', 'SPACE'], ['CHAR'], ['CURSOR']];
+// Each label stays inside its 32 px knob column with a pixel to spare (tests/lcd/labels.ts): DELETE and CURSOR are too wide
+// for one, so they are abbreviated and broken like the manual's own long labels (VARI-ATION).
+const LABELS: readonly (readonly string[])[] = [['JUMP', 'DEL'], ['CASE', 'SPACE'], ['CHAR'], ['CUR-', 'SOR']];
 
 class NameScreen implements Screen {
   readonly title = 'NAME';

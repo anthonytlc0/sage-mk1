@@ -126,7 +126,7 @@ const FX_LABEL = { align: 'center', width: 64 } as const;
 
 const LABELS: readonly (readonly (readonly string[])[])[] = [
   [['TRACK'], ['REC'], ['PLAY'], []],
-  [['INPUT'], ['TRACK'], ['RHYTHM'], ['NAME']],
+  [['INPUT'], ['TRACK'], ['RHY-', 'THM'], ['NAME']], // RHYTHM is wider than its 32 px column, so it breaks (as VARI-ATION does)
 ];
 
 const ICON_Y = 22;

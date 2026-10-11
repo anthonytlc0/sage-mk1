@@ -93,7 +93,7 @@ describe('opening the WRITE screen', () => {
     }
   });
 
-  it('shows the current memory number and its name, the target slot as a boxed number', async () => {
+  it('shows the target memory as a boxed number with its name: the current memory by its session name', async () => {
     const r = rig();
     r.c.setParam('name', 'Memory01');
     toWrite(r);
@@ -102,14 +102,154 @@ describe('opening the WRITE screen', () => {
     text(want, 1, 44, '01', FONT_MEDIUM, { invert: true, width: 17, align: 'center' });
     text(want, 20, 44, 'Memory01', FONT_MEDIUM);
     expect(sameRegion(frame(r.c), want, 0, 44, 128, 11)).toBe(true);
-    turn(r, 'knob3', 4);
-    const other = blank();
-    text(other, 1, 44, '05', FONT_MEDIUM, { invert: true, width: 17, align: 'center' });
-    expect(sameRegion(frame(r.c), other, 0, 44, 128, 11)).toBe(true); // no name is known for another slot
+  });
+});
+
+describe('the name of the memory being chosen', () => {
+  /** The number box and name row of the memory select, as the screen draws it. */
+  function row(num: string, name: string) {
+    const fb = blank();
+    text(fb, 1, 44, num, FONT_MEDIUM, { invert: true, width: 17, align: 'center' });
+    if (name !== '') text(fb, 20, 44, name, FONT_MEDIUM);
+    return fb;
+  }
+  const shows = (r: Rig, num: string, name: string): boolean => sameRegion(frame(r.c), row(num, name), 0, 44, 128, 11);
+
+  it('shows the saved name of the slot you turn to, and none for an empty slot (WRITE and CLEAR alike)', async () => {
+    for (const to of [toWrite, toClear]) {
+      const r = rig();
+      seed(r, 5, 'Hi-Hat 9');
+      seed(r, 6, 'Zed', false);
+      r.c.setParam('name', 'Memory01');
+      to(r);
+      await flush();
+      expect(shows(r, '01', 'Memory01')).toBe(true);
+      turn(r, 'knob3', 4);
+      expect(shows(r, '05', 'Hi-Hat 9')).toBe(true);
+      turn(r, 'knob2', 1);
+      expect(shows(r, '06', 'Zed')).toBe(true);
+      turn(r, 'knob4', 1);
+      expect(shows(r, '07', '')).toBe(true);
+      turn(r, 'knob1', -6); // back on the current slot: the name it has now
+      expect(shows(r, '01', 'Memory01')).toBe(true);
+    }
+  });
+
+  it('shows the session name for the current slot, not the one stored there (edits are what WRITE saves)', async () => {
+    const r = rig();
+    seed(r, 1, 'Old Name');
+    r.c.setParam('name', 'New Name');
+    toWrite(r);
+    await flush();
+    expect(shows(r, '01', 'New Name')).toBe(true);
+  });
+
+  it('asks for the names once, when the screen opens, and not again while you turn', async () => {
+    const r = rig();
+    const spy = vi.spyOn(r.c, 'memoryNames');
+    toWrite(r);
+    expect(spy).toHaveBeenCalledTimes(1);
+    await flush();
+    turn(r, 'knob1', 7);
+    push(r, 'exit');
+    toClear(r);
+    expect(spy).toHaveBeenCalledTimes(2); // a new screen, a new ask
+    await flush();
+    expect(r.stores.memories.lists).toBe(2);
+  });
+
+  it('shows no names until they arrive, then picks them up', async () => {
+    const r = rig();
+    seed(r, 5, 'Hi-Hat 9');
+    toWrite(r, 5);
+    expect(shows(r, '05', '')).toBe(true);
+    await flush();
+    expect(shows(r, '05', 'Hi-Hat 9')).toBe(true);
+  });
+
+  it('a screen torn down before the names arrive is left alone, and the late names do no harm', async () => {
+    const r = rig();
+    seed(r, 5, 'Hi-Hat 9');
+    const gate: { open: () => void } = { open: () => undefined };
+    const held = new Promise<void>((res) => (gate.open = res));
+    const real = r.stores.memories.list.bind(r.stores.memories);
+    r.stores.memories.list = async () => {
+      await held;
+      return real();
+    };
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    toWrite(r);
+    r.menu.showStartScreen();
+    gate.open();
+    await flush();
+    expect(r.menu.depth).toBe(1);
+    expect(log).not.toHaveBeenCalled();
+    expect(r.c.message).toBeNull();
+  });
+
+  it('if the names cannot be read the screen still works, without them (the failure is logged)', async () => {
+    const r = rig();
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    r.stores.memories.list = async () => {
+      throw new Error('db gone');
+    };
+    seed(r, 5, 'Hi-Hat 9');
+    toWrite(r, 5);
+    await flush();
+    expect(log).toHaveBeenCalled();
+    expect(shows(r, '05', '')).toBe(true);
+    expect(r.c.message).toBeNull();
+    push(r, 'enter');
+    await flush();
+    expect(r.c.message).toBe('NOT EMPTY'); // and writing goes on as usual
   });
 });
 
 describe('choosing the memory', () => {
+  // SETUP MEMORY EXT MIN..MAX limits the memories the player can reach (ruling R39): the select wraps inside it, as the
+  // memory knob on the play screen does.
+  it.each([[3, 8], [8, 3]])('wraps inside MEMORY EXT %i..%i, like the memory knob', async (min, max) => {
+    const cases: [number, number][] = [[-1, 8], [1, 4], [5, 8], [6, 3], [-3, 6], [12, 3], [-12, 3]];
+    for (const [mode, spyOn] of [['write', 'write'], ['clear', 'clear']] as const) {
+      for (const [steps, want] of cases) {
+        const r = rig();
+        r.c.setParam('setup.memoryExt.min', min);
+        r.c.setParam('setup.memoryExt.max', max);
+        await r.c.selectMemory(3);
+        const spy = vi.spyOn(r.c, spyOn);
+        (mode === 'write' ? toWrite : toClear)(r);
+        turn(r, 'knob2', steps);
+        push(r, 'enter');
+        expect(spy, `${mode} after ${steps}`).toHaveBeenCalledWith(want);
+        await flush();
+      }
+    }
+  });
+
+  it('turns a held knob by tens inside the range too', async () => {
+    const r = rig();
+    r.c.setParam('setup.memoryExt.max', 20);
+    const spy = vi.spyOn(r.c, 'write');
+    toWrite(r);
+    r.c.handle({ kind: 'press', id: 'knob1', t: 0 });
+    r.menu.onEvent(turnEv('knob1', 2), r.c); // 1 + 20 = 21, wraps to 1
+    r.c.handle({ kind: 'release', id: 'knob1', t: 5 });
+    push(r, 'enter');
+    expect(spy).toHaveBeenLastCalledWith(1);
+    await flush();
+  });
+
+  it('the current slot stays the starting point even outside the range', async () => {
+    const r = rig();
+    await r.c.selectMemory(50);
+    r.c.setParam('setup.memoryExt.max', 10);
+    const spy = vi.spyOn(r.c, 'write');
+    toWrite(r);
+    push(r, 'enter'); // no turn: over the current memory, which is always allowed
+    expect(spy).toHaveBeenLastCalledWith(50);
+    await flush();
+  });
+
   it('any of the knobs [1]-[4] turns the target slot', () => {
     for (const knob of ['knob1', 'knob2', 'knob3', 'knob4'] as const) {
       const r = rig();
@@ -217,19 +357,29 @@ describe('WRITE', () => {
     expect(r.stores.memories.saves).toBe(1);
   });
 
-  it('while the rhythm plays shows STOP ALL too (the manual: "or rhythm playback")', () => {
+  // Parameter Guide p. 6 (RHYTHM memo): writing while the rhythm plays or waits saves a "rhythm: on" memory (ruling R40).
+  it('goes ahead while only the rhythm plays or waits to start', async () => {
+    for (const rhythm of ['on', 'standby'] as const) {
+      const r = rig();
+      status(r, { rhythm }, [{ state: 'stopped' }]);
+      toWrite(r, 6);
+      push(r, 'enter');
+      expect(r.c.message).toBe('EXECUTING...');
+      await flush();
+      expect(r.stores.memories.slots.has(6)).toBe(true);
+      expect(r.c.message).toBeNull();
+    }
     const r = rig();
-    const spy = vi.spyOn(r.c, 'write');
-    status(r, { rhythm: 'on' });
-    toWrite(r);
+    status(r, { rhythm: 'on' }); // not even a stopped track
+    toWrite(r, 6);
     push(r, 'enter');
-    expect(r.c.message).toBe('STOP ALL');
-    expect(spy).not.toHaveBeenCalled();
+    await flush();
+    expect(r.stores.memories.slots.has(6)).toBe(true);
   });
 
-  it('a stopped track (or a waiting rhythm) does not block it', async () => {
+  it('a stopped or empty looper does not block it', async () => {
     const r = rig();
-    status(r, { rhythm: 'standby' }, [{ state: 'stopped' }]);
+    status(r, {}, [{ state: 'stopped' }]);
     toWrite(r, 6);
     push(r, 'enter');
     await flush();
@@ -354,7 +504,7 @@ describe('WRITE', () => {
       const r = rig();
       r.engine.exportReply = null;
       const remove = vi.fn();
-      const screen = writeScreen({ remove });
+      const screen = writeScreen({ remove }, r.c);
       r.menu.push(screen);
       push(r, 'knob1');
       turn(r, 'knob1', 4);
@@ -366,6 +516,20 @@ describe('WRITE', () => {
       if (tornDown) expect(remove).not.toHaveBeenCalled();
       else expect(remove).toHaveBeenCalledExactlyOnceWith(screen);
     }
+  });
+
+  it('a failure inside the screen\'s own follow-up is logged, not left as an unhandled rejection', async () => {
+    const r = rig();
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const boom = new Error('remove failed');
+    r.menu.push(writeScreen({ remove: () => { throw boom; } }, r.c)); // the write succeeds, closing the screen throws
+    push(r, 'knob1');
+    turn(r, 'knob1', 4);
+    push(r, 'enter');
+    await flush(); // an unhandled rejection would fail the run here
+    expect(r.stores.memories.slots.has(5)).toBe(true);
+    expect(log).toHaveBeenCalledWith(expect.any(String), boom);
+    expect(r.c.message).toBeNull();
   });
 
   it('runs one write at a time, even across screens (a new WRITE screen opened while the first one waits)', async () => {
@@ -434,14 +598,48 @@ describe('CLEAR', () => {
     expect(r.c.session.memory.name).toBe('');
   });
 
-  it('is not blocked by STOP ALL (only WRITE is)', async () => {
+  // Controller.clear empties the engine's tracks when the current memory is cleared (ruling R41).
+  it.each([['recording'], ['playing'], ['overdubbing']] as const)('of the current memory while a track is %s shows STOP ALL and clears nothing', async (state) => {
+    const r = rig();
+    r.c.setParam('name', 'MINE');
+    seed(r, 1, 'MINE');
+    const spy = vi.spyOn(r.c, 'clear');
+    status(r, {}, [{}, { state }]);
+    toClear(r); // the current slot
+    push(r, 'enter');
+    expect(r.c.message).toBe('STOP ALL');
+    expect(spy).not.toHaveBeenCalled();
+    await flush();
+    expect(r.stores.memories.slots.has(1)).toBe(true);
+    expect(r.c.session.memory.name).toBe('MINE');
+    expect(r.menu.top.title).toBe('WRITE');
+    status(r, {}, [{ state: 'stopped' }]);
+    push(r, 'enter'); // stopped now: it goes ahead
+    await flush();
+    expect(r.stores.memories.slots.has(1)).toBe(false);
+    expect(r.c.session.memory.name).toBe('');
+  });
+
+  it('of a different memory is allowed while tracks play (the engine is not touched)', async () => {
     const r = rig();
     seed(r, 5, 'OLD TAKE');
     status(r, {}, [{ state: 'playing' }]);
+    r.engine.reset();
     toClear(r, 5);
     push(r, 'enter');
     await flush();
     expect(r.stores.memories.slots.has(5)).toBe(false);
+    expect(r.engine.commands('loadTrack')).toEqual([]);
+  });
+
+  it('of the current memory is allowed while the rhythm plays (only tracks block it)', async () => {
+    const r = rig();
+    status(r, { rhythm: 'on' }, [{ state: 'stopped' }]);
+    toClear(r);
+    push(r, 'enter');
+    await flush();
+    expect(r.c.message).toBeNull();
+    expect(r.menu.depth).toBe(1);
   });
 
   it('a failing clear shows DATA WRITE ERR and stays', async () => {

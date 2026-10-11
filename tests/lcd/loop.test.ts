@@ -5,6 +5,7 @@ import { registerEditScreens } from '../../src/lcd/screens/register';
 import { MSG_BEAT_LOCKED } from '../../src/lcd/screens/rhythm';
 import { frame, push, rig, sameRegion, status, turn } from './rig';
 import type { Rig } from './rig';
+import { expectLabelsApart } from './labels';
 import { ARROW_L, ARROW_R, blank, footer } from './spec';
 
 let unregister: () => void;
@@ -57,10 +58,18 @@ describe('the LOOP screen', () => {
     push(r, 'right');
     expect(headerMatches(r, 'LOOP', true, false)).toBe(true);
     const want = blank();
-    footer(want, [['INPUT'], ['TRACK'], ['RHYTHM'], ['NAME']]);
+    footer(want, [['INPUT'], ['TRACK'], ['RHY-', 'THM'], ['NAME']]);
     expect(sameRegion(frame(r.c), want, 0, 56, 128, 8)).toBe(true);
     push(r, 'left');
     expect(headerMatches(r, 'LOOP', false, true)).toBe(true);
+  });
+
+  it('keeps its knob labels inside their columns, clear of each other, on both pages', () => {
+    const r = rig();
+    push(r, 'loop');
+    expectLabelsApart(frame(r.c), [['TRACK'], ['REC'], ['PLAY'], null]);
+    push(r, 'right');
+    expectLabelsApart(frame(r.c), [['INPUT'], ['TRACK'], ['RHY-', 'THM'], ['NAME']]);
   });
 
   it('starts on the current track, and knob [1] turned picks another (TRK3 shows over the icon)', () => {

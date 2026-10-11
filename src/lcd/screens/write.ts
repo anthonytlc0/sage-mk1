@@ -2,14 +2,19 @@
  * The WRITE / CLEAR screen (Owner's Manual p. 12), opened by EXIT + ENTER.
  *
  *   1. The choice: knobs [1] or [2] = WRITE, knobs [3] or [4] = CLEAR.
- *   2. Any of the knobs [1]-[4] turns the memory number (it starts on the current one); EXIT cancels.
+ *   2. Any of the knobs [1]-[4] turns the memory number (it starts on the current one) inside SETUP MEMORY EXT MIN..MAX,
+ *      wrapping at the ends as the memory knob does; its name shows beside it. EXIT cancels.
  *   3. ENTER runs it: "EXECUTING..." stays up until the controller is done.
  *
- * WRITE refuses while a track is recording, playing or overdubbing, or the rhythm plays: STOP ALL (manual p. 23). The
- * controller decides the rest: over the current memory is always allowed, over another one that holds audio it answers
- * NOT EMPTY (clear it first), and MEMORY FULL when storage refuses; all three are shown as a message and the screen
- * stays for another try. A save the controller aborts because the memory changed meanwhile shows WRITE ABORTED, any
- * other failure DATA WRITE ERR (manual p. 23).
+ * STOP ALL (manual p. 23) when a track is recording, playing or overdubbing: for WRITE, and for CLEAR of the current
+ * memory, which also empties the engine's tracks. (A rhythm that plays or waits does not block WRITE: it saves a
+ * "rhythm: on" memory, Parameter Guide p. 6.) The controller decides the rest: over the current memory is always allowed,
+ * over another one that holds audio it answers NOT EMPTY (clear it first), and MEMORY FULL when storage refuses; all
+ * three are shown as a message and the screen stays for another try. A save the controller aborts because the memory
+ * changed meanwhile shows WRITE ABORTED, any other failure DATA WRITE ERR (manual p. 23).
+ *
+ * The names of the memories are asked of the controller once, when the screen opens. The current memory shows the name
+ * it has now (what WRITE would save), any other the name it was saved under, blank when empty or not yet known.
  *
  * The controller's promises are never awaited by the screen: the result is picked up with `then`, and a screen that
  * has left the stack by then (`dispose` ran) is not touched. Its message still shows, the popup is still taken down.
@@ -22,7 +27,7 @@ import { FONT_MEDIUM, FONT_SMALL } from '../fonts';
 import type { Framebuffer } from '../framebuffer';
 import type { MenuSystem, Screen, ScreenResult } from '../menu';
 import { PLAIN, drawTitleBar, knobIndex, turnSteps } from './common';
-import { looperRunning, rhythmPlaying } from './looperState';
+import { looperRunning } from './looperState';
 
 export const MSG_EXECUTING = 'EXECUTING...';
 export const MSG_STOP_ALL = 'STOP ALL';
@@ -30,8 +35,8 @@ export const MSG_ABORTED = 'WRITE ABORTED';
 export const MSG_WRITE_ERR = 'DATA WRITE ERR';
 
 const SLOTS: readonly string[] = Array.from({ length: 100 }, (_, i) => String(i).padStart(2, '0'));
-const FIRST_SLOT = 1;
-const LAST_SLOT = 99;
+/** The names before they have arrived (and when they cannot be read). */
+const NO_NAMES: readonly string[] = [];
 
 /**
  * Controllers with a write or clear in flight. Only one runs at a time, even when its screen was torn down and a new one
@@ -86,8 +91,17 @@ class WriteScreen implements Screen {
   private busy = false;
   /** Cleared by `dispose`: the screen has left the stack. */
   private alive = true;
+  /** The names of the 99 memories (index = slot - 1), once they have arrived. */
+  private names: readonly string[] = NO_NAMES;
 
-  constructor(private readonly menu: Pick<MenuSystem, 'remove'>) {}
+  constructor(private readonly menu: Pick<MenuSystem, 'remove'>, ctx: Controller) {
+    ctx.memoryNames().then(
+      (names) => {
+        if (this.alive) this.names = names;
+      },
+      (err: unknown) => console.error('reading the memory names failed', err),
+    );
+  }
 
   dispose(): void {
     this.alive = false;
@@ -107,16 +121,19 @@ class WriteScreen implements Screen {
     if (mode === 'write') writeIcon(fb, 2, 11);
     else clearIcon(fb, 2, 11);
     text(fb, 1, 28, NAMES[mode], FONT_SMALL, PLAIN);
-    // the memory: its number in a box, then its name. Only the loaded memory's name is known here (INFERRED).
+    // the memory: its number in a box, then its name (the current memory's is the one it has now)
     text(fb, 1, 44, SLOTS[this.slot] ?? '--', FONT_MEDIUM, NUMBER_TAG);
-    if (this.slot === ctx.session.slot) text(fb, 20, 44, ctx.session.memory.name, FONT_MEDIUM, PLAIN);
+    text(fb, 20, 44, this.slot === ctx.session.slot ? ctx.session.memory.name : (this.names[this.slot - 1] ?? ''), FONT_MEDIUM, PLAIN);
   }
 
   onEvent(e: ControlEvent, ctx: Controller): ScreenResult {
     if (e.kind === 'turn') {
       if (!this.busy && this.mode !== 'choose') {
-        const n = LAST_SLOT - FIRST_SLOT + 1;
-        this.slot = FIRST_SLOT + ((((this.slot - FIRST_SLOT + turnSteps(e, ctx)) % n) + n) % n);
+        // inside SETUP MEMORY EXT MIN..MAX, wrapping at the ends (the same rule as the play screen's memory knob)
+        const { min, max } = ctx.session.system.setup.memoryExt;
+        const lo = Math.min(min, max), hi = Math.max(min, max);
+        const n = hi - lo + 1;
+        this.slot = lo + ((((this.slot - lo + turnSteps(e, ctx)) % n) + n) % n);
       }
       return 'handled';
     }
@@ -141,7 +158,8 @@ class WriteScreen implements Screen {
   }
 
   private run(ctx: Controller, mode: 'write' | 'clear'): void {
-    if (mode === 'write' && (looperRunning(ctx) || rhythmPlaying(ctx))) {
+    // Controller.clear of the current memory empties the engine's tracks, so it waits for the tracks to stop, like WRITE
+    if (looperRunning(ctx) && (mode === 'write' || this.slot === ctx.session.slot)) {
       ctx.showMessage(MSG_STOP_ALL);
       return;
     }
@@ -160,7 +178,7 @@ class WriteScreen implements Screen {
           this.finish(ctx, MSG_WRITE_ERR, false);
         }
       },
-    );
+    ).catch((err: unknown) => console.error('finishing the write screen failed', err)); // a throw in `finish` must not go unhandled
   }
 
   /** The job is over: take the popup down, say what went wrong, and leave the screen when it went right. */
@@ -174,6 +192,7 @@ class WriteScreen implements Screen {
   }
 }
 
-export function writeScreen(menu: Pick<MenuSystem, 'remove'>): Screen {
-  return new WriteScreen(menu);
+/** The WRITE / CLEAR screen. `menu` closes it when the job is done; `ctx` is asked for the memory names at once. */
+export function writeScreen(menu: Pick<MenuSystem, 'remove'>, ctx: Controller): Screen {
+  return new WriteScreen(menu, ctx);
 }

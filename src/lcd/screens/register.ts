@@ -11,7 +11,7 @@ import { writeScreen } from './write';
  */
 export function registerEditScreens(): () => void {
   const offs = [
-    registerScreen('write', (_req, _ctx, menu) => writeScreen(menu)),
+    registerScreen('write', (_req, ctx, menu) => writeScreen(menu, ctx)),
     registerScreen('track', (req) => trackScreen(req.track)),
     registerScreen('loop', () => loopScreen()),
     registerScreen('rhythmEdit', () => rhythmScreen()),

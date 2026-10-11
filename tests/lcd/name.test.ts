@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { text } from '../../src/lcd/draw';
-import { FONT_SMALL } from '../../src/lcd/fonts';
+import { FONT_MEDIUM, FONT_SMALL } from '../../src/lcd/fonts';
 import { NAME_CHARS, NameBuffer } from '../../src/lcd/screens/name';
 import { registerEditScreens } from '../../src/lcd/screens/register';
 import { NAME_LEN } from '../../src/shared/constants';
 import { frame, push, rig, sameRegion, turn, turnEv } from './rig';
 import type { Rig } from './rig';
+import { expectLabelsApart } from './labels';
 import { blank } from './spec';
 
 let unregister: () => void;
@@ -28,12 +29,23 @@ function openName(r: Rig): void {
 const A = NAME_CHARS.indexOf('A');
 
 describe('the character set', () => {
-  it('is printable ASCII in code order, and the small LCD font has a glyph of its own for every one', () => {
+  it('is printable ASCII in code order', () => {
     expect(NAME_CHARS[0]).toBe(' ');
     expect(NAME_CHARS.length).toBe(95);
     for (let i = 0; i < NAME_CHARS.length; i++) expect(NAME_CHARS.charCodeAt(i)).toBe(32 + i);
-    // the medium font has no lower case or symbols (it would draw "a" as "A"), so the editor cells use the small one
-    for (const ch of NAME_CHARS) if (ch !== ' ') expect(FONT_SMALL.glyphs.get(ch), `glyph ${ch}`).toBeDefined();
+  });
+
+  it.each([['small', FONT_SMALL, 7], ['medium', FONT_MEDIUM, 11]] as const)('the %s LCD font has a glyph of its own for every character the editor can enter', (_n, font, height) => {
+    const seen = new Map<string, string>();
+    for (const ch of NAME_CHARS) {
+      if (ch === ' ') continue;
+      const g = font.glyphs.get(ch); // no fallback to another case: a name shows as it was typed
+      expect(g, `glyph ${ch}`).toBeDefined();
+      expect(g!.h).toBe(height);
+      const key = `${g!.w}x${g!.h}:${Array.from(g!.px).join('')}`;
+      expect(seen.get(key), `${ch} looks like ${seen.get(key)}`).toBeUndefined();
+      seen.set(key, ch);
+    }
   });
 });
 
@@ -281,6 +293,12 @@ describe('the NAME screen', () => {
     const g = frame(r.c);
     expect(g.get(14, 24)).toBe(1);
     expect(g.get(4, 24)).toBe(0);
+  });
+
+  it('keeps its knob labels inside their columns and clear of each other', () => {
+    const r = rig();
+    openName(r);
+    expectLabelsApart(frame(r.c), [['JUMP', 'DEL'], ['CASE', 'SPACE'], ['CHAR'], ['CUR-', 'SOR']]);
   });
 
   it('EXIT leaves it', () => {

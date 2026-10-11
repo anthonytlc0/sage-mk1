@@ -10,11 +10,6 @@ export function looperRunning(ctx: Controller): boolean {
   return false;
 }
 
-/** The rhythm is playing (a rhythm that only waits to start, 'standby', is not). */
-export function rhythmPlaying(ctx: Controller): boolean {
-  return ctx.status?.rhythm === 'on';
-}
-
 /** Any track holds a phrase, stopped or not. */
 export function tracksHaveAudio(ctx: Controller): boolean {
   const tracks = ctx.status?.tracks;
