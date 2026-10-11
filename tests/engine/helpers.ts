@@ -37,9 +37,16 @@ export type Input = number | ((frame: number) => number) | null;
 /**
  * Runs `frames` frames through the processor in 128-frame blocks, as an AudioWorklet would. `input` is the mono mic: a
  * constant, a function of the frame within this run, or null for no input channel at all (no mic connected).
- * Returns the stereo output.
+ * `contextFrame`, when given, is the AudioContext frame of the first block (the worklet's `currentFrame`); the blocks
+ * after it follow on. Returns the stereo output.
  */
-export function run(p: SageProcessor, frames: number, input: Input = 0, block = BLOCK): { L: Float32Array; R: Float32Array } {
+export function run(
+  p: SageProcessor,
+  frames: number,
+  input: Input = 0,
+  block = BLOCK,
+  contextFrame?: number,
+): { L: Float32Array; R: Float32Array } {
   const L = new Float32Array(frames);
   const R = new Float32Array(frames);
   let done = 0;
@@ -55,7 +62,7 @@ export function run(p: SageProcessor, frames: number, input: Input = 0, block = 
       for (let k = 0; k < n; k++) mic[k] = typeof input === 'number' ? input : input(done + k);
       inputs = [[mic]];
     }
-    expect(p.process(inputs, [[outL, outR]])).toBe(true);
+    expect(p.process(inputs, [[outL, outR]], contextFrame === undefined ? undefined : contextFrame + done)).toBe(true);
     L.set(outL, done);
     R.set(outR, done);
     done += n;
@@ -63,13 +70,20 @@ export function run(p: SageProcessor, frames: number, input: Input = 0, block = 
   return { L, R };
 }
 
+/** Runs blocks of silence until the processor answers `reqId` (the export copies a bounded amount per block). */
+export function awaitTracks(p: SageProcessor, port: FakePort, reqId: number, maxBlocks = 10000): (TrackAudio | null)[] {
+  for (let i = 0; i < maxBlocks; i++) {
+    const reply = port.events('tracks').find((e) => e.reqId === reqId);
+    if (reply) return reply.tracks;
+    run(p, BLOCK);
+  }
+  throw new Error(`no tracks reply for request ${reqId}`);
+}
+
 /** Asks the processor for its tracks and returns the reply. */
 export function exportTracks(p: SageProcessor, port: FakePort, reqId = 1): (TrackAudio | null)[] {
   send(port, { t: 'exportTracks', reqId });
-  run(p, BLOCK);
-  const reply = port.events('tracks').find((e) => e.reqId === reqId);
-  if (!reply) throw new Error(`no tracks reply for request ${reqId}`);
-  return reply.tracks;
+  return awaitTracks(p, port, reqId);
 }
 
 export function maxAbs(buf: Float32Array, from = 0, to = buf.length): number {

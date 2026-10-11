@@ -210,6 +210,18 @@ describe('EngineHost latency', () => {
     expect(latencyCommands(rig).at(-1)).toEqual({ roundTripFrames: 720, outputLatencyFrames: 480 });
   });
 
+  it('re-estimates when the host\'s own resume brings the context back', async () => {
+    const ctx = new FakeContext();
+    ctx.outputLatency = 0;
+    const rig = await startHost({ ctx });
+    ctx.setState('interrupted');
+    ctx.outputLatency = 0.01;
+    rig.doc.set('visible');
+    await settle();
+    expect(ctx.state).toBe('running');
+    expect(latencyCommands(rig).at(-1)).toEqual({ roundTripFrames: 720, outputLatencyFrames: 480 });
+  });
+
   it('uses the calibrated SETUP LATENCY when it is set', async () => {
     const rig = await startHost();
     rig.host.send(freeSettings((_m, s) => {

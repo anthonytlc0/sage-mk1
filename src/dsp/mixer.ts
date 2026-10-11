@@ -80,7 +80,8 @@ export class Mixer {
     if (i >= 0 && i < TRACKS) this.fader[i] = gain > 0 ? gain : 0;
   }
 
-  process(tracks: Stereo[], input: Stereo, rhythm: Stereo, out: Stereo, perf: Stereo, n: number): void {
+  /** Mixes `n` frames into `out` and, unless it is null (the recorder is off), the recorder bus `perf`. */
+  process(tracks: Stereo[], input: Stereo, rhythm: Stereo, out: Stereo, perf: Stereo | null, n: number): void {
     const outL = out[0], outR = out[1];
     outL.fill(0, 0, n);
     outR.fill(0, 0, n);
@@ -101,8 +102,11 @@ export class Mixer {
     this.curRhythm = this.rhythm;
 
     // perf: the mix so far plus the mic at unity. out: the mix plus the mic only through the THRU gate.
-    const perfL = perf[0], perfR = perf[1], inL = input[0], inR = input[1];
-    for (let k = 0; k < n; k++) { perfL[k] = outL[k]! + inL[k]!; perfR[k] = outR[k]! + inR[k]!; }
+    const inL = input[0], inR = input[1];
+    if (perf !== null) {
+      const perfL = perf[0], perfR = perf[1];
+      for (let k = 0; k < n; k++) { perfL[k] = outL[k]! + inL[k]!; perfR[k] = outR[k]! + inR[k]!; }
+    }
     accumulate(outL, inL, this.curThru, this.thru, n);
     accumulate(outR, inR, this.curThru, this.thru, n);
     this.curThru = this.thru;

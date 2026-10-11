@@ -1,7 +1,23 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SageProcessor } from '../../src/engine/processor';
 import { DESKTOP_MEMORY_BUDGET, PROCESSOR_NAME, RECORDER_BLOCK } from '../../src/engine/config';
-import { BLOCK, SR, exportTracks, freeSettings, makeProcessor, maxAbs, minOf, run, send } from './helpers';
+import { MasterFx } from '../../src/dsp/master';
+import { defaultMemory } from '../../src/schema/memory';
+import type { TrackAudio } from '../../src/shared/protocol';
+import { BLOCK, SR, awaitTracks, exportTracks, freeSettings, makeProcessor, maxAbs, minOf, run, send } from './helpers';
+
+/** Deterministic stereo audio whose every sample differs. */
+function noiseAudio(frames: number, seed: number): TrackAudio {
+  const L = new Float32Array(frames);
+  const R = new Float32Array(frames);
+  let x = seed * 7919;
+  for (let i = 0; i < frames; i++) {
+    x = (x * 1103515245 + 12345) % 2147483648;
+    L[i] = x / 2147483648 - 0.5;
+    R[i] = 0.5 - x / 2147483648;
+  }
+  return { L, R, sampleRate: SR, recordedTempo: 100 + seed, measures: seed };
+}
 
 describe('SageProcessor', () => {
   it('records a 1 s loop of 0.5 DC and plays it back, posting a status about every 800 frames', () => {
@@ -220,6 +236,134 @@ describe('SageProcessor', () => {
   });
 });
 
+describe('SageProcessor timeline', () => {
+  it('dates commands on the AudioContext timeline (currentFrame), not from when the processor started', () => {
+    const { p, port } = makeProcessor();
+    send(port, freeSettings((_m, s) => {
+      s.input.dynamics.mic1Ns = 0;
+    }));
+    const base = 96000; // the context had run 2 s (permission prompt, worklet load) before the node existed
+    send(port, { t: 'recPlay', track: 0 }, base + 24000);
+    send(port, { t: 'recPlay', track: 0 }, base + 28800);
+    run(p, 48000, (f) => f / 100000, BLOCK, base); // the input is the core frame / 100000
+    const t = exportTracks(p, port)[0]!;
+    expect(t.L.length).toBe(4800);
+    expect(t.L[1000]).toBeCloseTo(0.25, 5); // core frame 25000 (the first 5 ms hold the seam crossfade)
+    expect(t.L[4799]).toBeCloseTo(0.28799, 5);
+  });
+
+  it('reports status.frame on the AudioContext timeline', () => {
+    const { p, port } = makeProcessor();
+    run(p, 1024, 0, BLOCK, 96000);
+    // The first status follows the 7th block: 896 frames after the processor's first block.
+    expect(port.events('status')[0]!.status.frame).toBe(96000 + 896);
+  });
+});
+
+describe('SageProcessor exportTracks', () => {
+  it('copies across blocks, at most one second of audio per block, and returns the audio exactly', () => {
+    const { p, port } = makeProcessor();
+    send(port, freeSettings());
+    const a = noiseAudio(SR, 1);
+    const b = noiseAudio(SR, 2);
+    const c = noiseAudio(SR / 2, 3);
+    send(port, { t: 'loadTrack', track: 0, audio: a });
+    send(port, { t: 'loadTrack', track: 2, audio: b });
+    send(port, { t: 'loadTrack', track: 4, audio: c });
+    run(p, BLOCK);
+    send(port, { t: 'exportTracks', reqId: 3 });
+    // 2.5 s of audio at 1 s per block: no answer after one or two blocks, the answer after the third.
+    run(p, BLOCK);
+    expect(port.events('tracks')).toHaveLength(0);
+    run(p, BLOCK);
+    expect(port.events('tracks')).toHaveLength(0);
+    run(p, BLOCK);
+    const reply = port.events('tracks');
+    expect(reply).toHaveLength(1);
+    const tracks = reply[0]!.tracks;
+    expect(reply[0]!.reqId).toBe(3);
+    expect(tracks[1]).toBeNull();
+    expect(tracks[3]).toBeNull();
+    for (const [i, src] of [[0, a], [2, b], [4, c]] as const) {
+      expect(tracks[i]!.L).toEqual(src.L);
+      expect(tracks[i]!.R).toEqual(src.R);
+      expect(tracks[i]!.sampleRate).toBe(SR);
+      expect(tracks[i]!.recordedTempo).toBe(src.recordedTempo);
+      expect(tracks[i]!.measures).toBe(src.measures);
+    }
+  });
+
+  it('exports the audio as it was when asked, even if the track changes while it copies', () => {
+    const { p, port } = makeProcessor();
+    send(port, freeSettings());
+    const a = noiseAudio(3 * SR, 4);
+    send(port, { t: 'loadTrack', track: 1, audio: a });
+    send(port, { t: 'exportTracks', reqId: 1 });
+    run(p, BLOCK);
+    send(port, { t: 'clear', track: 1 });
+    const tracks = awaitTracks(p, port, 1);
+    expect(tracks[1]!.L).toEqual(a.L);
+    expect(exportTracks(p, port, 2)[1]).toBeNull();
+  });
+
+  it('answers requests in order, sharing the per-block budget', () => {
+    const { p, port } = makeProcessor();
+    send(port, freeSettings());
+    send(port, { t: 'loadTrack', track: 0, audio: noiseAudio(SR, 5) });
+    send(port, { t: 'exportTracks', reqId: 1 });
+    send(port, { t: 'exportTracks', reqId: 2 });
+    run(p, BLOCK);
+    expect(port.events('tracks').map((e) => e.reqId)).toEqual([1]);
+    run(p, BLOCK);
+    expect(port.events('tracks').map((e) => e.reqId)).toEqual([1, 2]);
+  });
+});
+
+describe('SageProcessor robustness and CPU', () => {
+  it('drops a command that throws, reports ENGINE ERROR, and keeps rendering', () => {
+    const { p, port } = makeProcessor();
+    port.receive({ cmd: { t: 'settings', memory: defaultMemory() }, at: null }); // no system: configure throws
+    send(port, freeSettings((_m, s) => {
+      s.output.routing.inputThru = true;
+    }));
+    const out = run(p, 1600, 0.5);
+    expect(port.events('message').map((e) => e.text)).toEqual(['ENGINE ERROR']);
+    expect(out.L[1599]).toBeCloseTo(0.5, 4); // the command after it applied, and the blocks kept coming
+    expect(port.events('status')).toHaveLength(2);
+  });
+
+  it('skips the recorder bus MASTER FX while the recorder is off', () => {
+    const spy = vi.spyOn(MasterFx.prototype, 'process');
+    try {
+      const { p, port } = makeProcessor();
+      run(p, 4 * BLOCK);
+      expect(spy).toHaveBeenCalledTimes(4); // out only
+      send(port, { t: 'recorder', on: true });
+      run(p, 4 * BLOCK);
+      expect(spy).toHaveBeenCalledTimes(12); // out and perf
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('a recorder started again gets fresh MASTER FX: no stale reverb tail from the last take', () => {
+    const { p, port } = makeProcessor();
+    send(port, freeSettings((_m, s) => {
+      s.master.reverb = 40;
+    }));
+    send(port, { t: 'recorder', on: true });
+    run(p, RECORDER_BLOCK, 0.5);
+    send(port, { t: 'recorder', on: false });
+    send(port, { t: 'recorder', on: true });
+    run(p, RECORDER_BLOCK, 0);
+    const blocks = port.events('recorderBlock');
+    expect(blocks).toHaveLength(2);
+    expect(maxAbs(blocks[0]!.L)).toBeGreaterThan(0.1);
+    expect(maxAbs(blocks[1]!.L)).toBeLessThan(1e-9);
+    expect(maxAbs(blocks[1]!.R)).toBeLessThan(1e-9);
+  });
+});
+
 describe('the AudioWorklet registration', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -248,6 +392,7 @@ describe('the AudioWorklet registration', () => {
     });
     vi.stubGlobal('AudioWorkletProcessor', FakeWorkletProcessor);
     vi.stubGlobal('sampleRate', 44100);
+    vi.stubGlobal('currentFrame', 441000); // the context has run 10 s
     vi.stubGlobal('structuredClone', undefined); // the AudioWorkletGlobalScope has none
     vi.resetModules();
     await import('../../src/engine/processor');
@@ -261,8 +406,12 @@ describe('the AudioWorklet registration', () => {
       process(i: Float32Array[][], o: Float32Array[][]): boolean;
     };
     for (let i = 0; i < 6; i++) expect(node.process([[new Float32Array(BLOCK)]], [[new Float32Array(BLOCK), new Float32Array(BLOCK)]])).toBe(true);
-    const status = node.port.posted.map((m) => m as { t: string; status?: { sampleRate: number; memoryBudget: number } }).find((d) => d.t === 'status');
+    const status = node.port.posted
+      .map((m) => m as { t: string; status?: { sampleRate: number; memoryBudget: number; frame: number } })
+      .find((d) => d.t === 'status');
     expect(status?.status?.sampleRate).toBe(44100);
+    // currentFrame is read: the stub holds it at 441000, so the status shows the end of that block on the context's timeline.
+    expect(status?.status?.frame).toBe(441000 + BLOCK);
     expect(status?.status?.memoryBudget).toBe(5 * 1024 * 1024);
   });
 });

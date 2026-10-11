@@ -25,7 +25,7 @@ export interface TrackStatus {
   position: number; lengthFrames: number; measures: number | null; peak: number;
   canUndo: boolean; canRedo: boolean; hasMark: boolean; speed: 'HALF' | 'NORMAL' | 'DOUBLE';
 }
-export type EngineMessage = 'MEMORY FULL' | 'TEMPO TOO FAST' | 'TEMPO TOO SLOW' | 'NO INPUT';
+export type EngineMessage = 'MEMORY FULL' | 'TEMPO TOO FAST' | 'TEMPO TOO SLOW' | 'NO INPUT' | 'ENGINE ERROR'; // ENGINE ERROR: a command failed and was dropped
 export interface EngineStatus {
   frame: number; sampleRate: number; tempo: number; beat: Beat; beatPhase: number; measurePhase: number;
   rhythm: 'off' | 'on' | 'standby'; tracks: TrackStatus[]; inputPeak: number; outputPeak: number;

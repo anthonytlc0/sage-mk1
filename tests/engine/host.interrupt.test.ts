@@ -116,7 +116,14 @@ function recordThroughHost(rig: Rig): void {
   expect(statuses(rig).at(-1)!.tracks[0]!.state).toBe('recording');
 }
 
-describe('EngineHost interrupts', () => {
+/** An iPad's navigator: more than one touch point. */
+function touchNav(): FakeNav {
+  const nav = new FakeNav();
+  nav.maxTouchPoints = 5;
+  return nav;
+}
+
+describe('EngineHost interrupts (ruling R37)', () => {
   afterEach(() => {
     vi.useRealTimers();
   });
@@ -150,45 +157,69 @@ describe('EngineHost interrupts', () => {
     expect(statuses(rig).at(-1)!.tracks[0]!.state).toBe('playing');
   });
 
-  it('interrupted or suspended with nothing recording sends nothing', async () => {
+  it('every interrupted or suspended the host did not cause sends interrupt, recording or not (it is idempotent)', async () => {
     const rig = await startHost();
     run(rig.processor, 1600);
     rig.ctx.setState('interrupted');
     rig.ctx.setState('suspended');
-    expect(interrupts(rig)).toBe(0);
+    rig.ctx.setState('running');
+    rig.ctx.setState('suspended');
+    expect(interrupts(rig)).toBe(3);
   });
 
-  it('going hidden sends interrupt even when nothing records', async () => {
-    const rig = await startHost();
+  it('touch device: going hidden sends interrupt', async () => {
+    const rig = await startHost({ nav: touchNav() });
     rig.doc.set('hidden');
     expect(sentCommands(rig).at(-1)).toEqual({ t: 'interrupt', at: null });
   });
 
-  it('visible again: suspend() then resume() (WebKit bug 276016), and that suspend sends no second interrupt', async () => {
+  it('desktop: going hidden sends nothing (background tabs keep their audio); a suspended context still interrupts', async () => {
     const rig = await startHost();
     recordThroughHost(rig);
     rig.doc.set('hidden');
+    expect(interrupts(rig)).toBe(0);
+    run(rig.processor, 1600, 0.5);
+    expect(statuses(rig).at(-1)!.tracks[0]!.state).toBe('recording');
+    rig.ctx.setState('suspended');
     expect(interrupts(rig)).toBe(1);
+  });
+
+  it.each([
+    ['touch', touchNav],
+    ['desktop', () => new FakeNav()],
+  ] as const)('%s: visible with the context not running: suspend() then resume() (WebKit bug 276016), no second interrupt', async (_kind, nav) => {
+    const rig = await startHost({ nav: nav() });
+    recordThroughHost(rig);
+    rig.doc.set('hidden');
+    rig.ctx.setState('interrupted');
+    const before = interrupts(rig);
+    expect(before).toBeGreaterThanOrEqual(1);
     rig.ctx.calls.length = 0;
-    rig.doc.set('visible'); // the last status still shows the recording: no block ran since
+    rig.doc.set('visible');
     await settle();
     expect(rig.ctx.calls).toEqual(['suspend', 'resume']);
     expect(rig.ctx.state).toBe('running');
-    expect(interrupts(rig)).toBe(1);
+    expect(interrupts(rig)).toBe(before); // the host's own suspend is not an interruption
     expect(messages(rig)).toEqual([]);
   });
 
-  it('visible with a healthy mic keeps it', async () => {
-    const rig = await startHost();
+  it.each([
+    ['touch', touchNav],
+    ['desktop', () => new FakeNav()],
+  ] as const)('%s: visible with the context still running leaves it alone', async (_kind, nav) => {
+    const rig = await startHost({ nav: nav() });
     rig.doc.set('hidden');
+    rig.ctx.calls.length = 0;
     rig.doc.set('visible');
     await settle();
+    expect(rig.ctx.calls).toEqual([]);
     expect(rig.nav.streams).toHaveLength(1);
     expect(rig.nav.streams[0]!.track.stopped).toBe(false);
+    expect(messages(rig)).toEqual([]);
   });
 
   it.each(['ended', 'muted'] as const)('visible with the mic track %s: getUserMedia again and reconnect', async (how) => {
-    const rig = await startHost();
+    const rig = await startHost({ nav: touchNav() });
     const first = rig.nav.streams[0]!;
     if (how === 'ended') first.track.readyState = 'ended';
     else first.track.muted = true;
@@ -205,7 +236,19 @@ describe('EngineHost interrupts', () => {
     expect(messages(rig)).toEqual([]);
   });
 
-  it('a mic that cannot be had again gives NO INPUT', async () => {
+  it('interrupted -> running while the page stays visible (Siri, a call): an ended mic is opened again', async () => {
+    const rig = await startHost({ nav: touchNav() });
+    rig.ctx.setState('interrupted');
+    rig.nav.streams[0]!.track.readyState = 'ended';
+    rig.ctx.setState('running');
+    await settle();
+    expect(rig.nav.streams).toHaveLength(2);
+    expect(rig.ctx.sources[1]!.node.connections).toEqual([rig.node]);
+    expect(rig.host.micAvailable).toBe(true);
+    expect(messages(rig)).toEqual([]);
+  });
+
+  it('a mic that cannot be had again gives NO INPUT and needsResume', async () => {
     const rig = await startHost();
     rig.nav.streams[0]!.track.readyState = 'ended';
     rig.nav.fail = true;
@@ -214,27 +257,83 @@ describe('EngineHost interrupts', () => {
     await settle();
     expect(rig.host.micAvailable).toBe(false);
     expect(messages(rig)).toEqual(['NO INPUT']);
+    expect(rig.host.needsResume).toBe(true);
   });
 
-  it('a context that refuses to resume gives NO INPUT', async () => {
+  it('a context that refuses to resume gives NO INPUT and needsResume; a later resume() clears it', async () => {
     const rig = await startHost();
+    const seen: boolean[] = [];
+    rig.host.onNeedsResume((v) => seen.push(v));
+    rig.ctx.setState('interrupted');
     rig.ctx.resumeFails = true;
-    rig.doc.set('hidden');
     rig.doc.set('visible');
     await settle();
     expect(messages(rig)).toEqual(['NO INPUT']);
+    expect(rig.host.needsResume).toBe(true);
+    rig.ctx.resumeFails = false;
+    await expect(rig.host.resume()).resolves.toBe(true);
+    expect(rig.host.needsResume).toBe(false);
+    expect(seen).toEqual([true, false]);
   });
 
-  it('a resume that never settles gives NO INPUT after RESUME_TIMEOUT_MS', async () => {
+  it('a resume that has not settled after RESUME_TIMEOUT_MS gives NO INPUT; when it goes through later, needsResume clears', async () => {
     const rig = await startHost();
+    const seen: boolean[] = [];
+    rig.host.onNeedsResume((v) => seen.push(v));
     vi.useFakeTimers();
+    rig.ctx.setState('interrupted');
     rig.ctx.resumeHangs = true;
-    rig.doc.set('hidden');
     rig.doc.set('visible');
     await vi.advanceTimersByTimeAsync(RESUME_TIMEOUT_MS - 1);
     expect(messages(rig)).toEqual([]);
     await vi.advanceTimersByTimeAsync(1);
     expect(messages(rig)).toEqual(['NO INPUT']);
+    expect(rig.host.needsResume).toBe(true);
+    rig.ctx.finishResume(); // the context runs after all
+    await vi.advanceTimersByTimeAsync(0);
+    expect(rig.host.needsResume).toBe(false);
+    expect(seen).toEqual([true, false]);
+    expect(messages(rig)).toEqual(['NO INPUT']);
+  });
+
+  it('a resume racing stop() reports nothing after the stop', async () => {
+    const rig = await startHost();
+    const seen: boolean[] = [];
+    rig.host.onNeedsResume((v) => seen.push(v));
+    vi.useFakeTimers();
+    rig.ctx.setState('interrupted');
+    rig.ctx.resumeHangs = true;
+    const resumed = rig.host.resume();
+    await vi.advanceTimersByTimeAsync(10);
+    await rig.host.stop();
+    await vi.advanceTimersByTimeAsync(RESUME_TIMEOUT_MS * 2);
+    await expect(resumed).resolves.toBe(false);
+    expect(messages(rig)).toEqual([]);
+    expect(seen).toEqual([]);
+  });
+
+  it('a failure inside the automatic resume is caught and logged, never an unhandled rejection', async () => {
+    const rig = await startHost();
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown): void => {
+      unhandled.push(e);
+    };
+    // Node's process, without the Node typings this project does not install.
+    const proc = (globalThis as unknown as { process: { on(e: string, f: (r: unknown) => void): void; off(e: string, f: (r: unknown) => void): void } }).process;
+    proc.on('unhandledRejection', onUnhandled);
+    try {
+      rig.host.on((e) => {
+        if (e.t === 'message') throw new Error('a handler failed');
+      });
+      rig.ctx.setState('interrupted');
+      rig.ctx.resumeFails = true;
+      rig.doc.set('visible');
+      await settle();
+      expect(unhandled).toEqual([]);
+      expect(rig.logs.some(([m, d]) => m === 'engine: resume failed' && d instanceof Error && d.message === 'a handler failed')).toBe(true);
+    } finally {
+      proc.off('unhandledRejection', onUnhandled);
+    }
   });
 
   it('resume({ retryMic: true }) (TAP POWER TO RESUME) asks for a mic that was never had', async () => {
@@ -243,6 +342,7 @@ describe('EngineHost interrupts', () => {
     const rig = await startHost({ nav });
     await settle();
     expect(messages(rig)).toEqual(['NO INPUT']);
+    expect(rig.host.needsResume).toBe(false); // no mic at power-on is not a lost resume
     rig.doc.set('hidden');
     rig.doc.set('visible'); // an automatic resume does not ask again
     await settle();
@@ -252,5 +352,27 @@ describe('EngineHost interrupts', () => {
     expect(nav.constraints).toHaveLength(2);
     expect(rig.host.micAvailable).toBe(true);
     expect(rig.ctx.sources.at(-1)!.node.connections).toEqual([rig.node]);
+  });
+});
+
+describe('EngineHost and SageProcessor timelines', () => {
+  it('a dated press lands on the core frame it was heard at, though the context ran before the processor existed', async () => {
+    const rig = await startHost();
+    const base = 96000; // context frame of the processor's first block: 2 s of permission prompt and worklet loading
+    rig.host.send(freeSettings((_m, s) => {
+      s.input.dynamics.mic1Ns = 0;
+    }));
+    rig.ctx.timestamp = { contextTime: 2.5, performanceTime: 10000 }; // heard frame 120000 at t = 10000 ms
+    rig.host.send({ t: 'recPlay', track: 0 }, 10000); // heard frame 120000 = core frame 24000
+    rig.host.send({ t: 'recPlay', track: 0 }, 10100); // 4800 frames later
+    run(rig.processor, 48000, (f) => f / 100000, BLOCK, base); // the input is the core frame / 100000
+    rig.host.send({ t: 'exportTracks', reqId: 1 });
+    run(rig.processor, 4 * BLOCK, 0, BLOCK, base + 48000);
+    const reply = rig.events.find((e): e is Extract<EngineEvent, { t: 'tracks' }> => e.t === 'tracks')!;
+    const t = reply.tracks[0]!;
+    expect(t.L.length).toBe(4800);
+    expect(t.L[1000]).toBeCloseTo(0.25, 5); // core frame 25000 (the first 5 ms hold the seam crossfade)
+    // The last status followed core frame 48000 (60 x 800): on the context's timeline that is base + 48000.
+    expect(statuses(rig).at(-1)!.frame).toBe(base + 48000);
   });
 });

@@ -71,8 +71,9 @@ export class FakeContext implements HostContext {
   readonly sources: { stream: HostStream; node: FakeNode }[] = [];
   /** resume() rejects. */
   resumeFails = false;
-  /** resume() never settles (no user activation). */
+  /** resume() does not settle (no user activation) until `finishResume()`. */
   resumeHangs = false;
+  private readonly pendingResumes: (() => void)[] = [];
 
   getOutputTimestamp(): AudioTimestamp {
     return this.timestamp;
@@ -88,10 +89,16 @@ export class FakeContext implements HostContext {
   }
   resume(): Promise<void> {
     this.calls.push('resume');
-    if (this.resumeHangs) return new Promise(() => {});
+    if (this.resumeHangs) return new Promise((resolve) => this.pendingResumes.push(resolve));
     if (this.resumeFails) return Promise.reject(new Error('resume refused'));
     this.setState('running');
     return Promise.resolve();
+  }
+  /** A hung resume() finally goes through: the context runs and the promise resolves. */
+  finishResume(): void {
+    this.resumeHangs = false;
+    this.setState('running');
+    for (const resolve of this.pendingResumes.splice(0)) resolve();
   }
   async close(): Promise<void> {
     this.calls.push('close');

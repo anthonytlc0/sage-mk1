@@ -3,21 +3,31 @@
  * in an AudioWorklet, registered as 'sage-processor' by the block at the end of this file; in the tests it runs in Node
  * on a FakePort. It talks to the main thread only through its port: TimedCommands in, EngineEvents out.
  *
+ * Timeline: the host dates commands in AudioContext frames (the heard frame of the press), but the core counts frames
+ * from the processor's first block, and the context may have run for seconds before the node existed (permission
+ * prompt, worklet load). The worklet passes `currentFrame` with every block; the difference is applied to each dated
+ * command, and `status.frame` is reported in context frames.
+ *
  * Each render block, in order:
- *  1. apply the TimedCommands received since the last block (the core dates its own; the engine's act at once);
+ *  1. apply the TimedCommands received since the last block (the core dates its own; the engine's act at once). A
+ *     command that throws is dropped and reported as an `ENGINE ERROR` message, so it cannot stop the processor;
  *  2. the mic input chain (MIC 1 IN gain and mute, EQ, comp, noise suppressor);
  *  3. the looper core (each track after PLAY LEVEL, PAN and fades; the guide click). Its RHYTHM inputs are silent
  *     until input routing lands (Task 9);
- *  4. the mixer: `out`, what is heard, and `perf`, the recorder bus with the mic always in. The core's click goes in
- *     as the rhythm. The core has already panned the tracks (ruling R19), so the mixer does not pan again;
- *  5. MASTER FX on each bus (one MasterFx per bus, each with its own state);
+ *  4. the mixer: `out`, what is heard, and, only while the recorder is on, `perf`, the recorder bus with the mic always
+ *     in. The core's click goes in as the rhythm. The core has already panned the tracks (ruling R19), so the mixer
+ *     does not pan again;
+ *  5. MASTER FX on each bus in use (one MasterFx per bus; the recorder's is made fresh at every recorder start, so a
+ *     new take never opens on the last take's reverb tail);
  *  6. `out` to the node's output;
  *  7. while the recorder is on, `perf` in 4096-frame `recorderBlock` events, their buffers transferred;
- *  8. every round(sr / 60) frames, a `status`, then any LCD messages the core raised.
+ *  8. every round(sr / 60) frames, a `status`, then any LCD messages the core raised;
+ *  9. pending `exportTracks` requests: up to one second of audio (all tracks together) is copied out per block, from
+ *     copy-on-write snapshots of the takes taken when the request arrived, and the reply goes when all is copied.
  *
  * Nothing allocates in `process()` (no closures, no array destructuring) except the core's recording chunks, a fresh
  * recorder batch per 4096 frames and the status object 60 times a second (ruling R6), plus what the commands applied
- * in step 1 need, once per user action (the core's own rule; `exportTracks` copies the loops).
+ * in step 1 need, once per user action (the core's own rule; an export allocates its destination arrays once).
  *
  * Interrupts (the host lost audio): `interrupt` applies at once and the core ends every recording and overdub as if
  * STOP had been pressed, keeping the audio. Ending a pass leaves a 5 ms tail that keeps writing the input that follows
@@ -27,6 +37,7 @@
  * gated: the monitor and recorder buses keep the live mic.
  */
 
+import type { AudioTake } from '../core/chunks';
 import { xfadeFrames } from '../core/fade';
 import { LooperCore } from '../core/looper';
 import type { CoreOutput } from '../core/looper';
@@ -86,14 +97,32 @@ function makeBuffers(n: number): Buffers {
 /** The render quantum every browser uses today. A larger block reallocates the buffers once. */
 const QUANTUM = 128;
 const NO_TRANSFER: Transferable[] = [];
+/** Seconds of audio (all tracks together) an export copies per block. 5 x 30 s loops take 150 blocks (0.4 s). */
+const EXPORT_SECONDS_PER_BLOCK = 1;
+
+type ExportedAudio = TrackAudio & { L: Float32Array<ArrayBuffer>; R: Float32Array<ArrayBuffer> };
+
+/** One `exportTracks` request being copied out. */
+interface ExportJob {
+  readonly reqId: number;
+  /** Per track: a copy-on-write snapshot of its take and the reply's arrays, or null (no loop). */
+  readonly parts: ({ readonly take: AudioTake; readonly audio: ExportedAudio } | null)[];
+  /** The part being copied and the next frame of it. */
+  part: number;
+  pos: number;
+}
 
 export class SageProcessor {
   private readonly core: LooperCore;
   private readonly input: InputChain;
   private readonly mixer: Mixer;
   private readonly masterOut: MasterFx;
-  private readonly masterPerf: MasterFx;
+  private masterPerf: MasterFx;
   private buf = makeBuffers(QUANTUM);
+  /** The latest system settings (a fresh recorder MasterFx is configured from them). */
+  private system: SystemSettings;
+  /** AudioContext frame minus core frame, from the worklet's `currentFrame` (0 until one is given). */
+  private offset = 0;
 
   /** Commands received since the last block, in arrival order. */
   private readonly inbox: TimedCommand[] = [];
@@ -115,6 +144,10 @@ export class SageProcessor {
   /** Frames the recorder has taken since it was switched on. */
   private recFrames = 0;
 
+  /** Pending exports, oldest first, and the frames they may copy per block. */
+  private readonly exports: ExportJob[] = [];
+  private readonly exportBudget: number;
+
   constructor(
     private readonly sr: number,
     private readonly port: MessagePortLike,
@@ -130,20 +163,27 @@ export class SageProcessor {
     this.masterOut = new MasterFx(sr);
     this.masterPerf = new MasterFx(sr);
     // The core starts on the guide defaults; the DSP matches it until the host sends the real settings.
-    this.configure(defaultSystem());
+    this.system = defaultSystem();
+    this.configure(this.system);
+    this.exportBudget = Math.max(1, Math.round(sr * EXPORT_SECONDS_PER_BLOCK));
     this.statusEvery = Math.max(1, Math.round(sr / STATUS_HZ));
     this.xf = xfadeFrames(sr);
     port.onmessage = (ev) => this.receive(ev.data);
   }
 
-  /** Renders one block. `inputs[0][0]` is the mono mic (absent with no mic); `outputs[0]` the stereo output. */
-  process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
+  /**
+   * Renders one block. `inputs[0][0]` is the mono mic (absent with no mic); `outputs[0]` the stereo output.
+   * `contextFrame` is the AudioContext frame of the block's first sample (the worklet's `currentFrame`); without it the
+   * last known offset stays (0 at first: the core's own frames).
+   */
+  process(inputs: Float32Array[][], outputs: Float32Array[][], contextFrame?: number): boolean {
     const dest = outputs[0];
     const destL = dest?.[0];
     if (dest === undefined || destL === undefined || destL.length === 0) return true;
     const n = destL.length;
     if (n > this.buf.n) this.buf = makeBuffers(n);
     const b = this.buf;
+    if (contextFrame !== undefined && Number.isFinite(contextFrame)) this.offset = contextFrame - this.core.frame;
 
     // 1. Commands.
     this.applyInbox();
@@ -174,12 +214,13 @@ export class SageProcessor {
     }
     this.core.process(recL, recR, b.silence, b.silence, b.core, n);
 
-    // 4.-5. Mix both buses and run MASTER FX on each.
-    this.mixer.process(b.core.tracks, b.input, b.core.click, b.out, b.perf, n);
+    // 4.-5. Mix and run MASTER FX: `out` always, the recorder bus only while the recorder is on.
+    const perf = this.recOn ? b.perf : null;
+    this.mixer.process(b.core.tracks, b.input, b.core.click, b.out, perf, n);
     const outL = b.out[0];
     const outR = b.out[1];
     this.masterOut.process(outL, outR, n);
-    this.masterPerf.process(b.perf[0], b.perf[1], n);
+    if (perf !== null) this.masterPerf.process(perf[0], perf[1], n);
 
     // 6. Out.
     const destR = dest[1];
@@ -197,7 +238,7 @@ export class SageProcessor {
     this.outPeak = op;
 
     // 7. The recorder.
-    if (this.recOn) this.record(b.perf, n);
+    if (perf !== null) this.record(perf, n);
 
     // 8. Status.
     this.sinceStatus += n;
@@ -205,6 +246,9 @@ export class SageProcessor {
       this.sinceStatus %= this.statusEvery;
       this.postStatus();
     }
+
+    // 9. Exports.
+    if (this.exports.length > 0) this.stepExports();
     return true;
   }
 
@@ -218,11 +262,19 @@ export class SageProcessor {
     const q = this.inbox;
     if (q.length === 0) return;
     // A reply posted here can make the host send more; those arrive in this same loop and apply too.
-    for (let i = 0; i < q.length; i++) this.apply(q[i]!);
+    for (let i = 0; i < q.length; i++) {
+      try {
+        this.apply(q[i]!);
+      } catch {
+        // A browser stops calling a processor that throws: drop the command and let the LCD say so.
+        this.post({ t: 'message', text: 'ENGINE ERROR' });
+      }
+    }
     q.length = 0;
   }
 
   private apply({ cmd, at }: TimedCommand): void {
+    const coreAt = at === null ? null : at - this.offset; // context frames -> core frames
     switch (cmd.t) {
       case 'fader':
         this.mixer.setFader(cmd.track, cmd.gain);
@@ -234,11 +286,11 @@ export class SageProcessor {
         this.setRecorder(cmd.on);
         return;
       case 'exportTracks':
-        this.exportTracks(cmd.reqId);
+        this.startExport(cmd.reqId);
         return;
       case 'settings':
         this.configure(cmd.system);
-        this.core.command(cmd, at);
+        this.core.command(cmd, coreAt);
         return;
       case 'interrupt':
         // Now, whatever the date: the audio has already gone.
@@ -247,12 +299,13 @@ export class SageProcessor {
         return;
       // TODO(T21): `calibrate` (the click and the capture) arrives with the LATENCY screen; the core ignores it.
       default:
-        this.core.command(cmd, at);
+        this.core.command(cmd, coreAt);
         return;
     }
   }
 
   private configure(system: SystemSettings): void {
+    this.system = system;
     this.input.configure(system);
     this.mixer.configure(system);
     this.masterOut.configure(system);
@@ -262,6 +315,9 @@ export class SageProcessor {
   private setRecorder(on: boolean): void {
     if (on === this.recOn) return;
     if (on) {
+      // A fresh MasterFx: the recorder bus was not processed while off, so the old one holds a stale reverb tail.
+      this.masterPerf = new MasterFx(this.sr);
+      this.masterPerf.configure(this.system);
       this.recFill = 0;
       this.recFrames = 0;
       this.recOn = true;
@@ -302,23 +358,66 @@ export class SageProcessor {
     this.post({ t: 'recorderBlock', L, R }, [L.buffer, R.buffer]);
   }
 
-  private exportTracks(reqId: number): void {
-    const tracks: (TrackAudio | null)[] = [];
-    const transfer: Transferable[] = [];
-    for (const i of TRACKS) {
-      const a = this.core.getTrackAudio(i); // fresh copies, so their buffers can go
-      tracks.push(a);
-      if (a === null) continue;
-      if (a.L.buffer instanceof ArrayBuffer) transfer.push(a.L.buffer);
-      if (a.R.buffer instanceof ArrayBuffer && a.R.buffer !== a.L.buffer) transfer.push(a.R.buffer);
+  /** Queues an export of every loop as it is now: copy-on-write snapshots, so nothing is copied yet. */
+  private startExport(reqId: number): void {
+    const parts: ExportJob['parts'] = [];
+    for (const tr of this.core.tracks) {
+      // As Track.audio(): no loop while the track is empty or its first recording still runs.
+      if (tr.state === 'empty' || tr.state === 'recording') {
+        parts.push(null);
+        continue;
+      }
+      const take = tr.take.snapshot();
+      const n = take.length;
+      parts.push({
+        take,
+        audio: {
+          L: new Float32Array(n),
+          R: new Float32Array(n),
+          sampleRate: this.sr,
+          recordedTempo: tr.recordedTempo,
+          measures: tr.measures,
+        },
+      });
     }
-    this.post({ t: 'tracks', reqId, tracks }, transfer);
+    this.exports.push({ reqId, parts, part: 0, pos: 0 });
+  }
+
+  /** Copies up to `exportBudget` frames of the pending exports and answers each one that is complete. */
+  private stepExports(): void {
+    let budget = this.exportBudget;
+    while (this.exports.length > 0) {
+      const job = this.exports[0]!;
+      while (job.part < job.parts.length) {
+        const part = job.parts[job.part] ?? null;
+        if (part !== null && job.pos < part.take.length) {
+          if (budget === 0) break;
+          const m = Math.min(budget, part.take.length - job.pos);
+          part.take.read(job.pos, part.audio.L, part.audio.R, job.pos, m);
+          job.pos += m;
+          budget -= m;
+          if (job.pos < part.take.length) break;
+        }
+        part?.take.release();
+        job.part++;
+        job.pos = 0;
+      }
+      if (job.part < job.parts.length) return;
+      this.exports.shift();
+      const tracks: (TrackAudio | null)[] = [];
+      const transfer: Transferable[] = [];
+      for (const part of job.parts) {
+        tracks.push(part === null ? null : part.audio);
+        if (part !== null) transfer.push(part.audio.L.buffer, part.audio.R.buffer);
+      }
+      this.post({ t: 'tracks', reqId: job.reqId, tracks }, transfer);
+    }
   }
 
   private postStatus(): void {
     const status: EngineStatus = {
       ...this.core.status(),
-      frame: this.core.frame,
+      frame: this.core.frame + this.offset,
       sampleRate: this.sr,
       inputPeak: this.inPeak,
       outputPeak: this.outPeak,
@@ -351,6 +450,7 @@ function isTimedCommand(v: unknown): v is TimedCommand {
 declare const registerProcessor: ((name: string, ctor: new (options?: AudioWorkletNodeOptions) => object) => void) | undefined;
 declare const AudioWorkletProcessor: new () => { readonly port: MessagePortLike };
 declare const sampleRate: number;
+declare const currentFrame: number;
 
 if (typeof registerProcessor !== 'undefined') {
   ensureStructuredClone();
@@ -365,7 +465,7 @@ if (typeof registerProcessor !== 'undefined') {
     }
 
     process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
-      return this.engine.process(inputs, outputs);
+      return this.engine.process(inputs, outputs, currentFrame);
     }
   }
 
