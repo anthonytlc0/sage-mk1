@@ -4,8 +4,11 @@
  * whole window plus 500 ms. Then it posts `{ t: 'calibration', reqId, capture, clickFrames }`; the main thread turns
  * that into a latency (control/calibrate.ts).
  *
- * The click and the capture share the processor's frame timeline: a click written to the output at frame f and heard
- * by the mic at frame g took g - f frames, the round trip the core compensates.
+ * FRAME BASE: `clickFrames` and `capture` are both capture-relative. Frame 0 is the first frame of the render block in
+ * which `calibrate` was applied; `capture[i]` is the mic at that frame + i, and a click listed at frame c was written
+ * to the output at that same frame + c. Neither is expressed in core frames or AudioContext frames (the status
+ * timeline, which may be offset from the core's), so nothing needs converting: a click written at capture frame c and
+ * heard by the mic at capture frame g took g - c frames, the round trip the core compensates.
  *
  * While it runs the click replaces the output: loops and INPUT THRU monitoring are muted so they cannot be taken for
  * clicks (and the mic cannot feed back through the speaker).
@@ -82,7 +85,7 @@ export class Calibrator {
     return this.pos >= len;
   }
 
-  /** The result to post (transfer `capture.buffer`). */
+  /** The result to post (transfer `capture.buffer`). `clickFrames` index `capture` (see FRAME BASE above). */
   event(): Extract<EngineEvent, { t: 'calibration' }> {
     return { t: 'calibration', reqId: this.reqId, capture: this.capture, clickFrames: this.clickFrames };
   }

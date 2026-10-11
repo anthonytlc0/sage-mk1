@@ -198,10 +198,12 @@ function open(kind: NonNullable<Cell['opens']>, env: Env): Screen {
 /** A list of items, four to a page on the knobs. */
 class ItemsScreen implements Screen {
   private page = 0;
-  private readonly labels: (string | null)[];
+  /** The labels of each page, built once so drawing allocates nothing. */
+  private readonly pageLabels: (string | null)[][] = [];
 
   constructor(readonly title: string, private readonly list: readonly (MenuNode | null)[], private readonly env: Env) {
-    this.labels = list.map((n) => (n ? n.label ?? n.title : null));
+    const labels = list.map((n) => (n ? n.label ?? n.title : null));
+    for (let i = 0; i < labels.length; i += 4) this.pageLabels.push(labels.slice(i, i + 4));
   }
 
   private get pageCount(): number {
@@ -211,7 +213,7 @@ class ItemsScreen implements Screen {
   render(fb: Framebuffer): void {
     drawTitleBar(fb, this.title);
     drawPageArrows(fb, this.page > 0, this.page < this.pageCount - 1);
-    drawRows(fb, this.labels.slice(this.page * 4, this.page * 4 + 4));
+    drawRows(fb, this.pageLabels[this.page] ?? []);
   }
 
   onEvent(e: ControlEvent): ScreenResult {

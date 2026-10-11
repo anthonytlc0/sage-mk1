@@ -128,7 +128,7 @@ class StorageScreen implements Screen {
     const st = this.state;
     if (st.k === 'slot') {
       drawTitleBar(fb, 'IMPORT MEMORY');
-      text(fb, 0, 13, pad2(st.slot), FONT_LARGE, CENTERED);
+      text(fb, 0, 13, SLOT_TEXT[st.slot - 1]!, FONT_LARGE, CENTERED);
       text(fb, 0, 40, st.contents.settings.name, FONT_SMALL, CENTERED);
       drawLabelLines(fb, 0, SLOT_LABEL);
       drawLabelLines(fb, 3, ENTER_LABEL);
@@ -338,6 +338,7 @@ class StorageScreen implements Screen {
   }
 }
 
+const SLOT_TEXT: readonly string[] = Array.from({ length: 99 }, (_, i) => pad2(i + 1));
 const SLOT_LABEL: readonly string[] = ['MEMORY'];
 const ENTER_LABEL: readonly string[] = ['ENTER'];
 

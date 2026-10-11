@@ -63,6 +63,26 @@ describe('SageProcessor calibrate', () => {
     expect(posted.transfer).toHaveLength(1);
   });
 
+  it('clickFrames index the capture (capture-relative), wherever the processor timeline is when it starts', () => {
+    const { p, port } = makeProcessor();
+    const before = 100 * BLOCK; // the engine has been running a while: its own frame count is far from 0
+    const out = new Float32Array(before + captureFrames + 2 * BLOCK);
+    out.set(loopback(p, before, 300), 0);
+    send(port, { t: 'calibrate', reqId: 5 });
+    out.set(loopback(p, captureFrames + 2 * BLOCK, 1234), before);
+    const ev = calibrationEvents(port)[0]!;
+    // Same values as a calibration started at frame 0: they count from the start of the capture.
+    expect(ev.clickFrames).toEqual(calibrationClickFrames(SR));
+    // Each click left the output at the capture's start + its click frame...
+    for (const c of ev.clickFrames) expect(out[before + c]).toBeCloseTo(CLICK_GAIN, 5);
+    // ...and the capture holds it 1234 frames later at the same base, so the delay comes out exactly.
+    expect(ev.capture[ev.clickFrames[0]! + 1234]).toBeCloseTo(CLICK_GAIN * 0.5, 5);
+    expect(ev.capture[ev.clickFrames[0]! + 1233]).toBe(0);
+    expect(computeLatency(ev.capture, ev.clickFrames, SR)).toBe(1234);
+    // The status timeline is another base: it is not used here.
+    expect(port.events('status').at(-1)!.status.frame).toBeGreaterThan(before + captureFrames);
+  });
+
   it('mutes the normal output while it runs (no loops or monitoring under the clicks), then restores it', () => {
     const { p, port } = makeProcessor();
     send(port, freeSettings((_m, s) => {

@@ -144,7 +144,10 @@ class TempoEcho {
 
 const EMPTY_TRACKS = (): (TrackAudio | null)[] => TRACKS.map(() => null);
 
-/** What a LATENCY calibration recorded: the mic capture and the frames of it at which the clicks were played. */
+/**
+ * What a LATENCY calibration recorded: the mic capture, and the frames at which the clicks were played, as indices
+ * into `capture` (capture-relative, not status or context frames; see engine/calibration.ts).
+ */
 export interface Calibration {
   capture: Float32Array;
   clickFrames: number[];
