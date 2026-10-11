@@ -7,7 +7,7 @@ import type { IconName } from '../../src/lcd/icons';
 import type { FxBankView } from '../../src/lcd/menu';
 import type { TrackState } from '../../src/shared/protocol';
 import { expectScreen } from './fixtures';
-import { frame, push, rig, status } from './rig';
+import { frame, push, rig, sameRegion, status } from './rig';
 import { DEFAULT_FOOTER, bigNumber, blank, footer, header, pieCleared, rhythmPill, scaled, scaledWidth, statusRow } from './spec';
 import type { Rig } from './rig';
 
@@ -305,5 +305,32 @@ describe('INPUT FX (6) and TRACK FX (7)', () => {
     tiles(want, 'INPUT FX-B', [['LPF'], ['G2B'], ['PTN', 'SL'], ['DLY']], [true, false, true, false]);
     footer(want, DEFAULT_FOOTER);
     expectScreen(frame(r.c), want.toAscii());
+  });
+});
+
+describe('memory names are drawn in the case and with the symbols they were typed with', () => {
+  it('a lower-case name looks different from its upper-case version on the MEMORY NUMBER screen', () => {
+    const lower = rig();
+    lower.c.setParam('name', 'Memory01');
+    const upper = rig();
+    upper.c.setParam('name', 'MEMORY01');
+    const a = frame(lower.c);
+    expect(a.toAscii()).not.toBe(frame(upper.c).toAscii());
+    const want = blank();
+    text(want, 0, 36, 'Memory01', FONT_MEDIUM, { align: 'center', width: 128 });
+    for (let y = 36; y < 47; y++) for (let x = 0; x < 128; x++) expect(a.get(x, y), `pixel ${x},${y}`).toBe(want.get(x, y));
+  });
+
+  it('symbols are drawn, not left as gaps, and the header of the other screens does the same', () => {
+    const r = rig();
+    r.c.setParam('name', 'A&B #2 (v1)');
+    goto(r, 1);
+    const want = blank();
+    header(want, '01', 'A&B #2 (v1)');
+    const f = frame(r.c);
+    for (let y = 10; y < 21; y++) for (let x = 0; x < 128; x++) expect(f.get(x, y), `pixel ${x},${y}`).toBe(want.get(x, y));
+    const gaps = blank();
+    header(gaps, '01', 'A B  2  v1 ');
+    expect(sameRegion(f, gaps, 20, 10, 108, 11)).toBe(false); // the symbols leave marks
   });
 });

@@ -19,6 +19,7 @@ import { STATUS_HZ } from '../shared/constants';
 import type { PanelState } from '../shared/panel';
 import type { EngineCommand, EngineEvent, EngineStatus, TrackAudio } from '../shared/protocol';
 import { QuotaError } from '../storage/db';
+import { SLOT_COUNT } from '../storage/memoryStore';
 import type { MemoryStore } from '../storage/memoryStore';
 import type { Recovery } from '../storage/recovery';
 import type { SystemStore } from '../storage/systemStore';
@@ -48,7 +49,7 @@ export interface LcdHost {
 
 /** The storage the controller uses: the parts of the Task 12 stores it calls (the real stores satisfy this). */
 export interface Stores {
-  memories: Pick<MemoryStore, 'load' | 'save' | 'clear' | 'hasAudio'>;
+  memories: Pick<MemoryStore, 'load' | 'save' | 'clear' | 'hasAudio' | 'list'>;
   system: Pick<SystemStore, 'load' | 'save'>;
   recovery: Pick<Recovery, 'checkpoint' | 'discard' | 'markCleanShutdown'>;
 }
@@ -284,6 +285,18 @@ export class Controller {
     this.session.markSaved(slot, settings, this.audioSeq !== audioSeq);
     this.dropCheckpoint();
     return 'ok';
+  }
+
+  /**
+   * The names of all 99 memories for the WRITE / CLEAR screen: index 0 is memory 1, blank for an empty slot (and for a
+   * memory saved without a name). Reads the slot list only; no memory or audio is loaded and the session is untouched.
+   */
+  async memoryNames(): Promise<string[]> {
+    const names: string[] = Array.from({ length: SLOT_COUNT }, () => '');
+    for (const e of await this.stores.memories.list()) {
+      if (!e.empty && e.slot >= 1 && e.slot <= SLOT_COUNT) names[e.slot - 1] = e.name;
+    }
+    return names;
   }
 
   /** CLEAR: empties memory `slot`. Clearing the current memory also empties the session (INFERRED). */
