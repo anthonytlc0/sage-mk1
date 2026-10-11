@@ -249,7 +249,10 @@ export class LooperCore {
       case 'latency':
         this.setLatency(cmd.roundTripFrames, cmd.outputLatencyFrames);
         return;
-      // Not yet: undo/redo, marks and ALL START/STOP (Task 8), speedMoment (Task 7).
+      case 'speedMoment':
+        this.tracks[cmd.track]?.speedMoment(cmd.speed);
+        return;
+      // Not yet: undo/redo, marks and ALL START/STOP (Task 8).
       // Engine-only, handled outside the core: fader (the mixer), exportTracks, recorder, calibrate.
       default:
         return;
