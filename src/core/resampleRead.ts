@@ -4,24 +4,33 @@
  *
  * 4-point cubic Hermite (Catmull-Rom): it passes through the samples (a whole position returns the stored sample
  * exactly) and reproduces straight lines. The take is read as a loop: positions outside `[0, length)` wrap, so the
- * taps around the seam read across it, which the loop-seam crossfade made continuous.
+ * taps around the seam read across it, which the loop-seam crossfade made continuous. A `bounded` read (a 1SHOT,
+ * which plays once and ends) does not wrap: taps outside the take read silence.
  *
  * No allocation: the four taps come straight from the take's chunk arrays.
  */
 import type { AudioTake } from './chunks';
 
-/** The take's sample at fractional `pos` (wrapped into the loop) into `outL[i]`, `outR[i]`. An empty take reads 0. */
+/**
+ * The take's sample at fractional `pos` into `outL[i]`, `outR[i]`: wrapped into the loop, or with `bounded` silence
+ * outside it. An empty take reads 0.
+ */
 export function readInterpolated(
   take: AudioTake,
   pos: number,
   outL: Float32Array,
   outR: Float32Array,
   i: number,
+  bounded = false,
 ): void {
   const len = take.length;
   if (len === 0) {
     outL[i] = 0;
     outR[i] = 0;
+    return;
+  }
+  if (bounded && (pos < 1 || pos >= len - 2)) {
+    readEdge(take, pos, outL, outR, i);
     return;
   }
   let p = pos;
@@ -70,6 +79,38 @@ export function readInterpolated(
     a2 = take.chunkL(c)[j - c * cf];
     b2 = take.chunkR(c)[j - c * cf];
   }
+  outL[i] = hermite(am1, a0, a1, a2, t);
+  outR[i] = hermite(bm1, b0, b1, b2, t);
+}
+
+/** A bounded read whose taps reach past an end of the take: those taps read silence. */
+function readEdge(take: AudioTake, pos: number, outL: Float32Array, outR: Float32Array, i: number): void {
+  const len = take.length;
+  const cf = take.chunkFrames;
+  const i0 = Math.floor(pos);
+  let am1 = 0, a0 = 0, a1 = 0, a2 = 0;
+  let bm1 = 0, b0 = 0, b1 = 0, b2 = 0;
+  for (let k = -1; k <= 2; k++) {
+    const j = i0 + k;
+    if (j < 0 || j >= len) continue;
+    const c = Math.floor(j / cf);
+    const l = take.chunkL(c)[j - c * cf];
+    const r = take.chunkR(c)[j - c * cf];
+    if (k === -1) {
+      am1 = l;
+      bm1 = r;
+    } else if (k === 0) {
+      a0 = l;
+      b0 = r;
+    } else if (k === 1) {
+      a1 = l;
+      b1 = r;
+    } else {
+      a2 = l;
+      b2 = r;
+    }
+  }
+  const t = pos - i0;
   outL[i] = hermite(am1, a0, a1, a2, t);
   outR[i] = hermite(bm1, b0, b1, b2, t);
 }

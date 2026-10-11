@@ -14,29 +14,20 @@
  * `1 / sqrt(1 + 2 rho gA gB)`, where rho (clamped to 0..1) is the heads' correlation measured since the last re-seed.
  * rho = 0 leaves it equal-power; rho = 1 makes it an equal-gain crossfade.
  *
- * The take is read as a loop (`readInterpolated` wraps), so heads near the seam read across it. Negative rates play in
- * reverse: S and both heads move backwards.
- *
- * The heads' positions and window gains for each frame of the last `render` (up to `CAPTURE` frames) are kept, so a
- * track can write an overdub through the same heads (track.ts).
+ * The take is read as a loop (`readInterpolated` wraps), so heads near the seam read across it, unless `bounded` is
+ * set (a 1SHOT): then a head past either end of the take reads silence, so the last grain of a sample that plays once
+ * carries no ghost of its start. Negative rates play in reverse: S and both heads move backwards.
  *
  * Nothing is allocated after construction.
  */
 import type { AudioTake } from './chunks';
 import { readInterpolated } from './resampleRead';
 
-/** Frames per render whose head positions and gains are kept (the track renders in steps of at most this). */
-export const CAPTURE = 256;
-
 export class XfadeStretcher {
   /** Grain length in frames (even). Each head is re-seeded once per grain, the two half a grain apart. */
   readonly grainFrames: number;
-  /** Head A's position (in take frames, not wrapped) for each frame of the last render. */
-  readonly headPosA = new Float64Array(CAPTURE);
-  readonly headPosB = new Float64Array(CAPTURE);
-  /** Head A's window gain for each frame of the last render. */
-  readonly headGainA = new Float32Array(CAPTURE);
-  readonly headGainB = new Float32Array(CAPTURE);
+  /** Heads past the take's ends read silence instead of wrapping (a 1SHOT). */
+  bounded = false;
 
   private readonly half: number;
   /** sin(pi * i / grain) for i in [0, grain). */
@@ -93,13 +84,13 @@ export class XfadeStretcher {
    * ratio; negative plays in reverse). The source position ends `rate * n` further on.
    */
   render(take: AudioTake, rate: number, n: number, outL: Float32Array, outR: Float32Array, offset: number): void {
-    this.run(take, rate, n, outL, outR, offset, true);
+    this.run(take, rate, n, outL, outR, offset);
   }
 
-  /** What `render` would produce, leaving the stretcher (and the kept head positions) exactly as they were. */
+  /** What `render` would produce, leaving the stretcher exactly as it was. */
   peek(take: AudioTake, rate: number, n: number, outL: Float32Array, outR: Float32Array, offset: number): void {
     const { src, headA, headB, phase, sab, saa, sbb } = this;
-    this.run(take, rate, n, outL, outR, offset, false);
+    this.run(take, rate, n, outL, outR, offset);
     this.src = src;
     this.headA = headA;
     this.headB = headB;
@@ -116,7 +107,6 @@ export class XfadeStretcher {
     outL: Float32Array,
     outR: Float32Array,
     offset: number,
-    capture: boolean,
   ): void {
     const { win, half, tapL, tapR } = this;
     const grain = this.grainFrames;
@@ -138,8 +128,8 @@ export class XfadeStretcher {
         headB = src + rate * k + lead;
         sab = saa = sbb = 0;
       }
-      readInterpolated(take, headA, tapL, tapR, 0);
-      readInterpolated(take, headB, tapL, tapR, 1);
+      readInterpolated(take, headA, tapL, tapR, 0, this.bounded);
+      readInterpolated(take, headB, tapL, tapR, 1, this.bounded);
       const gA = win[phase];
       const gB = win[phase >= half ? phase - half : phase + half];
       const aL = tapL[0];
@@ -160,12 +150,6 @@ export class XfadeStretcher {
       const wb = gB * norm;
       outL[offset + k] = wa * aL + wb * bL;
       outR[offset + k] = wa * aR + wb * bR;
-      if (capture && k < CAPTURE) {
-        this.headPosA[k] = headA;
-        this.headPosB[k] = headB;
-        this.headGainA[k] = gA;
-        this.headGainB[k] = gB;
-      }
       headA += dir;
       headB += dir;
       phase = phase + 1 === grain ? 0 : phase + 1;

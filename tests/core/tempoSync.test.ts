@@ -27,6 +27,31 @@ function crossings(x: Float32Array, from: number, n: number): number {
   return c;
 }
 
+/**
+ * The local pitch of `x[a, b)` in Hz: the sample rate over the median interval between positive-going zero crossings
+ * (so an occasional phase step at a splice join does not move it).
+ */
+function medianPitch(x: Float32Array, a: number, b: number, sr = SR48): number {
+  const gaps: number[] = [];
+  let last = -1;
+  for (let i = a + 1; i < b; i++) {
+    if (x[i - 1] < 0 && x[i] >= 0) {
+      const t = i - 1 + x[i - 1] / (x[i - 1] - x[i]); // interpolated crossing
+      if (last >= 0) gaps.push(t - last);
+      last = t;
+    }
+  }
+  gaps.sort((p, q) => p - q);
+  return sr / gaps[gaps.length >> 1];
+}
+
+/** RMS of `x[a, b)` in dB relative to a full-scale sine (RMS 1/sqrt 2). */
+function sineDb(x: Float32Array, a: number, b: number): number {
+  let s = 0;
+  for (let i = a; i < b; i++) s += x[i] * x[i];
+  return 20 * Math.log10(Math.sqrt(s / (b - a)) / Math.SQRT1_2);
+}
+
 /** `a - b` on the unit circle, in [-0.5, 0.5). */
 function phaseDiff(a: number, b: number): number {
   const d = a - b;
@@ -39,6 +64,41 @@ function runSilent(core: LooperCore, n: number, block = 128): void {
   const inR = new Float32Array(block);
   const out = makeOutput(block);
   for (let done = 0; done < n; done += block) core.process(inL, inR, inL, inR, out, Math.min(block, n - done));
+}
+
+/** sr 48000, tempo 133, rhythm on: one synced 4/4 measure recorded from frame 0 (86617 frames), playing. */
+function loop133(mode: 'PITCH' | 'XFADE'): LooperCore {
+  const core = makeCore({ tempo: 133, track: [{ loopSyncSw: true, tempoSyncMode: mode }] }, { sampleRate: SR48 });
+  rhythmOn(core);
+  at(core, 0, recPlay(), tone(440));
+  at(core, 86617, recPlay(), tone(440)); // one measure is 86616.54 frames: rounded to 86617
+  run(core, 300, tone(440)); // past the 5 ms seam tail, so the take is final
+  expect(trk(core).lengthFrames).toBe(86617);
+  expect(trk(core).measures).toBe(1);
+  return core;
+}
+
+/** How far a one-measure loop's playhead is from the measure grid, in frames. */
+function gridError(core: LooperCore): number {
+  const s = core.status();
+  return phaseDiff(s.tracks[0].position, s.measurePhase) * s.tracks[0].lengthFrames;
+}
+
+/** Track 1's output for the next `n` frames and the playhead (a whole frame) where they start. */
+function capture(core: LooperCore, n: number): { out: Float32Array; p0: number } {
+  const p0 = Math.round(trk(core).position * trk(core).lengthFrames);
+  return { out: run(core, n).tracks[0], p0 };
+}
+
+/**
+ * Check the next `n` frames of output are the take's samples one for one from the playhead, up to the seam (where a
+ * correction may move the next pass by a frame). Returns the frames compared.
+ */
+function expectExact(core: LooperCore, take: Float32Array, n: number): number {
+  const { out, p0 } = capture(core, n);
+  const upTo = Math.min(n, take.length - p0);
+  for (let i = 0; i < upTo; i++) if (out[i] !== take[p0 + i]) expect(`frame ${i}: ${out[i]}`).toBe(`${take[p0 + i]}`);
+  return upTo;
 }
 
 /** A core at sr 48000 holding a 2 s free loop of a 1 kHz sine recorded at tempo 120 (frames 0..96000), playing. */
@@ -238,6 +298,28 @@ describe('reading at a fractional rate', () => {
     expect(trk(core).state).toBe('stopped');
   });
 
+  // Fix round 1: a 1SHOT plays once. The stretcher's heads run up to |rate - 1| * G/2 past the play position, and the
+  // PITCH taps two frames; wrapping them would leak the sample's other end into its last grain.
+  it.each([
+    ['XFADE', 'NORMAL', 60, false, 2800, 3000],
+    ['XFADE', 'DOUBLE', 120, false, 1300, 1500],
+    ['PITCH', 'NORMAL', 60, false, 2800, 3000],
+    ['XFADE', 'NORMAL', 60, true, 2800, 2999], // backwards from position 999, so it ends a frame sooner
+  ] as const)('a 1SHOT in %s (%s, tempo %i, reverse %s) ends in silence, with no ghost of its other end', (mode, speed, tempo, reverse, from, to) => {
+    // Loud at the end the play finishes away from (the start, or the end in REVERSE), silent elsewhere. Forwards the
+    // input stays loud after the end press too, so the seam crossfade keeps the sample's first frames loud.
+    const loud = (f: number): number => ((reverse ? f >= 900 && f < 1000 : f < 100 || f >= 1000) ? 0.5 : 0);
+    const core = makeCore({ track: [{ tempoSyncMode: mode, oneShot: true, reverse, tempoSyncSpeed: speed }] });
+    at(core, 0, recPlay(), loud);
+    at(core, 1000, recPlay(), loud); // a 1000-frame sample; it plays once from here
+    configure(core, { tempo });
+    const out = run(core, to - 1 - 1000, loud).tracks[0]; // up to the frame before the sample's end
+    expect(trk(core).state).toBe('playing');
+    for (let f = from; f < to - 1; f++) expect(out[f - 1000]).toBe(0);
+    run(core, 2);
+    expect(trk(core).state).toBe('stopped');
+  });
+
   it.each(['PITCH', 'XFADE'] as const)('%s: an IMMEDIATE stop at half rate still ramps out over 5 ms', (mode) => {
     const core = makeCore({ track: [{ tempoSyncMode: mode }] });
     at(core, 0, recPlay(), dc(0.5));
@@ -383,14 +465,90 @@ describe('overdubbing at a rate other than 1 (INFERRED: splatted at the fraction
     at(core, 50400, recPlay(), dc(0));
     at(core, 50400 + 96000, recPlay(), tone1k);
     const out = run(core, 96000).tracks[0];
-    const hz = crossings(out, 24000, 24000) / 0.5;
-    expect(hz).toBeGreaterThanOrEqual(970);
-    expect(hz).toBeLessThanOrEqual(1030);
-    let s = 0;
-    for (let i = 24000; i < 48000; i++) s += out[i] * out[i];
-    const rms = Math.sqrt(s / 24000);
-    expect(rms).toBeGreaterThan(0.5);
-    expect(rms).toBeLessThan(0.85);
+    // (A crossing count would miscount: each splice join can step the phase. Splatting at the playhead gives 2 kHz.)
+    const hz = medianPitch(out, 12000, 84000);
+    expect(hz).toBeGreaterThanOrEqual(990);
+    expect(hz).toBeLessThanOrEqual(1010);
+  });
+
+  // Fix round 1: one input moment per take frame. Averaging the moments the two heads wrote was a comb filter (-29 dB
+  // at 440 Hz at 0.5x). The stored overdub must keep the input's level, and so must its replay through the stretcher.
+  // (The replay check is valid for these tones; on others the stretcher itself can lose up to 4.4 dB on a recorded
+  // take too, since its heads are not phase-aligned. That is deferred by ruling.)
+  it.each([
+    [440, 0.5],
+    [1033, 0.5],
+    [440, 0.75],
+    [1033, 0.75],
+  ])('XFADE overdub of %f Hz at %fx: stored and replayed within 1.5 dB of the input', (freq, rate) => {
+    const core = makeCore({ track: [{ tempoSyncMode: 'XFADE' }] }, { sampleRate: SR48 });
+    at(core, 0, recPlay(), dc(0));
+    at(core, 48000, recPlay(), dc(0)); // a silent 1 s loop at tempo 120
+    configure(core, { tempo: 120 * rate });
+    const pass = Math.round(48000 / rate);
+    at(core, 50000, recPlay(), dc(0));
+    at(core, 50000 + pass, recPlay(), tone(freq)); // one whole pass
+    const replay = run(core, pass).tracks[0];
+    const stored = core.getTrackAudio(0)!.L;
+    expect(Math.abs(sineDb(stored, 4800, 43200))).toBeLessThan(1.5);
+    expect(Math.abs(sineDb(replay, 4800, pass - 4800))).toBeLessThan(1.5);
+  });
+
+  it('XFADE REPLACE1 at half rate replaces the old audio with the overdub at its level', () => {
+    const core = makeCore({ track: [{ tempoSyncMode: 'XFADE', dubMode: 'REPLACE1' }] }, { sampleRate: SR48 });
+    at(core, 0, recPlay(), tone(660));
+    at(core, 48000, recPlay(), tone(660)); // a 660 Hz loop
+    const old = core.getTrackAudio(0)!.L;
+    configure(core, { tempo: 60 });
+    at(core, 50000, recPlay(), tone(660));
+    at(core, 50000 + 96000, recPlay(), tone(440)); // replace one whole pass with 440 Hz
+    run(core, 300, tone(440));
+    const stored = core.getTrackAudio(0)!.L;
+    expect(Math.abs(sineDb(stored, 4800, 43200))).toBeLessThan(1.5); // 440 alone (with 660 left over it would be +3 dB)
+    let dot = 0;
+    let norm = 0;
+    for (let i = 4800; i < 43200; i++) {
+      dot += stored[i] * old[i];
+      norm += old[i] * old[i];
+    }
+    expect(Math.abs(dot / norm)).toBeLessThan(0.05); // nothing of the old 660 Hz remains
+  });
+});
+
+describe('flushPendingWrites (for Task 8 snapshots)', () => {
+  it('lands the gathered writes of a pass at half rate, so a snapshot taken after it is complete', () => {
+    const core = makeCore({ track: [{ tempoSyncMode: 'PITCH' }] });
+    at(core, 0, recPlay(), dc(0));
+    at(core, 2000, recPlay(), dc(0)); // a silent 2000-frame loop
+    configure(core, { tempo: 60 }); // rate 0.5
+    at(core, 2500, recPlay(), dc(0)); // punch in at position 250
+    run(core, 3000, dc(0.5)); // to position 1750
+    const track = core.tracks[0];
+    expect(track.flushPendingWrites()).toBe(false); // the pass is still running
+    core.command(recPlay()); // punch out
+    run(core, 10, dc(0.5)); // the 5 ms tail is done; the last frames written are still gathered
+    const L = new Float32Array(1500);
+    const R = new Float32Array(1500);
+    const early = track.take.snapshot();
+    early.read(250 + XF, L, R, 0, 1490);
+    early.release();
+    expect(L.subarray(0, 1490).every((v) => v === 0.5)).toBe(false); // a snapshot now would miss the end of the pass
+    expect(track.flushPendingWrites()).toBe(true);
+    const snap = track.take.snapshot();
+    snap.read(250 + XF, L, R, 0, 1490);
+    snap.release();
+    for (let i = 0; i < 1490; i++) expect(L[i]).toBeCloseTo(0.5, 6);
+  });
+
+  it('is complete at once on the exact path once the tail has ended', () => {
+    const core = makeCore();
+    at(core, 0, recPlay(), dc(0));
+    at(core, 1000, recPlay(), dc(0));
+    at(core, 1200, recPlay(), dc(0.5));
+    at(core, 1500, recPlay(), dc(0.5));
+    expect(core.tracks[0].flushPendingWrites()).toBe(false); // the 5 ms punch-out tail is still writing
+    run(core, XF, dc(0.5));
+    expect(core.tracks[0].flushPendingWrites()).toBe(true);
   });
 });
 
@@ -469,31 +627,63 @@ describe('synced loops follow the grid', () => {
   });
 
   it(
-    'note b: 10 minutes at 48 kHz and 133 bpm (a measure is 86616.54 frames) drift less than one frame',
+    'note b / R45: 10 minutes at 48 kHz and 133 bpm stay within a frame of the grid, playing the take sample for sample',
     () => {
       for (const mode of ['PITCH', 'XFADE'] as const) {
-        const core = makeCore({ tempo: 133, track: [{ loopSyncSw: true, tempoSyncMode: mode }] }, { sampleRate: SR48 });
-        rhythmOn(core);
-        at(core, 0, recPlay(), tone(440));
-        at(core, 86617, recPlay(), tone(440)); // one measure, rounded to 86617 frames
-        expect(trk(core).lengthFrames).toBe(86617);
-        expect(trk(core).measures).toBe(1);
-        const err = (): number => {
-          const s = core.status();
-          return phaseDiff(s.tracks[0].position, s.measurePhase) * s.tracks[0].lengthFrames;
-        };
-        const e0 = err();
+        const core = loop133(mode);
+        const take = core.getTrackAudio(0)!.L;
+        const e0 = gridError(core);
         expect(Math.abs(e0)).toBeLessThan(1);
-        // At rate 1 the loop would gain 0.46 frames a measure: about 153 frames over these 332 measures.
-        for (let minute = 0; minute < 10; minute++) {
-          runSilent(core, 60 * SR48);
-          expect(Math.abs(err() - e0)).toBeLessThan(1);
+        // At rate 1 with no seam correction the loop would gain 0.46 frames a measure: ~153 frames over the run.
+        let checked = 0;
+        // The seam correction keeps the error centred: within 0.75 of a frame of where it started (0.5 rounding plus
+        // half the 0.46-frame drift of a pass); checked at points spread over the whole run.
+        for (let t = 0; t < 600; t += 7) {
+          runSilent(core, 7 * SR48);
+          expect(Math.abs(gridError(core) - e0)).toBeLessThan(0.8);
+          checked += expectExact(core, take, 4096);
+          expect(Math.abs(gridError(core) - e0)).toBeLessThan(0.8);
         }
-        expect(Math.abs(err() - e0)).toBeLessThan(0.01);
+        expect(checked).toBeGreaterThan(80 * 3000); // most of every window was compared
       }
     },
     120_000,
   );
+
+  it('R45: a tempo nudged away and back returns to sample-for-sample playback at the next seam', () => {
+    const core = loop133('XFADE');
+    const take = core.getTrackAudio(0)!.L;
+    runSilent(core, 10000);
+    configure(core, { tempo: 134 }); // a real change: the loop is stretched
+    runSilent(core, 30000);
+    configure(core, { tempo: 133 }); // back to the loop's own tempo, between frames
+    const before = capture(core, 2000);
+    let differs = 0;
+    for (let i = 0; i < 2000; i++) if (before.out[i] !== take[(before.p0 + i) % 86617]) differs++;
+    expect(differs).toBeGreaterThan(0); // still the stretched path until the seam
+    runSilent(core, 86617); // past the seam
+    expect(expectExact(core, take, 4096)).toBeGreaterThan(3000);
+  });
+
+  it('R45: an overdub on a 133 bpm loop lands sample-aligned at once (no added delay)', () => {
+    const core = loop133('XFADE');
+    const old = core.getTrackAudio(0)!.L;
+    runSilent(core, 20000);
+    const p0 = Math.round(trk(core).position * 86617);
+    const f0 = core.frame;
+    const input = (f: number): number => ((f * 7) % 1000) / 4000;
+    core.command(recPlay()); // overdub
+    run(core, 10000, input);
+    core.command(recPlay()); // punch out
+    run(core, 300, input); // past the 5 ms tail, and no more
+    const a = core.getTrackAudio(0)!.L;
+    const xf = 240; // the 5 ms punch-in ramp at 48 kHz
+    for (let k = xf; k < 10000; k++) {
+      if (a[p0 + k] !== Math.fround(old[p0 + k] + Math.fround(input(f0 + k)))) {
+        expect(`${k}: ${a[p0 + k]}`).toBe(`${k}: ${Math.fround(old[p0 + k] + Math.fround(input(f0 + k)))}`);
+      }
+    }
+  });
 });
 
 describe('note c: a tempo change while a recording waits for its line', () => {

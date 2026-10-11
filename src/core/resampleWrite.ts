@@ -17,6 +17,9 @@
  * `flush` maps them onto the loop. Gathering also keeps the core's rule that the playhead reads a frame before that
  * pass writes it: the caller flushes frames only once its read heads can no longer reach them.
  *
+ * TEMPO SYNC PITCH splats at the playhead. XFADE overdubs reach the writer through `SpliceWriter` (below), which
+ * time-compresses the input in pitch-keeping splices and deposits each splice frame on one take frame.
+ *
  * Nothing is allocated after construction. The ring holds `[base, hi)`: frames below `base` are written; frames at
  * `hi` and above have no contributions yet.
  */
@@ -141,5 +144,116 @@ export class SplatWriter {
   /** Drop everything pending without writing it. */
   discard(): void {
     this.base = this.hi;
+  }
+}
+
+/** Most splices a frame can belong to at once (1.25 x rate + 1 at 4x is 6). */
+const SPLICES = 8;
+
+/**
+ * The XFADE overdub: the input time-compressed (or stretched) by the rate in splices, keeping its pitch, so the
+ * stretcher plays it back at the pitch it was played.
+ *
+ * INFERRED (fix round 1). Every `hop` input frames a splice starts: `rate * hop` consecutive input frames copied one for
+ * one into consecutive take frames, centred where the playhead is at the splice's centre. At rate < 1 the input between
+ * splices is dropped; at rate > 1 it is used twice. Neighbouring splices overlap by an eighth of a splice with a linear
+ * (equal-gain) crossfade, so each take frame holds one moment of the input, or two in the short crossfade. (Writing
+ * every input frame through both stretcher heads instead averaged up to 2 / rate moments a few milliseconds apart on
+ * each frame: a comb filter, -29 dB at 440 Hz at 0.5x.)
+ *
+ * The hop is 2/7 of the stretcher's grain (17 ms at 60 ms grains). A hop that divides the grain (a quarter, 15 ms) makes
+ * the splice joins beat against the read heads on replay, so some tones always lose level; at 2/7 they do not line up.
+ *
+ * Splice positions are whole stream frames, so a splice is a straight copy. Deposits land up to `reach` frames from
+ * the playhead (behind or ahead). Nothing is allocated after construction.
+ */
+export class SpliceWriter {
+  /** Input frames between splice starts (even). */
+  readonly hop: number;
+  /** The farthest a deposit lands from the playhead, in frames, at rates up to 4x. */
+  readonly reach: number;
+  private n = 0;
+  private next = 0;
+  private started = false;
+  private count = 0;
+  /** Live splices: centre (input frame), take centre (stream frame), half-length and crossfade length. */
+  private readonly centre = new Float64Array(SPLICES);
+  private readonly at = new Float64Array(SPLICES);
+  private readonly half = new Float64Array(SPLICES);
+  private readonly ramp = new Float64Array(SPLICES);
+
+  /** `grainFrames`: the stretcher's grain. A splice starts every 2/7 of a grain (17 ms at 60 ms grains). */
+  constructor(grainFrames: number) {
+    this.hop = 2 * Math.max(1, Math.round(grainFrames / 7));
+    const maxRate = SPLAT_MAX_WIDTH;
+    // A splice spans 1.25 x rate x hop; its frames land (rate - 1) x that half-span from the moving playhead.
+    this.reach = Math.ceil((maxRate - 1) * (maxRate * this.hop * 0.625)) + 2;
+  }
+
+  /** Start afresh: the next input frame begins a new run of splices (the input is not continuous with the last). */
+  reset(): void {
+    this.n = 0;
+    this.started = false;
+    this.count = 0;
+  }
+
+  /**
+   * One input frame (`xL`, `xR`, keep-gain `alpha`, input gain `beta`) arriving while the playhead is at stream frame
+   * `q`, playing at `rate` (> 0). It lands in each splice that covers it, weighted by the splice's crossfade.
+   */
+  push(
+    writer: SplatWriter,
+    q: number,
+    rate: number,
+    xL: number,
+    xR: number,
+    alpha: number,
+    beta: number,
+  ): void {
+    const hop = this.hop;
+    const h = (rate * hop) / 2; // half a splice, in frames
+    const x = Math.max(2, h / 4); // crossfade length: an eighth of the splice (2 ms at 1x), at least 2 frames
+    const reachIn = h + x / 2;
+    const n = this.n;
+    if (!this.started) {
+      this.next = Math.floor((n - reachIn - hop / 2) / hop) + 1;
+      this.started = true;
+    }
+    // Open the splices whose windows have begun; each is placed where the playhead will be at its centre.
+    while (this.next * hop + hop / 2 - reachIn <= n) {
+      const c = this.next * hop + hop / 2;
+      if (this.count === SPLICES) this.drop(0);
+      const i = this.count++;
+      this.centre[i] = c;
+      this.at[i] = Math.round(q + rate * (c - n));
+      this.half[i] = h;
+      this.ramp[i] = x;
+      this.next++;
+    }
+    for (let i = 0; i < this.count; ) {
+      const d = n - this.centre[i];
+      const edge = this.half[i] + this.ramp[i] / 2;
+      if (d >= edge) {
+        this.drop(i); // this splice is over
+        continue;
+      }
+      const ad = d < 0 ? -d : d;
+      if (ad < edge) {
+        const w = (edge - ad) / this.ramp[i];
+        writer.deposit(this.at[i] + d, 1, w > 1 ? 1 : w, xL, xR, alpha, beta);
+      }
+      i++;
+    }
+    this.n = n + 1;
+  }
+
+  private drop(i: number): void {
+    const last = --this.count;
+    for (let k = i; k < last; k++) {
+      this.centre[k] = this.centre[k + 1];
+      this.at[k] = this.at[k + 1];
+      this.half[k] = this.half[k + 1];
+      this.ramp[k] = this.ramp[k + 1];
+    }
   }
 }
