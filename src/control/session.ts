@@ -20,6 +20,11 @@ export type SettingsScope = 'memory' | 'system';
  * is in effect, with the groups whose PREFERENCE is MEMORY taken from `memory.prefs`. `get` reads the settings in
  * effect, and `set` on a parameter of a MEMORY group writes `memory.prefs` (a memory change). Change the settings
  * through `set` (or by assigning `memory` / `system`), not by writing into the objects, or `effectiveSystem` goes stale.
+ *
+ * A memory stores whole top-level groups (`input`, `output`, `master`, `ctl`; ruling R51): once any PREFERENCE switch
+ * under a group is MEMORY, WRITE (or a first edit) copies that whole group into `memory.prefs`, including the parts
+ * whose own switch is SYSTEM, which stay unused until their switch is set to MEMORY too. That is the shape
+ * `reconcileMemory` validates a stored or imported memory against.
  */
 export class Session {
   /** The current memory slot, 1-99. */
@@ -111,11 +116,21 @@ export class Session {
   }
 
   /**
-   * Copies the PREFERENCE = MEMORY groups in effect into `memory.prefs` (what WRITE stores). The settings in effect
-   * do not change, so neither does `dirty`.
+   * Copies the PREFERENCE = MEMORY groups in effect into the live `memory.prefs` (WRITE, which then compares what it
+   * saved with the live memory). The settings in effect do not change, so neither does `dirty`.
    */
   snapshotPrefs(): void {
     if (snapshotPrefs(this._system, this.effectiveSystem, this._memory.prefs)) this.rev++;
+  }
+
+  /**
+   * A copy of the memory with the PREFERENCE = MEMORY groups in effect copied into its `prefs`: what the recovery
+   * checkpoint and EXPORT MEMORY save. The live memory is not touched (the checkpoint runs on a timer).
+   */
+  memoryForSave(): MemorySettings {
+    const copy = structuredClone(this._memory);
+    snapshotPrefs(this._system, this.effectiveSystem, copy.prefs);
+    return copy;
   }
 
   /** Makes `memory` the current memory of `slot`, unchanged and saved. */

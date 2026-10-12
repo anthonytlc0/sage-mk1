@@ -4,6 +4,7 @@ import { FakeEngine } from '../../src/control/fakeEngine';
 import { PREF_GROUPS, effectiveSystem, prefGroupOf } from '../../src/control/prefs';
 import { SYSTEM_PARAMS, concreteIds, defaultMemory, defaultSystem } from '../../src/schema/params';
 import type { MemorySettings, SystemSettings } from '../../src/schema/types';
+import { FileTooLarge } from '../../src/storage/memoryFile';
 import { FakeLcd, click, memStores, setup, take } from './helpers';
 
 beforeEach(() => {
@@ -168,6 +169,21 @@ describe('PREFERENCE=MEMORY in the controller', () => {
     expect(lcd.shows).toEqual([]);
   });
 
+  it('the checkpoint (a background timer) and EXPORT snapshot into the copy they save, never the live memory', async () => {
+    const { c, engine } = await booted((s) => {
+      s.output.preference.MFX = 'MEMORY';
+      s.master.comp = 7;
+    });
+    const live = c.session.memory;
+    engine.emit({ t: 'status', status: (await import('../../src/control/fakeEngine')).makeStatus({ audioDirty: true }) });
+    await vi.advanceTimersByTimeAsync(5000); // the debounced checkpoint runs
+    expect(c.session.memory).toBe(live);
+    expect(live.prefs).toEqual({});
+    const out = await c.exportCurrent();
+    expect(out.settings.prefs.master!.comp).toBe(7);
+    expect(live.prefs).toEqual({});
+  });
+
   it('a recovery checkpoint carries the MEMORY groups too', async () => {
     const { c, engine, stores } = await booted((s) => {
       s.output.preference.MFX = 'MEMORY';
@@ -292,6 +308,48 @@ describe('calibration, recovery, system replacement, factory reset and memory fi
     expect(c.session.system).toEqual(defaultSystem());
   });
 
+  it('a FACTORY RESET MEMORY that fails partway still reloads the current memory from what storage now holds', async () => {
+    const { c, engine, stores } = setup();
+    const mine = defaultMemory();
+    mine.name = 'MINE';
+    stores.memories.slots.set(1, { settings: mine, tracks: [take(1), null, null, null, null] });
+    await c.selectMemory(1);
+    expect(c.session.memory.name).toBe('MINE');
+    const clear = stores.memories.clear.bind(stores.memories);
+    stores.memories.clear = async (slot: number) => {
+      if (slot === 50) throw new Error('disk on fire');
+      await clear(slot);
+    };
+    engine.reset();
+    await expect(c.factoryReset('MEMORY+SYSTEM')).rejects.toThrow('disk on fire');
+    // slot 1 was cleared before the failure: the session must not still claim it holds MINE, saved
+    expect(stores.memories.slots.has(1)).toBe(false);
+    expect(c.session.memory.name).toBe('');
+    expect(c.session.dirty).toBe(false);
+    expect(engine.commands('loadTrack').map((l) => l.audio)).toEqual([null, null, null, null, null]);
+  });
+
+  it('a RESTORE ALL that fails partway still reloads the current memory from what storage now holds', async () => {
+    const { c, stores } = setup();
+    const before = defaultMemory();
+    before.name = 'BEFORE';
+    stores.memories.slots.set(1, { settings: before, tracks: [null, null, null, null, null] });
+    await c.selectMemory(1);
+    const restored = defaultMemory();
+    restored.name = 'RESTORED';
+    const memories = Array.from({ length: 99 }, () => null) as ({ settings: typeof restored; tracks: null[] } | null)[];
+    memories[0] = { settings: restored, tracks: [null, null, null, null, null] };
+    const save = stores.memories.save.bind(stores.memories);
+    stores.memories.save = async (slot, settings, tracks) => {
+      if (slot === 1) return save(slot, settings, tracks);
+      throw new Error('write failed');
+    };
+    memories[29] = { settings: defaultMemory(), tracks: [null, null, null, null, null] };
+    await expect(c.restoreAll({ system: defaultSystem(), memories })).rejects.toThrow('write failed');
+    expect(c.session.memory.name).toBe('RESTORED');
+    expect(c.session.dirty).toBe(false);
+  });
+
   it('importMemory refuses a slot with a phrase (NOT EMPTY), and the current memory while it holds unsaved work', async () => {
     const { c, stores } = setup();
     stores.memories.slots.set(5, { settings: defaultMemory(), tracks: [take(1), null, null, null, null] });
@@ -330,6 +388,25 @@ describe('calibration, recovery, system replacement, factory reset and memory fi
     expect(out.settings.track[1]!.pan).toBe(-3);
     expect(out.settings.prefs.master!.reverb).toBe(4);
     expect(out.tracks[1]!.L[0]).toBe(5);
+  });
+
+  it('backupAll stops loading and throws FileTooLarge as soon as the audio passes the cap', async () => {
+    const { c, stores } = setup();
+    // take() is 8 frames: 64 bytes per track
+    for (const slot of [3, 10, 20, 40]) stores.memories.slots.set(slot, { settings: defaultMemory(), tracks: [take(slot), take(slot), null, null, null] });
+    let caught: unknown;
+    try {
+      await c.backupAll(300); // 128 bytes per memory: the third (slot 20) passes 300
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(FileTooLarge);
+    expect((caught as FileTooLarge).bytes).toBe(384);
+    expect((caught as FileTooLarge).limit).toBe(300);
+    expect(stores.memories.loads).toBe(20); // slots 21-99 were never loaded
+    // at the cap it is fine
+    const ok = await c.backupAll(512);
+    expect(ok.memories.filter((m) => m !== null)).toHaveLength(4);
   });
 
   it('backupAll gathers the 99 stored memories and the system settings; restoreAll puts them back', async () => {

@@ -10,7 +10,9 @@
  *
  * FILES ARE UNTRUSTED. Everything read back is validated and nothing is trusted to be the size it says:
  *  - anything that is not a well formed file of this format and version <= 1 throws `UnsupportedFile` (the LCD shows
- *    UNSUPPORTED FILE); entries the format does not define (track0.wav, track6.wav, folders, notes) are ignored;
+ *    UNSUPPORTED FILE), an oversized memory.json / backup.json included; audio over this device's cap throws
+ *    `FileTooLarge` instead (FILE TOO LARGE: the file is fine, the device is too small for it); entries the format
+ *    does not define (track0.wav, track6.wav, folders, notes) are ignored;
  *  - settings go through `reconcileMemory` / `reconcileSystem`, so missing keys take their defaults and out-of-range or
  *    wrong-typed values are corrected exactly as if they had been set through the schema;
  *  - a track's `memory.json` entry must be null (the track is absent, whatever `trackN.wav` holds) or well formed (a
@@ -22,8 +24,9 @@
  *    inflated (a zip bomb); sizes are taken from the archive and bound the inflate buffer, they are not trusted past that;
  *  - the decoded audio of the whole file (frames x 2 channels x 4 bytes, counted at the larger of the file's and the
  *    target rate, so a resample that grows a track counts as grown) may not exceed the cap, to keep a bad file from
- *    taking the iPad's memory down. The cap is taken from the header's frame count and charged BEFORE `decodeWav`
- *    allocates. It is `defaultMaxDecodedBytes()`: 384 MiB on a touch device (the iPad budget), 1 GiB elsewhere.
+ *    taking the iPad's memory down (`FileTooLarge`; so is a zip whose declared WAV sizes are already over it). The cap
+ *    is taken from the header's frame count and charged BEFORE `decodeWav` allocates. It is `defaultMaxDecodedBytes()`:
+ *    384 MiB on a touch device (the iPad budget), 1 GiB elsewhere.
  *    `packMemory` / `packBackup` enforce the same cap (`FileTooLarge`), so the app never writes a file its own unpack
  *    would refuse. A restore holds every memory in RAM; restoring slot by slot would lift that limit.
  */
@@ -68,7 +71,10 @@ export function defaultMaxDecodedBytes(nav: { maxTouchPoints?: number } | undefi
   return isTouchDevice(nav) ? TOUCH_MAX_DECODED_BYTES : MAX_DECODED_BYTES;
 }
 
-/** The file is not a memory file / backup this build can read. The LCD shows UNSUPPORTED FILE; `reason` says why. */
+/**
+ * The file is not a memory file / backup this build can read (malformed, another format, a newer version, an oversized
+ * JSON entry). The LCD shows UNSUPPORTED FILE; `reason` says why. Audio over the cap is `FileTooLarge`, not this.
+ */
 export class UnsupportedFile extends Error {
   readonly reason: string;
   constructor(reason: string, options?: { cause?: unknown }) {
@@ -90,10 +96,13 @@ export interface BackupContents {
   memories: (MemoryContents | null)[];
 }
 
-/** The file is bigger than this device can hold, so `packMemory` / `packBackup` will not write it. */
+/**
+ * The audio is more than this device can hold (the cap of `defaultMaxDecodedBytes`): `packMemory` / `packBackup` will
+ * not write such a file and `unpackMemory` / `unpackBackup` will not read one. The LCD shows FILE TOO LARGE.
+ */
 export class FileTooLarge extends Error {
   constructor(
-    /** Decoded audio of the file: summed frames x 8 bytes. */
+    /** Decoded audio of the file (summed frames x 8 bytes), or the declared WAV entry sizes, as far as counted. */
     readonly bytes: number,
     /** The cap it exceeded. */
     readonly limit: number,
@@ -213,14 +222,14 @@ function unzipEntries(bytes: Uint8Array, kindOf: (name: string) => Kind | null, 
       if (size > MAX_JSON_BYTES) throw new UnsupportedFile(`${file.name} is too large`);
     } else {
       wavBytes += size;
-      if (wavBytes > maxWavBytes) throw new UnsupportedFile('the audio in the file is too large');
+      if (wavBytes > maxWavBytes) throw new FileTooLarge(wavBytes, maxWavBytes);
     }
     return true;
   };
   try {
     return unzipSync(bytes, { filter });
   } catch (e) {
-    throw e instanceof UnsupportedFile ? e : new UnsupportedFile('not a readable zip archive', { cause: e });
+    throw e instanceof UnsupportedFile || e instanceof FileTooLarge ? e : new UnsupportedFile('not a readable zip archive', { cause: e });
   }
 }
 
@@ -244,11 +253,13 @@ function checkHeader(doc: unknown, format: string, name: string): Record<string,
 }
 
 /** The decoded-audio allowance of one file; every track of every memory takes from the same one. */
+/** The decoded-audio allowance of one file: `take` throws `FileTooLarge` once the total passes the cap. */
 class Budget {
-  constructor(private left: number) {}
+  private used = 0;
+  constructor(private readonly limit: number) {}
   take(bytes: number): void {
-    if (bytes > this.left) throw new UnsupportedFile('the audio in the file is too large');
-    this.left -= bytes;
+    this.used += bytes;
+    if (this.used > this.limit) throw new FileTooLarge(this.used, this.limit);
   }
 }
 

@@ -12,6 +12,7 @@
 import { faderGain } from '../dsp/mixer';
 import { Framebuffer } from '../lcd/framebuffer';
 import { defaultMemory, defaultSystem } from '../schema/params';
+import type { FACTORY_RESET_TARGETS } from '../schema/params';
 import type { MemorySettings, SystemSettings } from '../schema/types';
 import { TRACKS } from '../shared/ids';
 import type { ButtonId, ControlEvent } from '../shared/ids';
@@ -19,6 +20,7 @@ import { STATUS_HZ } from '../shared/constants';
 import type { PanelState } from '../shared/panel';
 import type { EngineCommand, EngineEvent, EngineStatus, TrackAudio } from '../shared/protocol';
 import { QuotaError } from '../storage/db';
+import { FileTooLarge, defaultMaxDecodedBytes } from '../storage/memoryFile';
 import type { BackupContents, MemoryContents } from '../storage/memoryFile';
 import type { MemoryStore } from '../storage/memoryStore';
 import type { Recovery } from '../storage/recovery';
@@ -65,7 +67,7 @@ export interface ControllerOptions {
 }
 
 /** What FACTORY RESET returns to the factory state (Owner's Manual p. 24). */
-export type FactoryResetTarget = 'MEMORY' | 'SYSTEM' | 'MEMORY+SYSTEM';
+export type FactoryResetTarget = (typeof FACTORY_RESET_TARGETS)[number];
 
 /** The memory slots, 01-99. */
 const SLOTS = 99;
@@ -411,13 +413,17 @@ export class Controller {
 
   /**
    * FACTORY RESET (Owner's Manual p. 24): MEMORY clears memories 01-99 (and so the current memory, unsaved work
-   * included); SYSTEM restores `defaultSystem()`; MEMORY+SYSTEM does both.
+   * included); SYSTEM restores `defaultSystem()`; MEMORY+SYSTEM does both. When clearing fails partway the error is
+   * passed on, but the current memory is reloaded from what storage holds first, so the session never claims a
+   * cleared slot still holds its old, saved memory.
    */
   async factoryReset(target: FactoryResetTarget): Promise<void> {
     if (target !== 'SYSTEM') {
-      for (let slot = 1; slot <= SLOTS; slot++) await this.stores.memories.clear(slot);
-      ++this.loadSeq;
-      this.loadSession(this.session.slot, defaultMemory(), EMPTY_TRACKS(), true);
+      try {
+        for (let slot = 1; slot <= SLOTS; slot++) await this.stores.memories.clear(slot);
+      } finally {
+        await this.selectMemory(this.session.slot);
+      }
     }
     if (target !== 'MEMORY') await this.replaceSystem(defaultSystem());
   }
@@ -441,17 +447,28 @@ export class Controller {
 
   /** EXPORT MEMORY: the current memory as it is now (unsaved edits and PREFERENCE = MEMORY groups included) and its audio. */
   async exportCurrent(): Promise<MemoryContents> {
-    this.session.snapshotPrefs();
-    const settings = structuredClone(this.session.memory);
+    const settings = this.session.memoryForSave();
     const tracks = await this.requestTracks();
     return { settings, tracks };
   }
 
-  /** BACKUP ALL: the 99 stored memories (null for an empty slot) and the system settings. Every memory is loaded. */
-  async backupAll(): Promise<BackupContents> {
+  /**
+   * BACKUP ALL: the 99 stored memories (null for an empty slot) and the system settings. The memories are loaded one
+   * by one with a running total of their audio (frames x 8 bytes, as `packBackup` counts it): once it passes
+   * `maxDecodedBytes` this throws `FileTooLarge` at once, before the rest are loaded, and what was loaded is dropped.
+   */
+  async backupAll(maxDecodedBytes: number = defaultMaxDecodedBytes()): Promise<BackupContents> {
     const memories: (MemoryContents | null)[] = [];
+    let bytes = 0;
     for (let slot = 1; slot <= SLOTS; slot++) {
       const rec = await this.stores.memories.load(slot);
+      if (rec) {
+        for (const t of rec.tracks) if (t) bytes += t.L.length * 8;
+        if (bytes > maxDecodedBytes) {
+          memories.length = 0; // let the loaded audio go before the error travels up
+          throw new FileTooLarge(bytes, maxDecodedBytes);
+        }
+      }
       memories.push(rec ? { settings: rec.settings, tracks: rec.tracks } : null);
     }
     return { system: structuredClone(this.session.system), memories };
@@ -459,22 +476,26 @@ export class Controller {
 
   /**
    * RESTORE ALL: every slot becomes the backup's (an empty one is cleared), the system settings are replaced, and the
-   * current memory is loaded again. MEMORY FULL when storage refuses a write (the slots before it are restored).
+   * current memory is loaded again. MEMORY FULL when storage refuses a write (the slots before it are restored). Any
+   * other failure is passed on, after the current memory has been reloaded from what storage now holds.
    */
   async restoreAll(backup: BackupContents): Promise<'ok' | 'MEMORY FULL'> {
     let result: 'ok' | 'MEMORY FULL' = 'ok';
     try {
-      for (let slot = 1; slot <= SLOTS; slot++) {
-        const m = backup.memories[slot - 1];
-        if (m) await this.stores.memories.save(slot, m.settings, m.tracks);
-        else await this.stores.memories.clear(slot);
+      try {
+        for (let slot = 1; slot <= SLOTS; slot++) {
+          const m = backup.memories[slot - 1];
+          if (m) await this.stores.memories.save(slot, m.settings, m.tracks);
+          else await this.stores.memories.clear(slot);
+        }
+      } catch (e) {
+        if (!(e instanceof QuotaError)) throw e;
+        result = 'MEMORY FULL';
       }
-    } catch (e) {
-      if (!(e instanceof QuotaError)) throw e;
-      result = 'MEMORY FULL';
+      await this.replaceSystem(backup.system);
+    } finally {
+      await this.selectMemory(this.session.slot);
     }
-    await this.replaceSystem(backup.system);
-    await this.selectMemory(this.session.slot);
     return result;
   }
 
@@ -485,8 +506,7 @@ export class Controller {
     if (this.poweredOff || !this.session.dirty) return;
     const gen = this.checkpointGen;
     const slot = this.session.slot;
-    this.session.snapshotPrefs();
-    const settings = structuredClone(this.session.memory);
+    const settings = this.session.memoryForSave();
     try {
       const tracks = await this.requestTracks();
       if (gen !== this.checkpointGen) return; // saved or reloaded meanwhile: this work is no longer unsaved

@@ -492,7 +492,7 @@ describe('function lists (PANEL / CTL / EXP / KNOB FUNC / ASSIGN)', () => {
   });
 
   it('FACTORY RESET is an action, not a param', () => {
-    expect(FACTORY_RESET_TARGETS).toEqual(['MEMORY', 'SYSTEM', 'MEM+SYS']);
+    expect(FACTORY_RESET_TARGETS).toEqual(['MEMORY', 'SYSTEM', 'MEMORY+SYSTEM']); // Owner's Manual p. 24
     expect(ALL.some((p) => /factory/i.test(p.id))).toBe(false);
   });
 });

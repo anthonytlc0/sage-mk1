@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { strToU8, zipSync } from 'fflate';
 import { drawMessage } from '../../src/lcd/screens/message';
 import { menuTree, registerMenuScreens } from '../../src/lcd/screens/menuTree';
 import type { MenuNode } from '../../src/lcd/screens/menuTree';
@@ -6,13 +7,15 @@ import {
   MSG_PREPARING, MSG_READY, MSG_RESTORE_CONFIRM, storageScreen,
 } from '../../src/lcd/screens/storage';
 import type { StorageDeps } from '../../src/lcd/screens/storage';
-import { CALIBRATE_PROMPT, MSG_CALIB_FAILED, MSG_REMOVE_HEADPHONES, latencyScreen, showCalibratePrompt } from '../../src/lcd/screens/latency';
+import { CALIBRATE_PROMPT, MSG_CALIB_FAILED, MSG_MEASURING, MSG_REMOVE_HEADPHONES, latencyScreen, showCalibratePrompt } from '../../src/lcd/screens/latency';
 import { RECOVER_PROMPT, recoverScreen, showBootPrompts } from '../../src/lcd/screens/recover';
-import { SYSTEM_PARAMS, concreteIds, defaultMemory, defaultSystem } from '../../src/schema/params';
+import { FACTORY_RESET_TARGETS, SYSTEM_PARAMS, concreteIds, defaultMemory, defaultSystem } from '../../src/schema/params';
+import { drawTitleBar } from '../../src/lcd/screens/common';
+import { drawRows } from '../../src/lcd/screens/prompt';
 import type { SaveResult } from '../../src/storage/share';
 import { packBackup, packMemory } from '../../src/storage/memoryFile';
 import type { MemoryContents } from '../../src/storage/memoryFile';
-import { SYSTEM_SAVE_DEBOUNCE_MS } from '../../src/control/controller';
+import { CALIBRATE_TIMEOUT_MS, SYSTEM_SAVE_DEBOUNCE_MS } from '../../src/control/controller';
 import { Framebuffer } from '../../src/lcd/framebuffer';
 import { frame, push, rig, sameRegion, status, turn } from './rig';
 import type { Rig } from './rig';
@@ -121,6 +124,43 @@ describe('menuTree', () => {
     expect(titles(root.items[4])).toHaveLength(16);
   });
 
+  it('pages group related parameters: KNOB FUNC 1-4 share a page, and no page holds a lone parameter', () => {
+    const root = menuTree();
+    if (root.kind !== 'items') throw new Error('root');
+    const setup = root.items[7]!;
+    if (setup.kind !== 'pages') throw new Error('setup');
+    const knobPage = setup.pages.find((p) => p.cells.some((c) => c.id === 'setup.knobFunc.0'))!;
+    expect(knobPage.cells.map((c) => c.id)).toEqual(['setup.knobFunc.0', 'setup.knobFunc.1', 'setup.knobFunc.2', 'setup.knobFunc.3']);
+    const lone: string[] = [];
+    const walk = (n: MenuNode): void => {
+      if (n.kind === 'items') n.items.forEach((i) => i && walk(i));
+      else if (n.kind === 'pages') {
+        const total = n.pages.reduce((a, p) => a + p.cells.length, 0);
+        for (const p of n.pages) if (total > 1 && p.cells.length < 2) lone.push(`${n.title}: ${p.cells[0]!.id}`);
+      }
+    };
+    walk(root);
+    expect(lone).toEqual([]);
+    const usb = root.items[5]!;
+    expect(usb.kind === 'pages' && usb.pages.map((p) => p.cells.length)).toEqual([3, 2]);
+    const assign = root.items[4]!;
+    const a1 = assign.kind === 'items' ? assign.items[0]! : null;
+    expect(a1?.kind === 'pages' && a1.pages.map((p) => p.cells.length)).toEqual([4, 4]);
+  });
+
+  it('FACTORY RESET offers the one list of targets, MEMORY+SYSTEM as on Owner\'s Manual p. 24', async () => {
+    expect(FACTORY_RESET_TARGETS).toEqual(['MEMORY', 'SYSTEM', 'MEMORY+SYSTEM']);
+    const r = menuRig();
+    push(r, 'menu');
+    push(r, 'right');
+    push(r, 'right');
+    push(r, 'knob4');
+    const want = new Framebuffer();
+    drawTitleBar(want, 'FACTORY RESET');
+    drawRows(want, FACTORY_RESET_TARGETS, 0);
+    expect(sameRegion(frame(r.c), want, 0, 0, 128, 64)).toBe(true);
+  });
+
   it('SETUP ends with LATENCY and MIC PROCESS; USB starts with STORAGE', () => {
     const root = menuTree();
     if (root.kind !== 'items') throw new Error('root');
@@ -198,7 +238,7 @@ describe('the MENU screens', () => {
     push(r, 'menu');
     push(r, 'right');
     push(r, 'knob4');
-    for (let i = 0; i < 4; i++) push(r, 'right');
+    for (let i = 0; i < 8; i++) push(r, 'right'); // to the last page
     push(r, 'knob2');
     expect(r.c.session.system.setup.micProcess).toBe(true);
   });
@@ -223,7 +263,7 @@ describe('the MENU screens', () => {
     push(r, 'menu');
     push(r, 'right');
     push(r, 'knob4');
-    for (let i = 0; i < 4; i++) push(r, 'right');
+    for (let i = 0; i < 8; i++) push(r, 'right'); // to the last page
     push(r, 'knob1');
     expect(r.menu.top.title).toBe('LATENCY');
     push(r, 'exit');
@@ -456,6 +496,30 @@ describe('STORAGE: memory files', () => {
     expect(files.saves[0]!.name).toMatch(/^sage-mk1-backup-\d{4}-\d{2}-\d{2}\.sagemk1$/);
   });
 
+  it('BACKUP ALL over the size cap shows FILE TOO LARGE before every memory is loaded', async () => {
+    const files = fakeFiles({ maxDecodedBytes: () => 100 });
+    const r = openStorage(files);
+    r.stores.memories.slots.set(2, { settings: defaultMemory(), tracks: [take(0.5), take(0.5), null, null, null] });
+    r.stores.memories.slots.set(60, { settings: defaultMemory(), tracks: [take(0.5), null, null, null, null] });
+    push(r, 'knob3');
+    push(r, 'enter');
+    await flush();
+    expect(r.c.message).toBe('FILE TOO LARGE');
+    expect(r.stores.memories.loads).toBe(2);
+    expect(files.saves).toHaveLength(0);
+  });
+
+  it('an oversized memory.json is UNSUPPORTED FILE, not FILE TOO LARGE (errors are told apart by class)', async () => {
+    const files = fakeFiles();
+    const r = openStorage(files);
+    const huge = strToU8(JSON.stringify({ format: 'sage-mk1-memory', version: 1 }) + ' '.repeat(3_000_000));
+    files.setPicked(fileOf(zipSync({ 'memory.json': [huge, { level: 6 }] }), 'odd.sagemk1'));
+    push(r, 'knob2');
+    push(r, 'enter');
+    await flush();
+    expect(r.c.message).toBe('UNSUPPORTED FILE');
+  });
+
   it('RESTORE ALL: picker at once, a confirmation, then EXECUTING... and everything replaced', async () => {
     const files = fakeFiles();
     const r = openStorage(files);
@@ -539,16 +603,43 @@ describe('LATENCY calibration', () => {
     expect((r.menu.top as ReturnType<typeof latencyScreen>).lines[0]).toBe(MSG_REMOVE_HEADPHONES);
   });
 
-  it('EXIT while it runs leaves; the late result is ignored', async () => {
+  it('EXIT is ignored while it measures (MEASURING...), so the output is never left muted behind the menu', async () => {
+    const r = menuRig();
+    r.menu.push(latencyScreen());
+    const screen = r.menu.top as ReturnType<typeof latencyScreen>;
+    push(r, 'enter');
+    const cmd = r.engine.last('calibrate')!;
+    expect(screen.lines).toEqual([MSG_MEASURING]);
+    push(r, 'exit');
+    expect(r.menu.top).toBe(screen);
+    r.engine.emit({ t: 'calibration', reqId: cmd.reqId, capture: capture(1000), clickFrames: clicks });
+    await flush();
+    expect(r.c.session.system.setup.latency).toBe(1000);
+    push(r, 'exit');
+    expect(r.menu.depth).toBe(1);
+  });
+
+  it('a calibration that never answers gives CALIB FAILED and EXIT works again', async () => {
     const r = menuRig();
     r.menu.push(latencyScreen());
     push(r, 'enter');
-    const cmd = r.engine.last('calibrate')!;
+    await vi.advanceTimersByTimeAsync(CALIBRATE_TIMEOUT_MS + 1);
+    expect(r.c.message).toBe(MSG_CALIB_FAILED);
     push(r, 'exit');
     expect(r.menu.depth).toBe(1);
-    r.engine.emit({ t: 'calibration', reqId: cmd.reqId, capture: capture(1000), clickFrames: clicks });
-    await flush();
-    expect(r.c.session.system.setup.latency).toBe(-1);
+  });
+
+  it('is refused with STOP ALL while a track records, plays or overdubs, or the rhythm plays', () => {
+    for (const st of [{ tracks: [{ state: 'playing' as const }] }, { tracks: [{ state: 'recording' as const }] }, { tracks: [{ state: 'overdubbing' as const }] }, { rhythm: 'on' as const }]) {
+      const r = menuRig();
+      status(r, 'rhythm' in st ? { rhythm: st.rhythm } : {}, 'tracks' in st ? st.tracks : []);
+      r.menu.push(latencyScreen());
+      push(r, 'enter');
+      expect(r.c.message).toBe('STOP ALL');
+      expect(r.engine.commands('calibrate')).toHaveLength(0);
+      expect((r.menu.top as ReturnType<typeof latencyScreen>).lines[0]).toBe(MSG_REMOVE_HEADPHONES);
+      off();
+    }
   });
 });
 

@@ -90,12 +90,50 @@ describe('SageProcessor calibrate', () => {
     }));
     expect(run(p, 1024, 0.25).L[1023]).toBeCloseTo(0.25, 4);
     send(port, { t: 'calibrate', reqId: 1 });
-    const during = run(p, Math.round(0.4 * SR), 0.25); // before the first click: silence, though the mic is monitored
-    expect(maxAbs(during.L)).toBe(0);
-    expect(maxAbs(during.R)).toBe(0);
+    const during = run(p, Math.round(0.4 * SR), 0.25); // before the first click: silence (after the 5 ms fade), though the mic is monitored
+    const fade = Math.round(0.005 * SR);
+    expect(maxAbs(during.L, fade)).toBe(0);
+    expect(maxAbs(during.R, fade)).toBe(0);
     run(p, captureFrames, 0.25);
     expect(calibrationEvents(port)).toHaveLength(1);
     expect(run(p, 1024, 0.25).L[1023]).toBeCloseTo(0.25, 4);
+  });
+
+  it('fades the normal output out over 5 ms at the start and back in over 5 ms after the capture (no pops)', () => {
+    const { p, port } = makeProcessor();
+    send(port, freeSettings((_m, s) => {
+      s.output.routing.inputThru = true; // the mic is heard: 0.25 on the output
+    }));
+    run(p, 1024, 0.25);
+    send(port, { t: 'calibrate', reqId: 4 });
+    const fade = Math.round(0.005 * SR);
+    const out = run(p, captureFrames + fade + 2 * BLOCK, 0.25).L;
+    // out: from 0.25 down to silence in `fade` frames, a straight line
+    for (let k = 0; k < fade; k++) expect(out[k]).toBeCloseTo(0.25 * (1 - k / fade), 5);
+    expect(maxAbs(out, fade, calibrationClickFrames(SR)[0]!)).toBe(0);
+    // in: from silence back to 0.25 in `fade` frames after the last captured frame
+    expect(calibrationEvents(port)).toHaveLength(1);
+    for (let k = 0; k < fade; k++) expect(out[captureFrames + k]).toBeCloseTo(0.25 * ((k + 1) / fade), 5);
+    expect(out[captureFrames + fade]).toBeCloseTo(0.25, 5);
+    // no step anywhere larger than one ramp step (the clicks aside)
+    const clicks = calibrationClickFrames(SR);
+    const burst = Math.round(CLICK_S * SR);
+    for (let k = 1; k < out.length; k++) {
+      if (clicks.some((c) => k >= c && k <= c + burst)) continue;
+      expect(Math.abs(out[k]! - out[k - 1]!)).toBeLessThanOrEqual(0.25 / fade + 1e-6);
+    }
+  });
+
+  it('a calibrate during a calibration starts muted (no fade back up in between)', () => {
+    const { p, port } = makeProcessor();
+    send(port, freeSettings((_m, s) => {
+      s.output.routing.inputThru = true;
+    }));
+    send(port, { t: 'calibrate', reqId: 1 });
+    run(p, 4800, 0.25);
+    send(port, { t: 'calibrate', reqId: 2 });
+    const out = run(p, 4800, 0.25).L;
+    expect(maxAbs(out)).toBe(0);
   });
 
   it('without a mic the capture is silent, so no latency can be measured', () => {

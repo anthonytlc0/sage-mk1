@@ -86,8 +86,7 @@ export function backupFileName(now: Date): string {
 /** The LCD message for a failed file operation; `fallback` for anything not about the file itself. */
 function messageFor(e: unknown, fallback: string): string {
   if (e instanceof FileTooLarge) return 'FILE TOO LARGE';
-  // unpack refuses audio over the device's cap as an unsupported file; it is really a file too large for this device
-  if (e instanceof UnsupportedFile) return /too large/.test(e.reason) ? 'FILE TOO LARGE' : 'UNSUPPORTED FILE';
+  if (e instanceof UnsupportedFile) return 'UNSUPPORTED FILE';
   if (e instanceof QuotaError) return 'MEMORY FULL';
   return fallback;
 }
@@ -274,7 +273,7 @@ class StorageScreen implements Screen {
   /** BACKUP ALL, step 1: every stored memory and the system settings, packed, then READY: ENTER=SAVE. */
   private backupAll(ctx: Controller): void {
     const op = this.setState({ k: 'busy', text: MSG_PREPARING });
-    ctx.backupAll()
+    ctx.backupAll(this.deps.maxDecodedBytes())
       .then((b) => {
         if (!this.current(op)) return;
         const bytes = packBackup(b.memories, b.system, { maxDecodedBytes: this.deps.maxDecodedBytes() });

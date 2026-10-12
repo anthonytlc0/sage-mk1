@@ -19,7 +19,7 @@
  */
 
 import type { Controller, FactoryResetTarget } from '../../control/controller';
-import { findParam } from '../../schema/params';
+import { FACTORY_RESET_TARGETS, findParam } from '../../schema/params';
 import type { ParamDef } from '../../schema/types';
 import type { ControlEvent } from '../../shared/ids';
 import type { Framebuffer } from '../framebuffer';
@@ -59,10 +59,21 @@ const items = (title: string, list: readonly (MenuNode | null)[], label?: string
 
 const cell = (id: string, label?: string, extra: Omit<Cell, 'id' | 'label'> = {}): Cell => ({ id, ...(label ? { label } : {}), ...extra });
 
-/** Pages of up to four cells; every group starts on a page of its own. */
+/**
+ * Pages of up to four cells. Every group starts on a page of its own and is spread evenly over as few pages as it
+ * needs (5 cells give 3 + 2, never 4 + 1), so no parameter is left alone on a page.
+ */
 function pages(title: string, groups: readonly (readonly Cell[])[], label?: string): MenuNode {
   const out: PageSpec[] = [];
-  for (const group of groups) for (let i = 0; i < group.length; i += 4) out.push({ cells: group.slice(i, i + 4) });
+  for (const group of groups) {
+    const count = Math.ceil(group.length / 4);
+    let at = 0;
+    for (let p = 0; p < count; p++) {
+      const size = Math.ceil((group.length - at) / (count - p));
+      out.push({ cells: group.slice(at, at + size) });
+      at += size;
+    }
+  }
   return { kind: 'pages', title, pages: out, ...(label ? { label } : {}) };
 }
 
@@ -139,24 +150,23 @@ const ctlFunc = (): MenuNode => items('CTL FUNC', [
 
 const ASSIGN_KEYS = ['sw', 'source', 'sourceMode', 'sourceActLo', 'sourceActHi', 'target', 'targetMin', 'targetMax'];
 const assign = (): MenuNode => items('ASSIGN', Array.from({ length: 16 }, (_, n) =>
-  pages(`ASSIGN${n + 1}`, [ASSIGN_KEYS.slice(0, 5).map((k) => cell(`assign.${n}.${k}`)), ASSIGN_KEYS.slice(5).map((k) => cell(`assign.${n}.${k}`))])));
+  pages(`ASSIGN${n + 1}`, [ASSIGN_KEYS.map((k) => cell(`assign.${n}.${k}`))])));
 
 const usb = (): MenuNode => pages('USB', [[
   cell('usb.storage', undefined, { opens: 'storage' }), cell('usb.audioMode'), cell('usb.audioRouting'), cell('usb.inputLevel'), cell('usb.outputLevel'),
 ]]);
 
-const midi = (): MenuNode => pages('MIDI', [[
-  cell('midi.rxCh.ctl'), cell('midi.rxCh.rhythm'), cell('midi.rxCh.voice'), cell('midi.txCh'),
-  cell('midi.sync.clock'), cell('midi.sync.out'), cell('midi.sync.start'), cell('midi.pcOut'), cell('midi.thru'),
-]]);
+const midi = (): MenuNode => pages('MIDI', [
+  [cell('midi.rxCh.ctl'), cell('midi.rxCh.rhythm'), cell('midi.rxCh.voice'), cell('midi.txCh')],
+  [cell('midi.sync.clock'), cell('midi.sync.out'), cell('midi.sync.start')],
+  [cell('midi.pcOut'), cell('midi.thru')],
+]);
 
 const setup = (): MenuNode => pages('SETUP', [
-  [
-    cell('setup.contrast'), cell('setup.displayMode'), cell('setup.indicator'), cell('setup.fxKnobMode'),
-    cell('setup.autoOff'), cell('setup.memoryExt.min'), cell('setup.memoryExt.max'),
-    ...[0, 1, 2, 3].map((n) => cell(`setup.knobFunc.${n}`)),
-    ...['rec', 'play', 'dub', 'stop', 'blank'].map((k) => cell(`setup.loopStatusColor.${k}`)),
-  ],
+  [cell('setup.contrast'), cell('setup.displayMode'), cell('setup.indicator'), cell('setup.fxKnobMode')],
+  [cell('setup.autoOff'), cell('setup.memoryExt.min'), cell('setup.memoryExt.max')],
+  [0, 1, 2, 3].map((n) => cell(`setup.knobFunc.${n}`)),
+  ['rec', 'play', 'dub', 'stop', 'blank'].map((k) => cell(`setup.loopStatusColor.${k}`)),
   [cell('setup.latency', undefined, { opens: 'latency', display: formatLatency }), cell('setup.micProcess')],
 ]);
 
@@ -274,7 +284,7 @@ class PagesScreen implements Screen {
   }
 }
 
-const RESET_TARGETS: readonly FactoryResetTarget[] = ['MEMORY', 'SYSTEM', 'MEMORY+SYSTEM'];
+const RESET_TARGETS: readonly FactoryResetTarget[] = FACTORY_RESET_TARGETS;
 
 /**
  * FACTORY RESET (Owner's Manual p. 24): turn a knob (or push [1]-[3]) to choose MEMORY, SYSTEM or MEMORY+SYSTEM,

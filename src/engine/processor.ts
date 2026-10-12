@@ -185,10 +185,12 @@ export class SageProcessor {
     this.masterOut.process(outL, outR, n);
     this.masterPerf.process(b.perf[0], b.perf[1], n);
 
-    // 5b. A LATENCY calibration replaces what is heard with its clicks and records the raw mic.
-    if (this.calib !== null && this.calib.process(mic !== undefined && mic.length >= n ? mic : undefined, outL, outR, n)) {
-      this.post(this.calib.event(), [this.calib.capture.buffer]);
-      this.calib = null;
+    // 5b. A LATENCY calibration replaces what is heard with its clicks (with 5 ms fades) and records the raw mic.
+    if (this.calib !== null) {
+      if (this.calib.process(mic !== undefined && mic.length >= n ? mic : undefined, outL, outR, n)) {
+        this.post(this.calib.event(), [this.calib.capture.buffer]);
+      }
+      if (this.calib.finished) this.calib = null;
     }
 
     // 6. Out.
@@ -256,7 +258,8 @@ export class SageProcessor {
         this.gate = this.xf;
         return;
       case 'calibrate':
-        this.calib = new Calibrator(cmd.reqId, this.sr); // a second one restarts the measurement
+        // a second one restarts the measurement, already muted
+        this.calib = new Calibrator(cmd.reqId, this.sr, this.calib !== null);
         return;
       default:
         this.core.command(cmd, at);

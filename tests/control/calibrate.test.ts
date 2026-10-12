@@ -93,6 +93,73 @@ describe('computeLatency', () => {
     expect(computeLatency(early, CLICKS, SR)).toBe(23995);
   });
 
+  it('speech in several windows (headphones on: no click reaches the mic) gives null', () => {
+    // The reviewer's probe: background noise, then talking from 1.2 s to 3.9 s, syllables of random length and pitch.
+    for (const seed of [1, 2, 3, 4, 5, 6]) {
+      const r = rng(100 + seed);
+      const capture = noise(LENGTH, 0.001, seed);
+      let t = Math.round(1.2 * SR);
+      const end = Math.round(3.9 * SR);
+      while (t < end) {
+        const len = Math.round((0.08 + r() * 0.22) * SR);
+        const f0 = 110 + r() * 140;
+        const amp = 0.05 + r() * 0.25;
+        for (let k = 0; k < len && t + k < end; k++) {
+          const env = Math.sin((Math.PI * k) / len);
+          let v = 0;
+          for (let h = 1; h <= 5; h++) v += Math.sin((2 * Math.PI * f0 * h * k) / SR) / h;
+          capture[t + k]! += amp * env * v;
+        }
+        t += len + Math.round((0.03 + r() * 0.12) * SR);
+      }
+      expect(computeLatency(capture, CLICKS, SR), `seed ${seed}`).toBeNull();
+    }
+  });
+
+  it('a very reverberant room (RT60 1.5 s) gives the right delay or null, never a wrong value', () => {
+    for (const [delay, seed] of [[600, 1], [600, 2], [1500, 3], [300, 4]] as const) {
+      const r = rng(seed);
+      const capture = noise(LENGTH, 0.0005, seed + 50);
+      const rt60 = 1.5 * SR; // frames to fall 60 dB
+      for (const c of CLICKS) {
+        const at = c + delay;
+        addClick(capture, at, 0.3);
+        // the room's diffuse tail: noise decaying 60 dB over 1.5 s, running on into the following clicks' windows
+        for (let k = 1; at + k < LENGTH; k++) capture[at + k]! += 0.08 * (r() * 2 - 1) * Math.pow(10, (-3 * k) / rt60);
+      }
+      const got = computeLatency(capture, CLICKS, SR);
+      if (got !== null) expect(Math.abs(got - delay), `delay ${delay}`).toBeLessThanOrEqual(2);
+    }
+  });
+
+  it('detections scattered by more than 1 ms around their median do not count', () => {
+    const capture = new Float32Array(LENGTH);
+    const scattered = [1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700];
+    CLICKS.forEach((c, i) => {
+      capture[c + scattered[i]!] = 0.5;
+    });
+    expect(computeLatency(capture, CLICKS, SR)).toBeNull();
+    // five within +-48 frames (1 ms) of the median count; the three strays are left out of the result
+    const mixed = new Float32Array(LENGTH);
+    [1234, 1240, 1230, 1236, 1250, 9000, 30, 15000].forEach((d, i) => {
+      mixed[CLICKS[i]! + d] = 0.5;
+    });
+    expect(computeLatency(mixed, CLICKS, SR)).toBe(1236);
+  });
+
+  it('needs at least 10 ms of lead-in before the first click for the noise floor', () => {
+    const at = (first: number) => CLICKS.map((c, i) => first + i * SR * 0.5);
+    for (const first of [0, Math.round(0.009 * SR)]) {
+      const capture = new Float32Array(LENGTH);
+      for (const c of at(first)) addClick(capture, c + 480);
+      expect(computeLatency(capture, at(first), SR), `first click at ${first}`).toBeNull();
+    }
+    const ok = new Float32Array(LENGTH);
+    const first = Math.round(0.01 * SR);
+    for (const c of at(first)) addClick(ok, c + 480);
+    expect(computeLatency(ok, at(first), SR)).toBe(480);
+  });
+
   it('gives null for no clicks or a capture that ends before them', () => {
     expect(computeLatency(new Float32Array(LENGTH), [], SR)).toBeNull();
     expect(computeLatency(new Float32Array(100), CLICKS, SR)).toBeNull();
