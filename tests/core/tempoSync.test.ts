@@ -627,22 +627,21 @@ describe('synced loops follow the grid', () => {
   });
 
   it(
-    'note b / R45: 10 minutes at 48 kHz and 133 bpm stay within a frame of the grid, playing the take sample for sample',
+    'note b / R45: 10 minutes at 48 kHz and 133 bpm stay within 0.75 of a frame of the grid, playing the take sample for sample',
     () => {
       for (const mode of ['PITCH', 'XFADE'] as const) {
         const core = loop133(mode);
         const take = core.getTrackAudio(0)!.L;
-        const e0 = gridError(core);
-        expect(Math.abs(e0)).toBeLessThan(1);
+        expect(Math.abs(gridError(core))).toBeLessThan(0.76);
         // At rate 1 with no seam correction the loop would gain 0.46 frames a measure: ~153 frames over the run.
         let checked = 0;
-        // The seam correction keeps the error centred: within 0.75 of a frame of where it started (0.5 rounding plus
-        // half the 0.46-frame drift of a pass); checked at points spread over the whole run.
+        // The seam correction keeps the error centred on the grid: within 0.75 of a frame (0.5 rounding plus half the
+        // 0.46-frame drift of a pass), absolutely; checked at points spread over the whole run.
         for (let t = 0; t < 600; t += 7) {
           runSilent(core, 7 * SR48);
-          expect(Math.abs(gridError(core) - e0)).toBeLessThan(0.8);
+          expect(Math.abs(gridError(core))).toBeLessThan(0.76);
           checked += expectExact(core, take, 4096);
-          expect(Math.abs(gridError(core) - e0)).toBeLessThan(0.8);
+          expect(Math.abs(gridError(core))).toBeLessThan(0.76);
         }
         expect(checked).toBeGreaterThan(80 * 3000); // most of every window was compared
       }
