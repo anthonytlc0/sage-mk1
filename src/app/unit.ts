@@ -9,16 +9,22 @@
  *   the power-on prompts (RECOVER? when the last session crashed with unsaved work, CALIBRATE? on first run) -> the
  *   session marked running -> the recorder pod mounted. The LCD shows the boot screen ("Sage MK1", the version) from the
  *   tap until all that is done and for at least BOOT_MS, then whatever is on top of the menu.
+ *   Each wait on storage gives up after STORAGE_TIMEOUT_MS (STORAGE ERROR: an IndexedDB that never answers would leave
+ *   the unit booting with the mic open), and a POWER tap once the boot has run for ABORT_AFTER_MS abandons it. Either
+ *   way the engine is stopped and the unit is off again.
  * POWER off (a tap while on): the running take is completed (`recorder.stop()`) before anything is torn down, the
  *   system settings are saved and a clean shutdown is marked (`Controller.powerOff`, which also drops the recovery
- *   checkpoint, ruling R16), then the pod, controller and menu go and the engine stops.
- * Audio lost (the engine's `needsResume`): the running take is halted at once, and the shell shows TAP POWER TO
- *   RESUME; a tap on POWER then calls `resume({ retryMic: true })` instead of switching off.
+ *   checkpoint, ruling R16), then the pod, controller and menu go and the engine stops. The system settings as they
+ *   are then are kept for the next power-on in this page (MIC PROCESS for the mic, CONTRAST for the boot screen).
+ * Audio lost (the engine's `needsResume`, ruling R58): the running take is halted at once, and the shell shows TAP
+ *   POWER TO RESUME. A POWER tap retries (`resume({ retryMic: true })`); once a retry has failed the prompt says the
+ *   next POWER tap switches off, and it does (the normal POWER off). Taps on the prompt itself always retry.
  * Page hide: only after a POWER off is it a clean shutdown (`markCleanShutdown`). While on, the running flag stays set,
  *   so a crash or a closed app offers RECOVER next time; the controller checkpoints unsaved work on `pagehide` itself,
  *   and the unit has it do the same when the page goes hidden (iPadOS may end a hidden app without a pagehide).
  * Wake lock: asked for at power-on (inside the tap), again when the page is visible again and on panel presses while
  *   none is held, and let go at power off.
+ * Recorder pod: REC and LOOP MIX are enabled only while the unit is on with its audio running.
  */
 
 import { Controller } from '../control/controller';
@@ -42,6 +48,18 @@ import type { VisibilitySource, WakeLockApi } from './wakeLock';
 
 export type PowerState = 'off' | 'booting' | 'on' | 'stopping';
 
+/**
+ * What the TAP POWER TO RESUME prompt shows: nothing; a resume is wanted; one is under way; one failed, so the next
+ * POWER tap switches off.
+ */
+export type ResumePrompt = 'none' | 'resume' | 'resuming' | 'off';
+
+/** Each wait on storage during power-on gives up after this long. */
+// INFERRED: IndexedDB answers in milliseconds; a wait this long means it is blocked or broken.
+export const STORAGE_TIMEOUT_MS = 8000;
+/** A POWER tap abandons a power-on that has been running this long (earlier taps are taken as impatience). */
+export const ABORT_AFTER_MS = 3000;
+
 /** The engine as the shell drives it: EngineHost in the app, a fake in tests. */
 export interface ShellEngine extends EngineLike {
   readonly ctx: { readonly sampleRate: number };
@@ -64,6 +82,8 @@ export interface ShellStores extends Stores {
 /** The recorder pod as the unit holds it (`mountRecorderPod`'s handle). */
 export interface PodHandle {
   toggleRecord(): Promise<void>;
+  /** Whether REC and LOOP MIX may start (the unit is on and its audio runs). */
+  setEnabled(on: boolean): void;
   dispose(): void;
 }
 
@@ -87,6 +107,10 @@ export interface UnitDeps {
   wakeLock?: WakeLockApi;
   /** The least time the boot screen shows (default BOOT_MS). */
   bootMs?: number;
+  /** Default STORAGE_TIMEOUT_MS. */
+  storageTimeoutMs?: number;
+  /** Default ABORT_AFTER_MS. */
+  abortAfterMs?: number;
 }
 
 /** The MIXER input that is the app's mic: muting it there mutes the engine's one mic (ruling R34). */
@@ -109,6 +133,28 @@ interface Live {
   offResume: () => void;
 }
 
+/** A power-on under way. */
+interface Boot {
+  readonly startedAt: number;
+  /** Rejects with BootAborted when a POWER tap abandons the boot. */
+  readonly aborted: Promise<never>;
+  abort(): void;
+}
+
+class BootAborted extends Error {
+  constructor() {
+    super('power-on abandoned by a POWER tap');
+    this.name = 'BootAborted';
+  }
+}
+
+class StorageTimeout extends Error {
+  constructor(ms: number) {
+    super(`storage did not answer within ${ms} ms`);
+    this.name = 'StorageTimeout';
+  }
+}
+
 const offRing = (): RingState => ({ color: 'off', blink: 'none', mode: 'status', amount: 0 });
 /** A panel with every LED dark and the given LCD. */
 const darkPanel = (lcd: Uint8Array): PanelState => ({
@@ -125,7 +171,13 @@ export class SageUnit {
   private _state: PowerState = 'off';
   private _error: string | null = null;
   private live: Live | null = null;
-  /** The stored system settings, read ahead of the tap so the engine opens the mic with the right MIC PROCESS. */
+  private boot: Boot | null = null;
+  /** Where a resume asked for by TAP POWER TO RESUME stands. */
+  private resume: 'idle' | 'resuming' | 'failed' = 'idle';
+  /**
+   * The system settings for the next power-on: read from storage ahead of the first tap, then kept from the last
+   * session, so the engine opens the mic with the right MIC PROCESS and the boot screen has the right CONTRAST.
+   */
   private system: SystemSettings | undefined;
   /** The last power-off came from the POWER control (and the unit has not been switched on since). */
   private switchedOff = false;
@@ -134,12 +186,16 @@ export class SageUnit {
   private readonly listeners = new Set<() => void>();
   private readonly wake: WakeLockKeeper;
   private readonly bootMs: number;
+  private readonly storageTimeoutMs: number;
+  private readonly abortAfterMs: number;
   private readonly offState = darkPanel(new Uint8Array(LCD_W * LCD_H));
   private readonly bootState: PanelState;
   private disposed = false;
 
   constructor(private readonly deps: UnitDeps) {
     this.bootMs = deps.bootMs ?? BOOT_MS;
+    this.storageTimeoutMs = deps.storageTimeoutMs ?? STORAGE_TIMEOUT_MS;
+    this.abortAfterMs = deps.abortAfterMs ?? ABORT_AFTER_MS;
     const fb = new Framebuffer();
     drawBootScreen(fb);
     this.bootState = darkPanel(fb.data);
@@ -148,7 +204,7 @@ export class SageUnit {
       .then((s) => s.system.load())
       .then(
         (sys) => {
-          this.system = sys;
+          this.system ??= sys;
         },
         (e: unknown) => console.error('reading the system settings failed', e),
       );
@@ -168,6 +224,12 @@ export class SageUnit {
   /** Audio was lost while on: the shell shows TAP POWER TO RESUME. */
   get needsResume(): boolean {
     return this._state === 'on' && this.live !== null && this.live.engine.needsResume;
+  }
+
+  /** What the TAP POWER TO RESUME prompt shows. */
+  get resumePrompt(): ResumePrompt {
+    if (!this.needsResume) return 'none';
+    return this.resume === 'idle' ? 'resume' : this.resume === 'resuming' ? 'resuming' : 'off';
   }
 
   get controller(): Controller | null {
@@ -196,7 +258,7 @@ export class SageUnit {
     return this.transition;
   }
 
-  /** Tells `fn` whenever the state, the error or `needsResume` changes. Returns the unsubscribe. */
+  /** Tells `fn` whenever the state, the error or the resume prompt changes. Returns the unsubscribe. */
   onChange(fn: () => void): () => void {
     this.listeners.add(fn);
     return () => {
@@ -204,21 +266,49 @@ export class SageUnit {
     };
   }
 
-  /** The POWER control. Off: power on. On: resume when audio is lost, else power off. Ignored while booting or stopping. */
+  /**
+   * The POWER control. Off: power on. On: switch off, or, while audio is lost, retry the resume (and switch off once a
+   * retry has failed). Booting: abandon a boot that has run for ABORT_AFTER_MS. Ignored while stopping.
+   */
   tap(): void {
     if (this.disposed) return;
     if (this._state === 'off') {
       this.powerOn();
       return;
     }
+    if (this._state === 'booting') {
+      const boot = this.boot;
+      if (boot && performance.now() - boot.startedAt >= this.abortAfterMs) boot.abort();
+      return;
+    }
     const live = this.live;
     if (this._state !== 'on' || live === null) return;
     if (live.engine.needsResume) {
-      this.wake.ensure();
-      live.engine.resume({ retryMic: true }).catch((e: unknown) => console.error('resuming audio failed', e));
+      if (this.resume === 'failed') this.transition = this.powerOff(live);
+      else this.retryResume();
       return;
     }
     this.transition = this.powerOff(live);
+  }
+
+  /** A tap on the TAP POWER TO RESUME prompt: always a retry (`resume({ retryMic: true })`), never an off. */
+  retryResume(): void {
+    const live = this.live;
+    if (this._state !== 'on' || live === null || !live.engine.needsResume || this.resume === 'resuming') return;
+    this.resume = 'resuming';
+    this.emit();
+    this.wake.ensure();
+    live.engine
+      .resume({ retryMic: true })
+      .catch((e: unknown) => {
+        console.error('resuming audio failed', e);
+        return false;
+      })
+      .then((ok) => {
+        if (this.live !== live) return;
+        this.resume = ok || !live.engine.needsResume ? 'idle' : 'failed';
+        this.emit();
+      });
   }
 
   /** Panel input: to the controller while on, nowhere otherwise. */
@@ -246,6 +336,7 @@ export class SageUnit {
     this.disposed = true;
     this.deps.win?.removeEventListener('pagehide', this.onPageHide);
     this.deps.doc?.removeEventListener('visibilitychange', this.onVisibility);
+    this.boot?.abort();
     this.wake.dispose();
     const live = this.live;
     this.live = null;
@@ -262,9 +353,16 @@ export class SageUnit {
   private powerOn(): void {
     this._error = null;
     this.switchedOff = false;
+    this.resume = 'idle';
     this.bootState.contrast = this.system?.setup.contrast ?? 5;
+    let abort!: () => void;
+    const aborted = new Promise<never>((_, reject) => {
+      abort = () => reject(new BootAborted());
+    });
+    aborted.catch(() => undefined); // nobody may be waiting on it when it fires
+    const boot: Boot = { startedAt: performance.now(), aborted, abort };
+    this.boot = boot;
     this.setState('booting');
-    const t0 = performance.now();
     let starting: Promise<ShellEngine>;
     try {
       starting = this.deps.startEngine(this.system);
@@ -272,25 +370,52 @@ export class SageUnit {
       starting = Promise.reject(e);
     }
     this.wake.acquire(); // inside the tap too: Safari may want its activation
-    this.transition = this.boot(starting, t0);
+    this.transition = this.runBoot(boot, starting);
   }
 
-  private async boot(starting: Promise<ShellEngine>, t0: number): Promise<void> {
+  /** Waits for a storage step of the boot: its result, or a StorageTimeout, or BootAborted. */
+  private storage<T>(boot: Boot, step: Promise<T>): Promise<T> {
+    const ms = this.storageTimeoutMs;
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new StorageTimeout(ms)), ms);
+      step.then(
+        (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        (e: unknown) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      );
+      boot.aborted.catch((e: unknown) => {
+        clearTimeout(timer);
+        reject(e);
+      });
+    });
+  }
+
+  private async runBoot(boot: Boot, starting: Promise<ShellEngine>): Promise<void> {
     let engine: ShellEngine;
     try {
-      engine = await starting;
+      engine = await Promise.race([starting, boot.aborted]);
     } catch (e) {
+      if (e instanceof BootAborted) {
+        // The engine may still come (the mic prompt is open): stop it when it does.
+        starting.then((late) => late.stop()).catch(() => undefined);
+        this.endBoot(boot, null);
+        return;
+      }
       console.error('the audio engine did not start', e);
-      this.fail('AUDIO ERROR');
+      this.endBoot(boot, 'AUDIO ERROR');
       return;
     }
+
     let stores: ShellStores;
     try {
-      stores = await this.deps.stores;
+      stores = await this.storage(boot, this.deps.stores);
     } catch (e) {
-      console.error('storage did not open', e);
-      await engine.stop().catch(() => undefined);
-      this.fail('STORAGE ERROR');
+      await this.abandon(boot, null, engine, e);
       return;
     }
     if (this.disposed) {
@@ -318,25 +443,63 @@ export class SageUnit {
 
     let bootMessage: string | null = null;
     try {
-      await controller.boot(1);
+      await this.storage(boot, controller.boot(1));
     } catch (e) {
+      if (e instanceof BootAborted || e instanceof StorageTimeout) {
+        await this.abandon(boot, live, engine, e);
+        return;
+      }
       console.error('loading the settings or memory 01 failed', e);
       bootMessage = 'DATA READ ERR';
     }
     if (this.live !== live) return;
     menu.showStartScreen();
-    await showBootPrompts(menu, controller, stores.recovery); // reads the running flag before it is set below
+    try {
+      await this.storage(boot, showBootPrompts(menu, controller, stores.recovery)); // reads the running flag first
+    } catch (e) {
+      await this.abandon(boot, live, engine, e);
+      return;
+    }
     if (this.live !== live) return;
     stores.recovery.markRunning().catch((e: unknown) => console.error('marking the session running failed', e));
     live.pod = this.deps.mountPod?.(recorder, controller) ?? null;
+    this.syncPod();
 
-    const left = t0 + this.bootMs - performance.now();
-    if (left > 0) await sleep(left);
+    const left = boot.startedAt + this.bootMs - performance.now();
+    try {
+      if (left > 0) await Promise.race([sleep(left), boot.aborted]);
+    } catch (e) {
+      await this.abandon(boot, live, engine, e);
+      return;
+    }
     if (this.live !== live) return;
+    this.boot = null;
     this.setState('on');
     // A message raised while the boot screen was up has mostly expired under it: NO INPUT is shown again, in full.
     if (bootMessage !== null) controller.showMessage(bootMessage);
     else if (!engine.micAvailable) controller.showMessage('NO INPUT');
+  }
+
+  /** Gives up a power-on: everything made so far goes and the engine stops. STORAGE ERROR unless a tap asked for it. */
+  private async abandon(boot: Boot, live: Live | null, engine: ShellEngine, reason: unknown): Promise<void> {
+    const byTap = reason instanceof BootAborted;
+    if (!byTap) console.error('power-on gave up: storage did not answer', reason);
+    if (live) {
+      if (this.live === live) this.live = null;
+      this.teardown(live);
+    }
+    await engine.stop().catch(() => undefined);
+    this.endBoot(boot, byTap ? null : 'STORAGE ERROR');
+  }
+
+  /** The boot is over without the unit coming on: off, with `error` (or none). */
+  private endBoot(boot: Boot, error: string | null): void {
+    if (this.boot !== boot) return;
+    this.boot = null;
+    this.wake.release();
+    this.live = null;
+    this._error = error;
+    this.setState('off');
   }
 
   private async powerOff(live: Live): Promise<void> {
@@ -349,9 +512,11 @@ export class SageUnit {
       await live.recorder.stop().catch((e: unknown) => console.error('ending the take at power off failed', e));
     }
     await saved;
+    this.system = structuredClone(live.controller.session.system); // for the next power-on in this page
     this.teardown(live);
     await live.engine.stop().catch((e: unknown) => console.error('stopping the engine failed', e));
     if (this.live === live) this.live = null;
+    this.resume = 'idle';
     this.setState('off');
   }
 
@@ -363,18 +528,18 @@ export class SageUnit {
     live.menu.dispose();
   }
 
-  private fail(error: string): void {
-    this.wake.release();
-    this.live = null;
-    this._error = error;
-    this.setState('off');
-  }
-
   private onNeedsResume(live: Live, lost: boolean): void {
     if (this.live !== live) return;
     // The audio thread is gone: a stop() would wait for statuses that will not come. End the take with what it has.
     if (lost) live.recorder.halt().catch((e: unknown) => console.error('halting the take failed', e));
+    else this.resume = 'idle';
     this.emit();
+  }
+
+  /** REC and LOOP MIX only while the unit is on with its audio running. */
+  private syncPod(): void {
+    const live = this.live;
+    live?.pod?.setEnabled(this._state === 'on' && !live.engine.needsResume);
   }
 
   private readonly onPageHide = (): void => {
@@ -395,6 +560,7 @@ export class SageUnit {
   }
 
   private emit(): void {
+    this.syncPod();
     for (const fn of [...this.listeners]) {
       try {
         fn();

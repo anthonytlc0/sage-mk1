@@ -1,7 +1,7 @@
 /**
- * Reading text off the LCD: the 128x64 framebuffer (1 = dark pixel) is searched for `s` drawn in `font` with the app's own
- * glyphs, every pixel of the text's cell compared (ink and the clear pixels between). Pure: Playwright specs pass the
- * framebuffer they read from the page, unit tests a Framebuffer's data.
+ * Reading text off the LCD, shared by unit tests and the Playwright specs: the 128x64 framebuffer (1 = dark pixel) is
+ * searched for `s` drawn in `font` with the app's own glyphs, every pixel of the text's cell compared (ink and the clear
+ * pixels between). Pure: specs pass the framebuffer they read from the page, unit tests a Framebuffer's data.
  */
 import { text, textWidth } from '../../src/lcd/draw';
 import type { Font } from '../../src/lcd/fonts';

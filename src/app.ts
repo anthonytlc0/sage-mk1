@@ -79,11 +79,16 @@ export async function bootApp(root: HTMLElement): Promise<void> {
     wakeLock: (win.navigator as Navigator & { wakeLock?: WakeLockApi }).wakeLock,
   });
 
-  const power = mountPowerSwitch(shelf, root, () => unit.tap());
+  const power = mountPowerSwitch(
+    shelf,
+    root,
+    () => unit.tap(),
+    () => unit.retryResume(),
+  );
   const sync = (): void => {
     tabletop.dataset.power = unit.state;
     power.setState(unit.state);
-    power.setResume(unit.needsResume);
+    power.setResume(unit.resumePrompt);
     power.setNote(unit.error);
   };
   unit.onChange(sync);

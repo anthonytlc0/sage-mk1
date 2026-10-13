@@ -4,7 +4,7 @@ import { FONT_SMALL } from '../../src/lcd/fonts';
 import { Framebuffer } from '../../src/lcd/framebuffer';
 import { APP_VERSION, BOOT_MS, drawBootScreen } from '../../src/lcd/screens/boot';
 import { LCD_H, LCD_W } from '../../src/shared/constants';
-import { findText } from '../e2e/lcd';
+import { findText } from './text';
 
 describe('the LCD boot screen', () => {
   it('APP_VERSION is the package version', () => {

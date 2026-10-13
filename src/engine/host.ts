@@ -19,9 +19,9 @@
  *    track ended or was muted. A context that comes back to `running` by itself (after Siri or a call) gets an ended
  *    mic reopened too.
  *  - When audio cannot be brought back the LCD gets NO INPUT and `needsResume` turns true (`onNeedsResume` tells).
- *    For Task 23: show TAP POWER TO RESUME while `needsResume` is true, and from the tap call
- *    `resume({ retryMic: true })`. It turns false again by itself when the context does run after all (a resume that
- *    took longer than RESUME_TIMEOUT_MS) and the mic is back. No mic at power-on (a desktop without one) is NO INPUT
+ *    The app shell (SageUnit, app/unit.ts) then shows TAP POWER TO RESUME, and a tap calls `resume({ retryMic: true })`
+ *    (after a failed retry the next POWER tap switches off, ruling R58). It turns false again by itself when the
+ *    context does run after all (a resume that took longer than RESUME_TIMEOUT_MS) and the mic is back. No mic at power-on (a desktop without one) is NO INPUT
  *    only: the looper works without input, so it does not set `needsResume`.
  *
  * The browser pieces are injectable (`EngineHostOptions`) so the host runs in Node against fakes.

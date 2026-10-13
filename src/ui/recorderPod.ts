@@ -45,6 +45,11 @@ export interface RecorderPodOptions {
 export interface RecorderPod {
   /** REC pressed: starts a take, or ends the running one. Resolves when that has happened. */
   toggleRecord(): Promise<void>;
+  /**
+   * Whether REC and LOOP MIX may start (the app shell: only while the unit is on with its audio running). Disabled,
+   * they are dimmed and start nothing, though a running take can still be ended. Enabled by default.
+   */
+  setEnabled(on: boolean): void;
   /** Removes the pod and releases everything it holds. */
   dispose(): void;
 }
@@ -161,6 +166,8 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
   let noteTimer: ReturnType<typeof setTimeout> | undefined;
   let tickTimer: ReturnType<typeof setInterval> | undefined;
   let disposed = false;
+  /** REC and LOOP MIX may start (`setEnabled`). */
+  let enabled = true;
 
   // ------------------------------------------------------------------------------------------------------- message line
   function setNote(text: string, ms = NOTE_MS): void {
@@ -177,6 +184,7 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
     recBtn.classList.toggle('is-on', on);
     recBtn.setAttribute('aria-pressed', String(on));
     clock.classList.toggle('is-on', on);
+    syncDisabled();
     if (recorder.state === 'idle') clock.textContent = formatClock(0);
     if ((recorder.state === 'recording' || recorder.state === 'stopping') && tickTimer === undefined) {
       tickTimer = setInterval(tick, TICK_MS);
@@ -194,6 +202,7 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
     try {
       const s = recorder.state;
       if (s === 'idle') {
+        if (!enabled) return; // the unit is off or has lost its audio: a take would be empty
         recBtn.classList.add('is-on'); // lit at once; the take itself exists a moment later
         await recorder.start();
       } else if (s === 'recording' || s === 'starting') {
@@ -446,6 +455,7 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
     mixBtn.classList.toggle('is-ready', mix.phase === 'ready');
     mixBtn.setAttribute('aria-label', mix.phase === 'ready' ? 'Save the mix' : 'Mix the playing loops');
     mixDiscard.hidden = mix.phase !== 'ready';
+    syncDisabled();
   }
 
   async function renderMix(): Promise<void> {
@@ -501,7 +511,7 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
         void toggleRec();
         break;
       case 'mix':
-        if (mix.phase === 'idle') void renderMix();
+        if (mix.phase === 'idle' && enabled) void renderMix();
         else if (mix.phase === 'ready') saveMix();
         break;
       case 'mix-discard':
@@ -523,10 +533,24 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
   // ------------------------------------------------------------------------------------------------------- go
   syncRecording();
   syncMix();
+  setEnabled(true);
   void refresh();
+
+  function setEnabled(on: boolean): void {
+    enabled = on;
+    pod.classList.toggle('is-disabled', !on);
+    syncDisabled();
+  }
+
+  /** REC is disabled only when it would start a take; LOOP MIX only when it would start a render. */
+  function syncDisabled(): void {
+    recBtn.setAttribute('aria-disabled', String(!enabled && recorder.state === 'idle'));
+    mixBtn.setAttribute('aria-disabled', String(!enabled && mix.phase === 'idle'));
+  }
 
   const handle: RecorderPod = {
     toggleRecord: () => toggleRec(),
+    setEnabled,
     dispose(): void {
       if (disposed) return;
       disposed = true;

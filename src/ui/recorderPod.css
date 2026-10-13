@@ -236,3 +236,10 @@
   background: linear-gradient(#5b2326, #3d1a1c);
   color: #fff;
 }
+
+/* REC and LOOP MIX while the unit is off or has lost its audio (a running take can still be ended). */
+.recorder-pod.is-disabled .rp-rec:not(.is-on),
+.recorder-pod.is-disabled .rp-mix:not(.is-ready) {
+  opacity: 0.4;
+  cursor: default;
+}

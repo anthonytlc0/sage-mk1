@@ -1,7 +1,7 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { FONT_MEDIUM, FONT_SMALL } from '../../src/lcd/fonts';
 import { APP_VERSION } from '../../src/lcd/screens/boot';
-import { expectLed, lcdShows, menuDepth, openApp, powerState, powerSwitch, pressControl, readLcd, tap, topScreen } from './app';
+import { expectLed, lcdShows, ledColor, menuDepth, openApp, powerState, powerSwitch, pressControl, readLcd, tap, topScreen } from './app';
 import { fakeMic } from './fakeMic';
 
 test.beforeEach(async ({ page }) => {
@@ -13,7 +13,8 @@ test('off until POWER: the panel is dark and its controls do nothing', async ({ 
   expect(await powerState(page)).toBe('off');
   expect((await readLcd(page)).every((p) => p === 0)).toBe(true);
   await pressControl(page, 'trk1.rec', browserName);
-  await expectLed(page, 'trk1.rec', 'off', 300);
+  await page.waitForTimeout(300); // long enough for a recording to light it
+  expect(await ledColor(page, 'trk1.rec')).toBe('off');
   expect(await powerState(page)).toBe('off');
 });
 
@@ -99,4 +100,92 @@ test('the panel, POWER and the recorder pod keep at least 24 px from every edge'
   // The shelf (POWER, pod) sits below the panel, never over it.
   expect(boxes.power.y).toBeGreaterThanOrEqual(boxes.panel.y + boxes.panel.h);
   expect(boxes.pod.y).toBeGreaterThanOrEqual(boxes.panel.y + boxes.panel.h);
+});
+
+// ------------------------------------------------------------------------------------------------ TAP POWER TO RESUME
+
+interface ResumeProbe {
+  calls: object[];
+  ok: boolean;
+}
+
+/**
+ * Puts the running engine into "audio lost" (as EngineHost does when a resume fails) and makes its `resume` answer
+ * `ok`, recording each call. Uses the host's private setNeedsResume through the dev hook.
+ */
+async function loseAudio(page: Page, ok: boolean): Promise<void> {
+  await page.evaluate((ok) => {
+    const host = window.__sage!.unit.engine as unknown as {
+      resume(opts?: object): Promise<boolean>;
+      setNeedsResume(v: boolean): void;
+    };
+    const probe: ResumeProbe = { calls: [], ok };
+    (window as unknown as { __resume: ResumeProbe }).__resume = probe;
+    host.resume = (opts = {}) => {
+      probe.calls.push(opts);
+      if (probe.ok) host.setNeedsResume(false);
+      return Promise.resolve(probe.ok);
+    };
+    host.setNeedsResume(true);
+  }, ok);
+}
+
+const resumeCalls = (page: Page): Promise<object[]> =>
+  page.evaluate(() => (window as unknown as { __resume: ResumeProbe }).__resume.calls);
+
+/** The topmost element at the centre of `selector`'s box, as the nearest of the given shell classes it is inside. */
+const topAt = (page: Page, selector: string): Promise<string> =>
+  page.evaluate((selector) => {
+    const r = (selector === 'panel' ? window.__sage!.view.rootSvg : document.querySelector(selector)!).getBoundingClientRect();
+    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    for (const cls of ['resume-overlay', 'power-switch', 'recorder-pod', 'panel-svg']) if (hit?.closest(`.${cls}`)) return cls;
+    return hit?.tagName ?? 'nothing';
+  }, selector);
+
+test.describe('TAP POWER TO RESUME', () => {
+  test.beforeEach(async ({ page, browserName }) => {
+    await tap(page, powerSwitch(page), browserName);
+    await expect.poll(() => powerState(page), { timeout: 3000 }).toBe('on');
+    await page.keyboard.press('Escape');
+  });
+
+  test('audio lost: the prompt covers the panel but not POWER or the pod; a tap on it resumes', async ({ page, browserName }) => {
+    const overlay = page.locator('.resume-overlay');
+    await expect(overlay).toBeHidden();
+    await loseAudio(page, true);
+    await expect(overlay).toBeVisible();
+    await expect(overlay.locator('.resume-text')).toHaveText('TAP POWER TO RESUME');
+    expect(await topAt(page, 'panel')).toBe('resume-overlay'); // a touch on the panel lands on the prompt
+    expect(await topAt(page, '.power-switch')).toBe('power-switch');
+    expect(await topAt(page, '.rp-rec')).toBe('recorder-pod');
+    await expect(page.locator('.rp-rec')).toHaveAttribute('aria-disabled', 'true'); // no takes of a dead engine
+
+    await tap(page, overlay, browserName);
+    await expect(overlay).toBeHidden();
+    expect(await resumeCalls(page)).toEqual([{ retryMic: true }]);
+    expect(await powerState(page)).toBe('on');
+    await expect(page.locator('.rp-rec')).toHaveAttribute('aria-disabled', 'false');
+  });
+
+  test('POWER retries first; once that fails the prompt says POWER switches off, the prompt still retries, and POWER is OFF', async ({ page, browserName }) => {
+    const overlay = page.locator('.resume-overlay');
+    await loseAudio(page, false);
+    await expect(overlay).toBeVisible();
+    await tap(page, powerSwitch(page), browserName); // first POWER tap: a retry
+    await expect.poll(() => resumeCalls(page)).toEqual([{ retryMic: true }]);
+    expect(await powerState(page)).toBe('on');
+    await expect(overlay.locator('.resume-text')).toHaveText('TAP POWER TO SWITCH OFF');
+    await expect(powerSwitch(page)).toHaveAttribute('data-resume', 'off');
+
+    await tap(page, overlay, browserName); // the prompt always retries
+    await expect.poll(async () => (await resumeCalls(page)).length).toBe(2);
+    expect(await powerState(page)).toBe('on');
+    await expect(overlay.locator('.resume-text')).toHaveText('TAP POWER TO SWITCH OFF');
+
+    await tap(page, powerSwitch(page), browserName); // now POWER switches off
+    await expect.poll(() => powerState(page)).toBe('off');
+    await expect(overlay).toBeHidden();
+    expect((await resumeCalls(page)).length).toBe(2);
+    await expect.poll(async () => (await readLcd(page)).every((p) => p === 0)).toBe(true);
+  });
 });

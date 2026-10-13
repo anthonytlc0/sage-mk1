@@ -4,7 +4,7 @@ import type { SageDebug } from '../../src/app';
 import type { PowerState } from '../../src/app/unit';
 import type { Font } from '../../src/lcd/fonts';
 import type { ButtonId } from '../../src/shared/ids';
-import { lcdHas } from './lcd';
+import { lcdHas } from '../lcd/text';
 
 declare global {
   interface Window {

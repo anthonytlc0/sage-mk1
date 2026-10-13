@@ -442,6 +442,63 @@ describe('recovery checkpoint', () => {
     expect(stores.system.saves).toBe(1);
   });
 
+  it('a second request while a checkpoint is being written joins it: the audio is exported once (hidden, then pagehide)', async () => {
+    const { c, engine, stores } = setup();
+    engine.exportReply = null;
+    c.setParam('name', 'UNSAVED');
+    void c.checkpointNow(); // the page went hidden
+    void c.checkpointNow(); // and then pagehide
+    expect(engine.commands('exportTracks')).toHaveLength(1);
+    const { reqId } = engine.last('exportTracks')!;
+    engine.emit({ t: 'tracks', reqId, tracks: [take(1), null, null, null, null] });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stores.recovery.checkpoints).toHaveLength(1);
+    expect(engine.commands('exportTracks')).toHaveLength(1);
+  });
+
+  it('nothing changed since the last checkpoint: no export, no write; a change makes the next one write again', async () => {
+    const { c, engine, stores } = setup();
+    c.setParam('name', 'UNSAVED');
+    await c.checkpointNow();
+    await c.checkpointNow();
+    expect(engine.commands('exportTracks')).toHaveLength(1);
+    expect(stores.recovery.checkpoints).toHaveLength(1);
+    engine.emit({ t: 'status', status: makeStatus({ audioDirty: true }) }); // the audio changed
+    await c.checkpointNow();
+    expect(stores.recovery.checkpoints).toHaveLength(2);
+    c.setParam('name', 'MORE');
+    await c.checkpointNow();
+    expect(stores.recovery.checkpoints).toHaveLength(3);
+    expect(stores.recovery.checkpoints[2]!.settings.name).toBe('MORE');
+  });
+
+  it('a change made while a checkpoint is being written is checkpointed right after it', async () => {
+    const { c, engine, stores } = setup();
+    engine.exportReply = null;
+    c.setParam('name', 'FIRST');
+    void c.checkpointNow();
+    c.setParam('name', 'SECOND');
+    const joined = c.checkpointNow();
+    const first = engine.last('exportTracks')!.reqId;
+    engine.emit({ t: 'tracks', reqId: first, tracks: [null, null, null, null, null] });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(engine.commands('exportTracks')).toHaveLength(2);
+    const second = engine.last('exportTracks')!.reqId;
+    engine.emit({ t: 'tracks', reqId: second, tracks: [null, null, null, null, null] });
+    await joined;
+    expect(stores.recovery.checkpoints.map((k) => k.settings.name)).toEqual(['FIRST', 'SECOND']);
+  });
+
+  it('after the checkpoint is dropped (memory saved), new work is checkpointed again', async () => {
+    const { c, stores } = setup();
+    c.setParam('name', 'A');
+    await c.checkpointNow();
+    await c.write(1);
+    c.setParam('name', 'B');
+    await c.checkpointNow();
+    expect(stores.recovery.checkpoints.map((k) => k.settings.name)).toEqual(['A', 'B']);
+  });
+
   it('a saved or reloaded memory drops the stale checkpoint', async () => {
     const { c, stores } = setup();
     await c.write(1);

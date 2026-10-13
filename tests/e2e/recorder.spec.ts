@@ -360,3 +360,40 @@ test.describe('recorder pod: no mixer yet', () => {
     expect(errors).toEqual([]);
   });
 });
+
+test.describe('recorder pod: disabled while the unit is not on', () => {
+  test('disabled: REC (click or Backquote) and LOOP MIX start nothing and show as disabled; enabled again, REC works', async ({ page }) => {
+    await open(page);
+    await page.evaluate(() => window.__rec.pod.setEnabled(false));
+    await expect(page.locator('.recorder-pod')).toHaveClass(/is-disabled/);
+    await expect(rec(page)).toHaveAttribute('aria-disabled', 'true');
+    await expect(mix(page)).toHaveAttribute('aria-disabled', 'true');
+    await rec(page).click({ force: true }); // a tap on the dimmed button
+    await page.keyboard.press('Backquote');
+    await mix(page).click({ force: true });
+    await page.waitForTimeout(300);
+    await expect(rec(page)).not.toHaveClass(/is-on/);
+    await expect(mix(page)).toHaveText('LOOP MIX');
+    expect(await page.evaluate(() => window.__rec.recorder.state)).toBe('idle');
+    expect(await page.evaluate(() => window.__rec.engine.sent.filter((s) => s.cmd.t === 'recorder' || s.cmd.t === 'exportTracks').length)).toBe(0);
+    await expect(takeRows(page)).toHaveCount(0);
+
+    await page.evaluate(() => window.__rec.pod.setEnabled(true));
+    await expect(page.locator('.recorder-pod')).not.toHaveClass(/is-disabled/);
+    await expect(rec(page)).toHaveAttribute('aria-disabled', 'false');
+    await recordTake(page, 400);
+  });
+
+  test('a take that is running can still be ended after the pod is disabled', async ({ page }) => {
+    await open(page);
+    await rec(page).click();
+    await expect(rec(page)).toHaveClass(/is-on/);
+    await page.waitForTimeout(400);
+    await page.evaluate(() => window.__rec.pod.setEnabled(false));
+    await expect(rec(page)).toHaveAttribute('aria-disabled', 'false'); // it can still end the take
+    await rec(page).click();
+    await expect(takeRows(page)).toHaveCount(1);
+    await expect(rec(page)).toHaveAttribute('aria-disabled', 'true');
+    await expect(rec(page)).not.toHaveClass(/is-on/);
+  });
+});

@@ -186,6 +186,12 @@ export class Controller {
   private loadSeq = 0;
   /** Bumped whenever the checkpoint goes stale (memory saved or reloaded): a checkpoint in flight then gives up. */
   private checkpointGen = 0;
+  /** Bumped by every change to the work a checkpoint holds (a parameter, the audio, a tempo the engine set, a restore). */
+  private workSeq = 0;
+  /** The `workSeq` the checkpoint in storage holds; -1 when there is none for this work. */
+  private checkpointedSeq = -1;
+  /** The checkpoint being written: a second request joins it rather than exporting all the audio again. */
+  private checkpointing: Promise<void> | null = null;
 
   constructor(
     private readonly engine: EngineLike,
@@ -293,6 +299,7 @@ export class Controller {
   setParam(id: string, value: unknown, track?: number | string): void {
     const { scope, changed } = this.session.set(id, value, track);
     if (!changed) return;
+    this.workSeq++;
     if (scope === 'system') this.scheduleSystemSave();
     this.pushSettings();
     if (id === 'tempo') {
@@ -415,6 +422,7 @@ export class Controller {
   restoreRecovery(rec: { slot: number; settings: MemorySettings; tracks: (TrackAudio | null)[] }): void {
     ++this.loadSeq;
     this.loadSession(rec.slot, rec.settings, rec.tracks, false);
+    this.workSeq++;
     this.session.paramsDirty = true;
     if (rec.tracks.some((t) => t !== null)) this.session.audioDirty = true;
   }
@@ -426,6 +434,7 @@ export class Controller {
   async replaceSystem(system: SystemSettings): Promise<void> {
     const micBefore = this.session.system.setup.micProcess;
     this.session.system = system;
+    this.workSeq++;
     this.pushSettings();
     if (system.setup.micProcess !== micBefore) this.reopenMic();
     clearTimeout(this.systemSaveTimer);
@@ -521,18 +530,41 @@ export class Controller {
     return result;
   }
 
-  /** Writes the recovery checkpoint now (unsaved work only). */
+  /**
+   * Writes the recovery checkpoint now (unsaved work only). Nothing is written when the checkpoint already holds the
+   * work as it is. A request while one is being written joins it (the page going hidden and then `pagehide` export the
+   * audio once), and writes again after it if the work changed meanwhile.
+   */
   async checkpointNow(): Promise<void> {
     clearTimeout(this.checkpointTimer);
     this.checkpointTimer = undefined;
     if (this.poweredOff || !this.session.dirty) return;
+    const running = this.checkpointing;
+    if (running) {
+      await running;
+      if (this.workSeq !== this.checkpointedSeq) await this.checkpointNow();
+      return;
+    }
+    if (this.workSeq === this.checkpointedSeq) return; // the checkpoint in storage is current
+    const run = this.writeCheckpoint();
+    this.checkpointing = run;
+    try {
+      await run;
+    } finally {
+      if (this.checkpointing === run) this.checkpointing = null;
+    }
+  }
+
+  private async writeCheckpoint(): Promise<void> {
     const gen = this.checkpointGen;
+    const seq = this.workSeq;
     const slot = this.session.slot;
     const settings = this.session.memoryForSave();
     try {
       const tracks = await this.requestTracks();
       if (gen !== this.checkpointGen) return; // saved or reloaded meanwhile: this work is no longer unsaved
       await this.stores.recovery.checkpoint(slot, settings, tracks);
+      if (gen === this.checkpointGen) this.checkpointedSeq = seq;
     } catch (e) {
       if (e instanceof QuotaError) this.showMessage('MEMORY FULL');
       else console.error('recovery checkpoint failed', e);
@@ -605,6 +637,7 @@ export class Controller {
   /** Loads a memory into the session and the engine. `discardCheckpoint`: the unsaved work it held is now gone. */
   private loadSession(slot: number, memory: MemorySettings, tracks: (TrackAudio | null)[], discardCheckpoint: boolean): void {
     this.session.load(slot, memory);
+    this.workSeq++;
     this.buttons.resetTap();
     if (discardCheckpoint) this.dropCheckpoint();
     this.pushSettings();
@@ -614,6 +647,7 @@ export class Controller {
   /** The checkpoint holds unsaved work; once the memory is saved or reloaded it is stale. */
   private dropCheckpoint(): void {
     this.checkpointGen++;
+    this.checkpointedSeq = -1;
     clearTimeout(this.checkpointTimer);
     this.checkpointTimer = undefined;
     this.stores.recovery.discard().catch((e: unknown) => console.error('recovery discard failed', e));
@@ -655,6 +689,7 @@ export class Controller {
     // audioDirty is a pulse (raised once per change: a recording kept, a pass ended, a track cleared); latch it.
     if (s.audioDirty) {
       this.audioSeq++;
+      this.workSeq++;
       this.session.audioDirty = true;
       this.scheduleCheckpoint();
     }
@@ -662,7 +697,10 @@ export class Controller {
     // settings push would put the old one back. Echoes of our own sends are told apart by TempoEcho. No settings push:
     // the engine already has it; session.set leaves the memory clean when the (snapped) value is the one it had.
     const adopt = this.tempoEcho.seen(s.tempo);
-    if (adopt !== null) this.session.set('tempo', adopt);
+    if (adopt !== null) {
+      this.session.set('tempo', adopt);
+      this.workSeq++;
+    }
   }
 
   private scheduleCheckpoint(): void {

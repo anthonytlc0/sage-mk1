@@ -176,8 +176,14 @@ body {
 
 .power-switch[data-state='booting'] .power-led,
 .power-switch[data-state='stopping'] .power-led,
-.power-switch.is-resume .power-led {
+.power-switch[data-resume='resume'] .power-led,
+.power-switch[data-resume='resuming'] .power-led {
   animation: power-blink 0.5s steps(1, end) infinite;
+}
+
+/* After a failed resume the next POWER tap switches off: the LED blinks fast. */
+.power-switch[data-resume='off'] .power-led {
+  animation: power-blink 0.16s steps(1, end) infinite;
 }
 
 @keyframes power-blink {
@@ -220,7 +226,9 @@ body {
   color: #eceef0;
 }
 
-.power-switch.is-resume {
+.power-switch[data-resume='resume'],
+.power-switch[data-resume='resuming'],
+.power-switch[data-resume='off'] {
   border-color: #6b2125;
   box-shadow:
     0 0 0 2px rgba(255, 42, 31, 0.45),
@@ -277,6 +285,15 @@ body {
 .resume-text {
   color: #f0f1f3;
   font-size: 22px;
+}
+
+.resume-hint {
+  color: #8e9298;
+  font-size: 12px;
+}
+
+.resume-hint[hidden] {
+  display: none;
 }
 
 /* ---- the rotate screen ------------------------------------------------------------------------------------------ */

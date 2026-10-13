@@ -56,8 +56,12 @@ class ShellFake extends FakeEngine implements ShellEngine {
     for (const h of [...this.resumeHandlers]) h(v);
   }
 
+  /** When set, `resume` waits for this before answering. */
+  resumeGate: Promise<void> | null = null;
+
   async resume(opts: { retryMic?: boolean } = {}): Promise<boolean> {
     this.resumes.push(opts);
+    if (this.resumeGate) await this.resumeGate;
     if (this.resumeWorks) this.setNeedsResume(false);
     return this.resumeWorks;
   }
@@ -101,7 +105,12 @@ class FakeDoc extends EventTarget {
 class FakePod implements PodHandle {
   toggles = 0;
   disposed = false;
+  /** Every setEnabled call, in order. */
+  readonly enabled: boolean[] = [];
   constructor(private readonly log: string[]) {}
+  setEnabled(on: boolean): void {
+    this.enabled.push(on);
+  }
   async toggleRecord(): Promise<void> {
     this.toggles++;
   }
@@ -123,6 +132,10 @@ interface RigOptions {
   engine?: (log: string[]) => ShellFake;
   startEngine?: UnitDeps['startEngine'];
   bootMs?: number;
+  /** What the unit gets as its stores (default: the opened, seeded stores). */
+  stores?: (opened: ShellStores) => Promise<ShellStores>;
+  storageTimeoutMs?: number;
+  abortAfterMs?: number;
 }
 
 async function rig(opts: RigOptions = {}) {
@@ -143,8 +156,9 @@ async function rig(opts: RigOptions = {}) {
       }),
   );
   const requestPersistence = vi.fn(async () => true);
+  const unitStores = opts.stores ? opts.stores(stores) : Promise.resolve(stores);
   const unit = new SageUnit({
-    stores: Promise.resolve(stores),
+    stores: unitStores,
     startEngine,
     requestPersistence,
     mountPod: () => {
@@ -156,9 +170,11 @@ async function rig(opts: RigOptions = {}) {
     doc,
     wakeLock,
     bootMs: opts.bootMs ?? 20,
+    ...(opts.storageTimeoutMs !== undefined ? { storageTimeoutMs: opts.storageTimeoutMs } : {}),
+    ...(opts.abortAfterMs !== undefined ? { abortAfterMs: opts.abortAfterMs } : {}),
   });
   units.push(unit);
-  await unit.ready(); // the stored system settings are read ahead of the POWER tap
+  if (!opts.stores) await unit.ready(); // the stored system settings are read ahead of the POWER tap
   return { unit, stores, engine, win, doc, wakeLock, pods, started, startEngine, requestPersistence, log };
 }
 
@@ -379,6 +395,7 @@ describe('SageUnit: TAP POWER TO RESUME', () => {
     const r = await rig({ seed: (s) => s.system.save(calibrated()) });
     await powerOn(r);
     r.engine.setNeedsResume(true);
+    expect(r.unit.resumePrompt).toBe('resume');
     r.engine.resumeWorks = false;
     r.unit.tap();
     await sleep(0);
@@ -386,11 +403,73 @@ describe('SageUnit: TAP POWER TO RESUME', () => {
     expect(r.unit.state).toBe('on');
     expect(r.unit.needsResume).toBe(true); // still lost: the prompt stays
     r.engine.resumeWorks = true;
-    r.unit.tap();
+    r.unit.retryResume(); // a tap on the prompt
     await sleep(0);
     expect(r.engine.resumes).toHaveLength(2);
     expect(r.unit.needsResume).toBe(false);
+    expect(r.unit.resumePrompt).toBe('none');
     expect(r.engine.stopped).toBe(false);
+  });
+
+  it('R58: after a failed resume the next POWER tap switches off cleanly (a clean shutdown is marked)', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()) });
+    await powerOn(r);
+    const clean = vi.spyOn(r.stores.recovery, 'markCleanShutdown');
+    r.engine.setNeedsResume(true);
+    r.engine.resumeWorks = false;
+    r.unit.tap(); // first POWER tap: retry
+    await sleep(0);
+    expect(r.unit.resumePrompt).toBe('off'); // the prompt now says POWER means OFF
+    r.unit.tap(); // second POWER tap: off
+    expect(r.unit.state).toBe('stopping');
+    await r.unit.settled();
+    expect(r.unit.state).toBe('off');
+    expect(r.engine.resumes).toHaveLength(1);
+    expect(r.engine.stopped).toBe(true);
+    expect(clean).toHaveBeenCalled();
+    expect(await r.stores.recovery.needsRecovery()).toBe(false);
+    expect(r.unit.resumePrompt).toBe('none');
+  });
+
+  it('R58: taps on the prompt always retry, even once POWER would switch off', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()) });
+    await powerOn(r);
+    r.engine.setNeedsResume(true);
+    r.engine.resumeWorks = false;
+    r.unit.retryResume();
+    await sleep(0);
+    expect(r.unit.resumePrompt).toBe('off');
+    r.unit.retryResume();
+    await sleep(0);
+    expect(r.engine.resumes).toHaveLength(2);
+    expect(r.unit.state).toBe('on');
+    expect(r.unit.resumePrompt).toBe('off');
+  });
+
+  it('R58: taps while a resume is under way do nothing; audio lost again later starts from a retry, not OFF', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()) });
+    await powerOn(r);
+    let open!: () => void;
+    r.engine.resumeGate = new Promise((res) => (open = res));
+    r.engine.setNeedsResume(true);
+    r.engine.resumeWorks = false;
+    r.unit.tap();
+    expect(r.unit.resumePrompt).toBe('resuming');
+    r.unit.tap();
+    r.unit.retryResume();
+    expect(r.engine.resumes).toHaveLength(1);
+    expect(r.unit.state).toBe('on');
+    r.engine.resumeWorks = true;
+    open();
+    await sleep(0);
+    expect(r.unit.resumePrompt).toBe('none');
+    r.engine.resumeGate = null;
+    r.engine.setNeedsResume(true); // lost again
+    expect(r.unit.resumePrompt).toBe('resume');
+    r.unit.tap();
+    await sleep(0);
+    expect(r.engine.resumes).toHaveLength(2);
+    expect(r.unit.state).toBe('on');
   });
 });
 
@@ -490,5 +569,150 @@ describe('SageUnit: POWER off and page hide', () => {
     r.doc.set('hidden');
     r.doc.set('visible');
     expect(r.wakeLock.requests).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------- fix round 1
+
+describe('SageUnit: settings carried to the next power-on', () => {
+  it('a later power-on in the same page opens the mic with the current MIC PROCESS and boots with the current contrast', async () => {
+    const r = await rig({
+      seed: (s) => s.system.save(calibrated()),
+      startEngine: (system) => {
+        r.started.push(system);
+        return Promise.resolve(new ShellFake());
+      },
+    });
+    await powerOn(r);
+    expect(r.started[0]!.setup.micProcess).toBe(false);
+    r.unit.controller!.setParam('setup.micProcess', true);
+    r.unit.controller!.setParam('setup.contrast', 8);
+    r.unit.tap();
+    await r.unit.settled();
+    r.unit.tap();
+    expect(r.started[1]!.setup.micProcess).toBe(true);
+    expect(r.unit.frame(0).contrast).toBe(8); // the boot screen
+    await r.unit.settled();
+  });
+});
+
+describe('SageUnit: a power-on that cannot finish', () => {
+  const never = <T>(): Promise<T> => new Promise<T>(() => {});
+
+  it('storage that never opens: STORAGE ERROR after the timeout, and the engine is stopped', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const r = await rig({ stores: () => never(), storageTimeoutMs: 40 });
+    r.unit.tap();
+    await r.unit.settled();
+    expect(r.unit.state).toBe('off');
+    expect(r.unit.error).toBe('STORAGE ERROR');
+    expect(r.engine.stopped).toBe(true);
+    expect(r.wakeLock.sentinels.every((x) => x.released)).toBe(true);
+    err.mockRestore();
+  });
+
+  it('memory 01 that never loads: STORAGE ERROR, the controller let go, the engine stopped', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const r = await rig({
+      stores: async (s) => {
+        s.memories.load = () => never();
+        return s;
+      },
+      storageTimeoutMs: 40,
+    });
+    r.unit.tap();
+    await r.unit.settled();
+    expect(r.unit.state).toBe('off');
+    expect(r.unit.error).toBe('STORAGE ERROR');
+    expect(r.unit.controller).toBeNull();
+    expect(r.engine.stopped).toBe(true);
+    expect(r.pods).toEqual([]);
+    err.mockRestore();
+  });
+
+  it('a recovery check that never answers: STORAGE ERROR, the engine stopped', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const r = await rig({
+      stores: async (s) => {
+        s.recovery.needsRecovery = () => never();
+        return s;
+      },
+      storageTimeoutMs: 40,
+    });
+    r.unit.tap();
+    await r.unit.settled();
+    expect(r.unit.state).toBe('off');
+    expect(r.unit.error).toBe('STORAGE ERROR');
+    expect(r.engine.stopped).toBe(true);
+    err.mockRestore();
+  });
+
+  it('a POWER tap aborts a boot that has run past the abort time (not earlier), cleanly and without an error', async () => {
+    const r = await rig({
+      stores: async (s) => {
+        s.memories.load = () => never();
+        return s;
+      },
+      storageTimeoutMs: 10_000,
+      abortAfterMs: 60,
+    });
+    const clean = vi.spyOn(r.stores.recovery, 'markCleanShutdown');
+    r.unit.tap();
+    await sleep(10);
+    r.unit.tap(); // too early: ignored
+    expect(r.unit.state).toBe('booting');
+    await sleep(70);
+    r.unit.tap();
+    await r.unit.settled();
+    expect(r.unit.state).toBe('off');
+    expect(r.unit.error).toBeNull();
+    expect(r.engine.stopped).toBe(true);
+    expect(r.unit.controller).toBeNull();
+    expect(clean).not.toHaveBeenCalled(); // not a POWER off of a running unit: the last session's flag stays
+    r.unit.tap(); // and it can be switched on again (the load still hangs, so abandon that one too)
+    expect(r.startEngine).toHaveBeenCalledTimes(2);
+    expect(r.unit.state).toBe('booting');
+    await sleep(70);
+    r.unit.tap();
+    await r.unit.settled();
+    expect(r.unit.state).toBe('off');
+  });
+
+  it('a POWER tap aborts a boot still waiting for the engine (the mic prompt); the engine is stopped when it comes', async () => {
+    let deliver!: (e: ShellFake) => void;
+    const late = new ShellFake();
+    const r = await rig({
+      seed: (s) => s.system.save(calibrated()),
+      startEngine: () => new Promise((res) => (deliver = res)),
+      abortAfterMs: 30,
+    });
+    r.unit.tap();
+    await sleep(40);
+    r.unit.tap();
+    await r.unit.settled();
+    expect(r.unit.state).toBe('off');
+    deliver(late);
+    await sleep(0);
+    expect(late.stopped).toBe(true);
+  });
+});
+
+describe('SageUnit: the recorder pod only records while the unit is on', () => {
+  it('REC is disabled while booting, enabled when on, disabled while audio is lost and while stopping', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()), bootMs: 60 });
+    r.unit.tap();
+    await sleep(30); // mounted during the boot screen
+    expect(r.pods).toHaveLength(1);
+    const pod = r.pods[0]!;
+    expect(pod.enabled.at(-1)).toBe(false);
+    await r.unit.settled();
+    expect(pod.enabled.at(-1)).toBe(true);
+    r.engine.setNeedsResume(true);
+    expect(pod.enabled.at(-1)).toBe(false);
+    r.engine.setNeedsResume(false);
+    expect(pod.enabled.at(-1)).toBe(true);
+    r.unit.tap(); // POWER off
+    expect(pod.enabled.at(-1)).toBe(false);
+    await r.unit.settled();
   });
 });
