@@ -1,5 +1,5 @@
 import 'fake-indexeddb/auto';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { openDb } from '../../src/storage/db';
 import { Takes } from '../../src/storage/takes';
 import { EXPORT_RATE } from '../../src/shared/constants';
@@ -71,6 +71,36 @@ describe('Takes', () => {
     expect(Array.from(out.subarray(44))).toEqual(chunks.flatMap((c) => Array.from(c)));
   });
 
+  it('walks the chunks with a cursor and wraps each in a Blob as it goes, never reading them all at once with getAll', async () => {
+    const id = await takes.create();
+    const chunks = Array.from({ length: 300 }, (_, i) => bytes(30, i));
+    for (let i = 0; i < chunks.length; i += 50) await Promise.all(chunks.slice(i, i + 50).map((c) => takes.append(id, c)));
+    const getAll = vi.spyOn(IDBIndex.prototype, 'getAll');
+    const openCursor = vi.spyOn(IDBIndex.prototype, 'openCursor');
+    try {
+      const blob = await takes.blob(id);
+      expect(getAll).not.toHaveBeenCalled();
+      expect(openCursor).toHaveBeenCalledTimes(1);
+      const out = await bytesOf(blob);
+      expect(out.length).toBe(44 + 300 * 30);
+      expect(new DataView(out.buffer).getUint32(40, true)).toBe(300 * 30);
+      expect(Array.from(out.subarray(44))).toEqual(chunks.flatMap((c) => Array.from(c))); // every chunk, in append order
+    } finally {
+      getAll.mockRestore();
+      openCursor.mockRestore();
+    }
+  });
+
+  it('only walks the chunks of its own take', async () => {
+    const a = await takes.create();
+    const b = await takes.create();
+    await takes.append(a, bytes(6, 1));
+    await takes.append(b, bytes(6, 100));
+    await takes.append(a, bytes(6, 2));
+    expect(Array.from((await bytesOf(await takes.blob(a))).subarray(44))).toEqual([...bytes(6, 1), ...bytes(6, 2)]);
+    expect(Array.from((await bytesOf(await takes.blob(b))).subarray(44))).toEqual([...bytes(6, 100)]);
+  });
+
   it('stores only the bytes of a subarray view, not its whole backing buffer', async () => {
     const id = await takes.create();
     const backing = bytes(100, 0);
@@ -106,7 +136,7 @@ describe('Takes', () => {
         objectStore: (name: string) =>
           name === 'takes'
             ? { count: () => failing('count failed') }
-            : { index: () => ({ getAll: () => failing('getAll failed') }) },
+            : { index: () => ({ getAll: () => failing('getAll failed'), openCursor: () => failing('cursor failed') }) },
       }),
     } as unknown as IDBDatabase;
 
