@@ -1,0 +1,54 @@
+# Builds Sage MK1 and deploys it to GitHub Pages on every push to main.
+#
+# One-time setup in the GitHub repository: Settings > Pages > Build and deployment > Source: "GitHub Actions".
+#
+# The site is served from a project subpath (https://<user>.github.io/<repo>/), so the build gets that path as its
+# base on the command line. vite.config.ts is not touched, and vite-plugin-pwa takes the manifest scope and start_url
+# from the same base. (A user site named <user>.github.io is served from "/" and would need --base=/ instead.)
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deployment at a time. A deployment already running is allowed to finish; the newest queued run goes next.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build -- --base=/${{ github.event.repository.name }}/
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write # publish to Pages
+      id-token: write # prove the deployment comes from this workflow
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
