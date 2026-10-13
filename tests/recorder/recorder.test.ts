@@ -6,7 +6,7 @@ import { QuotaError, openDb } from '../../src/storage/db';
 import { Takes } from '../../src/storage/takes';
 import { createDither, decodeWav, encodeWav, pcm24Bytes } from '../../src/storage/wav';
 import { EXPORT_RATE } from '../../src/shared/constants';
-import { BLOCK, RecEngine, bytesOf, resampleAll, sameBytes, sine } from './helpers';
+import { BLOCK, LaggyEngine, RecEngine, bytesOf, resampleAll, sameBytes, sine, sleep } from './helpers';
 
 const SR = 48000;
 const FREQ = 1000;
@@ -208,7 +208,7 @@ describe('Recorder: streaming', () => {
 
     for (let b = 1; b <= 6; b++) {
       feed(1, (b - 1) * BLOCK);
-      expect(append).toHaveBeenCalledTimes(b); // one append per block, before any stop
+      await vi.waitFor(() => expect(append).toHaveBeenCalledTimes(b)); // one append per block, before any stop
     }
     for (const call of append.mock.calls) {
       const bytes = call[1];
@@ -295,5 +295,229 @@ describe('Recorder: storage failure', () => {
     expect(info.frames).toBeGreaterThan(0);
     expect(info.frames).toBeLessThan((4 * BLOCK * EXPORT_RATE) / SR);
     expect(recorder.lastError).toBeInstanceOf(QuotaError);
+  });
+});
+
+/** The take's stored data, as bytes after the 44-byte header. */
+async function storedData(id: number): Promise<Uint8Array> {
+  return (await bytesOf(await takes.blob(id))).subarray(44);
+}
+
+describe('Recorder: appends are chained, so there is never a hole', () => {
+  it('after a failed append nothing more is appended, and the stored bytes are exactly the frames recorded', async () => {
+    const real = takes.append.bind(takes);
+    const sent: Uint8Array[] = [];
+    const append = vi.spyOn(takes, 'append').mockImplementation((id, bytes) => {
+      sent.push(bytes);
+      if (sent.length === 4) return new Promise((_, reject) => setTimeout(() => reject(new QuotaError()), 20)); // slow to fail
+      return real(id, bytes); // the fifth and sixth would succeed, were they tried
+    });
+    await recorder.start();
+    feed(6); // all six blocks arrive while the first appends are still being written
+    await vi.waitFor(() => expect(recorder.recording).toBe(false), { timeout: 2000 });
+
+    expect(append).toHaveBeenCalledTimes(4);
+    const id = recorder.lastTakeId!;
+    const info = (await takes.list()).find((t) => t.id === id)!;
+    const stored = await storedData(id);
+    const firstThree = sent.slice(0, 3);
+    expect(stored.length).toBe(firstThree.reduce((n, b) => n + b.length, 0));
+    expect(info.frames).toBe(stored.length / 6);
+    expect(sameBytes(stored, Uint8Array.from(firstThree.flatMap((b) => Array.from(b))))).toBe(true);
+  });
+
+  it('writes the chunks in the order the blocks arrived, however long each write takes', async () => {
+    const real = takes.append.bind(takes);
+    let n = 0;
+    vi.spyOn(takes, 'append').mockImplementation(async (id, bytes) => {
+      await sleep(n++ % 2 === 0 ? 15 : 0); // every other write is slow
+      return real(id, bytes);
+    });
+    await recorder.start();
+    feed(6);
+    const id = await recorder.stop();
+    const [fullL, fullR] = sine(6 * BLOCK, FREQ, SR);
+    const [rL, rR] = resampleAll(fullL, fullR, SR);
+    expect(sameBytes(await bytesOf(await takes.blob(id)), encodeWav([rL, rR], EXPORT_RATE, 'pcm24'))).toBe(true);
+  });
+});
+
+describe('Recorder: the end of a take', () => {
+  it('ignores a null status that is behind the last one seen (in flight when off was sent), and keeps the last block', async () => {
+    const lag = new LaggyEngine();
+    const rec = new Recorder(lag, takes, SR, { settleMs: 3000 });
+    await rec.start();
+    lag.handle(); // `on` heard
+    lag.post(); // a status with the recorder running: frame 800
+    lag.block();
+    lag.block();
+    lag.post(); // frame 1600
+
+    let done = false;
+    const stopped = rec.stop().then((id) => ((done = true), id));
+    await sleep(10);
+    expect(lag.commands('recorder').at(-1)).toEqual({ t: 'recorder', on: false }); // the recorder was seen running: off goes now
+    lag.postStale(null, 1000); // a null status from before, delivered late: its frame is below the last one seen
+    await sleep(30);
+    expect(done).toBe(false);
+
+    lag.handle(500); // off heard: the last, partial block
+    lag.post(); // null, frame beyond the last seen
+    const id = await stopped;
+    const info = (await takes.list()).find((t) => t.id === id)!;
+    expect(info.frames).toBe(Math.ceil(((2 * BLOCK + 500) * EXPORT_RATE) / SR));
+  });
+
+  it('a stop before the worklet has heard `on` holds the off back until the recorder is seen running', async () => {
+    const lag = new LaggyEngine();
+    const rec = new Recorder(lag, takes, SR, { settleMs: 3000 });
+    await rec.start();
+    let done = false;
+    const stopped = rec.stop().then((id) => ((done = true), id));
+    await sleep(10);
+    expect(lag.commands('recorder')).toEqual([{ t: 'recorder', on: true }]); // off is not sent yet
+
+    lag.post(); // statuses from before `on` was heard: null
+    lag.post();
+    await sleep(20);
+    expect(lag.commands('recorder')).toHaveLength(1);
+    expect(done).toBe(false);
+
+    lag.handle(); // `on` heard
+    lag.block();
+    lag.post(); // the recorder shows running: now off can follow
+    await sleep(10);
+    expect(lag.commands('recorder').at(-1)).toEqual({ t: 'recorder', on: false });
+    lag.handle(500);
+    lag.post();
+    const id = await stopped;
+    const info = (await takes.list()).find((t) => t.id === id)!;
+    expect(info.frames).toBe(Math.ceil(((BLOCK + 500) * EXPORT_RATE) / SR));
+  });
+
+  it('with an engine that never answers, stop still sends off and finishes within the settle time', async () => {
+    engine.answerOn = false;
+    engine.answerOff = false;
+    await recorder.start();
+    feed(2);
+    const t0 = performance.now();
+    const id = await recorder.stop();
+    expect(performance.now() - t0).toBeLessThan(500);
+    expect(engine.commands('recorder').at(-1)).toEqual({ t: 'recorder', on: false });
+    expect((await takes.list()).find((t) => t.id === id)!.frames).toBe(Math.ceil((2 * BLOCK * EXPORT_RATE) / SR));
+  });
+});
+
+describe('Recorder: halt', () => {
+  it('ends the take at once without waiting for the engine, keeping everything received', async () => {
+    const slow = new Recorder(engine, takes, SR, { settleMs: 5000 });
+    engine.answerOff = false;
+    const seen: RecorderEvent[] = [];
+    slow.onChange((e) => seen.push(e));
+    await slow.start();
+    feed(3);
+    const t0 = performance.now();
+    const id = await slow.halt();
+    expect(performance.now() - t0).toBeLessThan(1000);
+
+    expect(id).not.toBeNull();
+    expect(slow.state).toBe('idle');
+    expect(slow.recordingFrames).toBe(0);
+    expect(seen).toEqual([{ kind: 'start' }, { kind: 'halted', reason: 'requested' }, { kind: 'stop', takeId: id }]);
+    expect(engine.commands('recorder').at(-1)).toEqual({ t: 'recorder', on: false }); // best effort: it may still be alive
+    const info = (await takes.list()).find((t) => t.id === id)!;
+    expect(info.frames).toBe(Math.ceil((3 * BLOCK * EXPORT_RATE) / SR));
+    expect((await storedData(id!)).length).toBe(info.frames! * 6);
+  });
+
+  it('resolves null when no take is running, and stop then rejects', async () => {
+    expect(await recorder.halt()).toBeNull();
+    await recorder.start();
+    await recorder.halt();
+    await expect(recorder.stop()).rejects.toThrow(/not recording/i);
+  });
+
+  it('cuts short a stop that is still waiting for the engine', async () => {
+    const slow = new Recorder(engine, takes, SR, { settleMs: 5000 });
+    engine.answerOff = false;
+    await slow.start();
+    feed(2);
+    const stopping = slow.stop(); // waits for a status that will not come
+    await sleep(20);
+    const t0 = performance.now();
+    const [a, b] = await Promise.all([slow.halt(), stopping]);
+    expect(performance.now() - t0).toBeLessThan(1000);
+    expect(a).toBe(b);
+    expect(slow.state).toBe('idle');
+  });
+
+  it('a halt right after start waits for the take to exist and then ends it', async () => {
+    const started = recorder.start();
+    const halted = recorder.halt();
+    await started;
+    const id = await halted;
+    expect(id).not.toBeNull();
+    expect(recorder.state).toBe('idle');
+  });
+});
+
+describe('Recorder: stall watchdog', () => {
+  const make = () => new Recorder(engine, takes, SR, { settleMs: 30, stallMs: 90 });
+
+  it('halts the take when the engine stops posting statuses, keeping what was recorded', async () => {
+    const rec = make();
+    const seen: RecorderEvent[] = [];
+    rec.onChange((e) => seen.push(e));
+    await rec.start();
+    feed(2);
+    await vi.waitFor(() => expect(rec.state).toBe('idle'), { timeout: 3000 });
+    expect(seen.map((e) => e.kind)).toEqual(['start', 'halted', 'stop']);
+    expect(seen[1]).toEqual({ kind: 'halted', reason: 'stalled' });
+    const info = (await takes.list()).find((t) => t.id === rec.lastTakeId)!;
+    expect(info.frames).toBe(Math.ceil((2 * BLOCK * EXPORT_RATE) / SR));
+  });
+
+  it('leaves a take alone while statuses keep coming', async () => {
+    const rec = make();
+    await rec.start();
+    for (let i = 0; i < 12; i++) {
+      engine.status(i * 100);
+      await sleep(25); // 300 ms in all: more than three stall times
+    }
+    expect(rec.state).toBe('recording');
+    await rec.stop();
+  });
+
+  it('does not take a blocked page for a dead engine', async () => {
+    const rec = make();
+    await rec.start();
+    engine.status(0);
+    await new Promise<void>((resolve) =>
+      setTimeout(() => {
+        const t = performance.now();
+        while (performance.now() - t < 300) {
+          // the page is busy (a long render): nothing is handled, statuses wait in the queue
+        }
+        resolve();
+      }, 0),
+    );
+    await sleep(40); // the stall check runs, late
+    expect(rec.state).toBe('recording');
+    for (let i = 0; i < 6; i++) {
+      engine.status(i * 100);
+      await sleep(25);
+    }
+    expect(rec.state).toBe('recording');
+    await rec.stop();
+  });
+
+  it('stops watching once the take is over', async () => {
+    const rec = make();
+    await rec.start();
+    await rec.stop();
+    const seen: RecorderEvent[] = [];
+    rec.onChange((e) => seen.push(e));
+    await sleep(250);
+    expect(seen).toEqual([]);
   });
 });

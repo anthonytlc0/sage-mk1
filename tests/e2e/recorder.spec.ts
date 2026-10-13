@@ -7,8 +7,22 @@ const clock = (page: Page): Locator => page.locator('.rp-clock');
 const mix = (page: Page): Locator => page.locator('.rp-mix');
 const takeRows = (page: Page): Locator => page.locator('.rp-take');
 
-async function open(page: Page, db?: string): Promise<void> {
-  await page.goto(db ? `${HARNESS}?db=${db}` : HARNESS);
+interface OpenOptions {
+  /** Database name: the same name finds the same takes again after a reload. */
+  db?: string;
+  /** The pod's cacheBytes. */
+  cache?: number;
+  /** Replace saveFile with a stand-in the spec answers by hand (`__rec.saves`, `__rec.releaseSave`). */
+  fakeSave?: boolean;
+}
+
+async function open(page: Page, opts: OpenOptions | string = {}): Promise<void> {
+  const o = typeof opts === 'string' ? { db: opts } : opts;
+  const q = new URLSearchParams();
+  if (o.db) q.set('db', o.db);
+  if (o.cache !== undefined) q.set('cache', String(o.cache));
+  if (o.fakeSave) q.set('save', 'fake');
+  await page.goto(q.size ? `${HARNESS}?${q}` : HARNESS);
   await page.waitForFunction(() => document.documentElement.dataset.ready === '1');
 }
 
@@ -198,5 +212,132 @@ test.describe('recorder pod', () => {
     await expect(row.locator('.rp-save')).toHaveText('SAVE');
     const [download] = await Promise.all([page.waitForEvent('download'), row.locator('.rp-save').click()]); // second tap: save
     expect(wavInfo(await bytesOf(download)).sr).toBe(44100);
+  });
+});
+
+// Each of these opens its own page: a small cache, or a save that does not answer until the spec says.
+test.describe('recorder pod: memory and saving', () => {
+  const save = (row: Locator): Locator => row.locator('.rp-save');
+  const saves = (page: Page) => page.evaluate(() => window.__rec.saves.length);
+  const release = (page: Page, result: 'saved' | 'cancelled' | 'failed') => page.evaluate((r) => window.__rec.releaseSave(r), result);
+
+  test('with a small cache the oldest takes are evicted and prepared again by a tap', async ({ page }) => {
+    // Each 0.8 s take is about 215 KB: two fit in 500 KB, three do not.
+    await open(page, { cache: 500_000, fakeSave: true });
+    await recordTake(page, 800);
+    await recordTake(page, 800);
+    const rows = takeRows(page);
+    await expect(rows.nth(0)).not.toHaveClass(/is-cold/);
+    await expect(rows.nth(1)).not.toHaveClass(/is-cold/);
+
+    await recordTake(page, 800); // the third does not fit with the other two: the oldest goes
+    await expect(rows.nth(0)).not.toHaveClass(/is-cold/);
+    await expect(rows.nth(1)).not.toHaveClass(/is-cold/);
+    await expect(rows.nth(2)).toHaveClass(/is-cold/);
+
+    await save(rows.nth(2)).click(); // a tap on the cold one prepares it (and makes room by evicting the oldest other)
+    await expect(rows.nth(2)).not.toHaveClass(/is-cold/);
+    await expect(rows.nth(1)).toHaveClass(/is-cold/);
+    await expect(rows.nth(0)).not.toHaveClass(/is-cold/);
+    expect(await saves(page)).toBe(0); // preparing is not saving
+  });
+
+  test('a take over the cap is not prepared by itself; a tap prepares it, the save releases it again', async ({ page }) => {
+    await open(page, { cache: 100_000, fakeSave: true }); // a 0.8 s take is about 215 KB
+    await recordTake(page, 800);
+    const row = takeRows(page).first();
+    await page.waitForTimeout(400); // time enough for an automatic preparation, had there been one
+    await expect(row).toHaveClass(/is-cold/);
+    await expect(save(row)).toHaveText('SAVE');
+
+    await save(row).click(); // first tap: prepare, held for this tap even though it is over the cap
+    await expect(row).not.toHaveClass(/is-cold/);
+    expect(await saves(page)).toBe(0);
+    await save(row).click(); // second tap: save
+    expect(await saves(page)).toBe(1);
+    expect(await page.evaluate(() => window.__rec.saves[0]!.size)).toBeGreaterThan(100_000);
+    await release(page, 'saved');
+    await expect(save(row)).toHaveText('SAVED');
+    await expect(row).toHaveClass(/is-cold/); // let go once saved
+  });
+
+  test('a take within the cap is prepared by itself, and let go after its save: saving it again takes two taps', async ({ page }) => {
+    await open(page, { fakeSave: true });
+    await recordTake(page, 500);
+    const row = takeRows(page).first();
+    await expect(row).not.toHaveClass(/is-cold/);
+
+    await save(row).click();
+    expect(await saves(page)).toBe(1);
+    await release(page, 'saved');
+    await expect(row).toHaveClass(/is-cold/);
+    await expect(save(row)).toHaveText('SAVE'); // the SAVED note has gone
+
+    await save(row).click(); // prepares again
+    await expect(row).not.toHaveClass(/is-cold/);
+    expect(await saves(page)).toBe(1);
+    await save(row).click();
+    expect(await saves(page)).toBe(2);
+    await release(page, 'cancelled'); // dismissed: nothing was saved, the take stays ready
+    await expect(row).not.toHaveClass(/is-cold/);
+  });
+
+  test('a double tap on SAVE starts one save, not two; once it has answered the button works again', async ({ page }) => {
+    await open(page, { fakeSave: true });
+    await recordTake(page, 500);
+    const row = takeRows(page).first();
+    await save(row).dblclick();
+    expect(await saves(page)).toBe(1);
+    await save(row).click(); // still in flight
+    expect(await saves(page)).toBe(1);
+
+    await release(page, 'cancelled');
+    await expect(save(row)).not.toHaveClass(/is-saving/);
+    await save(row).click();
+    expect(await saves(page)).toBe(2);
+    await release(page, 'cancelled');
+  });
+
+  test('a double tap on SAVE MIX starts one save, not two', async ({ page }) => {
+    await open(page, { fakeSave: true });
+    await mix(page).click();
+    await expect(mix(page)).toHaveText('SAVE MIX');
+    await mix(page).dblclick();
+    expect(await saves(page)).toBe(1);
+    await mix(page).click();
+    expect(await saves(page)).toBe(1);
+
+    await release(page, 'cancelled'); // dismissed: the mix is still there
+    await expect(mix(page)).toHaveText('SAVE MIX');
+    await expect(mix(page)).not.toHaveClass(/is-saving/);
+    await mix(page).click();
+    expect(await saves(page)).toBe(2);
+    await release(page, 'saved');
+    await expect(mix(page)).toHaveText('LOOP MIX');
+  });
+
+  test('an engine that stops mid-take ends it: REC goes dark, the clock is reset and the take is listed', async ({ page }) => {
+    await open(page);
+    await rec(page).click();
+    await expect(rec(page)).toHaveClass(/is-on/);
+    await page.waitForTimeout(600);
+    await page.evaluate(() => window.__rec.recorder.halt()); // what the shell does when the host needs a resume
+    await expect(rec(page)).not.toHaveClass(/is-on/);
+    await expect(clock(page)).toHaveText('00:00');
+    await expect(takeRows(page)).toHaveCount(1);
+    await expect(page.locator('.rp-note')).toHaveText('AUDIO STOPPED: TAKE ENDED');
+  });
+
+  test('a worklet that goes silent is noticed by the watchdog without any tap', async ({ page }) => {
+    await open(page);
+    await rec(page).click();
+    await expect(rec(page)).toHaveClass(/is-on/);
+    await page.waitForTimeout(400);
+    await page.evaluate(() => {
+      window.__rec.engine.statuses = false; // statuses stop; (the sine blocks do too, once it is dead)
+    });
+    await expect(rec(page)).not.toHaveClass(/is-on/, { timeout: 5000 });
+    await expect(takeRows(page)).toHaveCount(1);
+    await expect(page.locator('.rp-note')).toHaveText('AUDIO STOPPED: TAKE ENDED');
   });
 });

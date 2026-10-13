@@ -1,7 +1,11 @@
 /**
  * Playwright harness for the recorder pod (tests/e2e/recorder.spec.ts): the real Recorder, Takes (IndexedDB), Controller,
- * saveFile and pod, with a fake engine that posts a 440 Hz sine in real time while the recorder is on. The database is
- * named by the `?db=` query parameter, so a spec can reload the page and find its takes again.
+ * saveFile and pod, with a fake engine that posts a 440 Hz sine in real time (and a status at 60 Hz, as the worklet
+ * does) while the recorder is on. Query parameters:
+ *  - `db`    the database name, so a spec can reload the page and find its takes again;
+ *  - `cache` the pod's `cacheBytes` (to exercise eviction with small takes);
+ *  - `save=fake` replaces `saveFile` with a stand-in that records each call and answers when the spec says
+ *    (`__rec.releaseSave(result)`), to hold a save in flight.
  *
  * It also stands in for the shell: Backquote calls `toggleRecord()`, as the input layer's `onSpecialKey('recorder')` will.
  */
@@ -9,9 +13,10 @@ import { Controller } from '../../../src/control/controller';
 import { FakeEngine, makeStatus } from '../../../src/control/fakeEngine';
 import type { RenderMixFn } from '../../../src/recorder/loopMix';
 import { Recorder } from '../../../src/recorder/recorder';
-import type { EngineCommand } from '../../../src/shared/protocol';
+import type { EngineCommand, EngineStatus } from '../../../src/shared/protocol';
 import type { TrackAudio } from '../../../src/shared/protocol';
 import { openDb } from '../../../src/storage/db';
+import type { SaveResult } from '../../../src/storage/share';
 import { Takes } from '../../../src/storage/takes';
 import { mountRecorderPod, toggleRecord } from '../../../src/ui/recorderPod';
 import type { RecorderPod } from '../../../src/ui/recorderPod';
@@ -24,7 +29,12 @@ const BLOCK = 4096;
 class HarnessEngine extends FakeEngine {
   /** How long `exportTracks` takes to answer (ms), so a spec can see PREPARING. */
   exportDelayMs = 0;
+  /** False: the engine goes quiet while recording (no statuses), like a worklet that has died. */
+  statuses = true;
+  /** What the periodic statuses are made from (two tracks playing). */
+  template: EngineStatus = makeStatus({ sampleRate: SR }, [{ state: 'playing' }, { state: 'playing' }]);
   private timer: ReturnType<typeof setInterval> | undefined;
+  private statusTimer: ReturnType<typeof setInterval> | undefined;
   private frame = 0;
 
   constructor() {
@@ -45,11 +55,15 @@ class HarnessEngine extends FakeEngine {
     if (cmd.t === 'recorder' && cmd.on) {
       this.frame = 0;
       this.timer = setInterval(() => this.block(BLOCK), (BLOCK / SR) * 1000);
+      this.statusTimer = setInterval(() => {
+        if (this.statuses) this.emit({ t: 'status', status: { ...this.template, frame: this.frame, recorderFrames: this.frame } });
+      }, 1000 / 60);
     } else if (cmd.t === 'recorder') {
       clearInterval(this.timer);
+      clearInterval(this.statusTimer);
       setTimeout(() => {
         this.block(1000);
-        this.emit({ t: 'status', status: makeStatus({ recorderFrames: null }) });
+        this.emit({ t: 'status', status: { ...this.template, frame: this.frame, recorderFrames: null } });
       }, 0);
     } else if (cmd.t === 'exportTracks') {
       const reqId = cmd.reqId;
@@ -90,6 +104,10 @@ export interface RecorderHarness {
   urls: { created: string[]; revoked: string[] };
   /** The `code` of every keydown the page saw (the pod must not need, or take, any key). */
   keyPresses: string[];
+  /** With `?save=fake`: every save the pod asked for. */
+  saves: { name: string; size: number }[];
+  /** With `?save=fake`: answers the oldest save still waiting. */
+  releaseSave(result: SaveResult): void;
 }
 
 declare global {
@@ -111,17 +129,30 @@ URL.revokeObjectURL = (url: string): void => {
   revoke(url);
 };
 
+const params = new URLSearchParams(location.search);
+const saves: { name: string; size: number }[] = [];
+const waiting: ((r: SaveResult) => void)[] = [];
+const fakeSave = (blob: Blob, name: string): Promise<SaveResult> => {
+  saves.push({ name, size: blob.size });
+  return new Promise((resolve) => waiting.push(resolve));
+};
+
 const root = document.getElementById('app');
 if (!root) throw new Error('recorder harness: #app missing');
-const dbName = new URLSearchParams(location.search).get('db') ?? `recorder-e2e-${Math.random().toString(36).slice(2)}`;
+const dbName = params.get('db') ?? `recorder-e2e-${Math.random().toString(36).slice(2)}`;
 
 const db = await openDb(dbName);
 const takes = new Takes(db);
 const engine = new HarnessEngine();
 const controller = new Controller(engine, memStores(), new FakeLcd());
-engine.emit({ t: 'status', status: makeStatus({ sampleRate: SR }, [{ state: 'playing' }, { state: 'playing' }]) });
+engine.emit({ t: 'status', status: engine.template });
 const recorder = new Recorder(engine, takes, SR);
-const pod = mountRecorderPod(root, recorder, controller, { render });
+const cache = params.get('cache');
+const pod = mountRecorderPod(root, recorder, controller, {
+  render,
+  ...(cache ? { cacheBytes: Number(cache) } : {}),
+  ...(params.get('save') === 'fake' ? { save: fakeSave } : {}),
+});
 
 const keyPresses: string[] = [];
 window.addEventListener('keydown', (e) => {
@@ -129,5 +160,15 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'Backquote' && !e.repeat) void toggleRecord();
 });
 
-window.__rec = { recorder, takes, controller, engine, pod, urls, keyPresses };
+window.__rec = {
+  recorder,
+  takes,
+  controller,
+  engine,
+  pod,
+  urls,
+  keyPresses,
+  saves,
+  releaseSave: (result) => waiting.shift()?.(result),
+};
 document.documentElement.dataset.ready = '1';

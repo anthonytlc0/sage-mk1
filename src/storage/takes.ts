@@ -7,7 +7,7 @@
  */
 
 import { EXPORT_RATE } from '../shared/constants';
-import { BY_TAKE, TAKES, TAKE_CHUNKS, reqP, writeTx } from './db';
+import { BY_TAKE, TAKES, TAKE_CHUNKS, reqP, toStorageError, writeTx } from './db';
 import { wavHeader } from './wav';
 
 interface TakeRecord {
@@ -81,15 +81,34 @@ export class Takes {
     return records.map((r) => ({ id: r.id, createdAt: r.createdAt, frames: r.frames }));
   }
 
-  /** The take as a 44.1 kHz stereo pcm24 WAV: header, then the chunks in append order. */
+  /**
+   * The take as a 44.1 kHz stereo pcm24 WAV: header, then the chunks in append order.
+   *
+   * The chunks are walked with a cursor and each is wrapped in a Blob as soon as it is read, so the take never exists
+   * as one big byte array (or as `getAll`'s array of every chunk) in script memory: at any moment only the chunk in
+   * hand is plain memory, and the browser owns the Blobs (and may keep them off the heap). The result is assembled from
+   * those Blobs behind the header.
+   */
   async blob(id: number): Promise<Blob> {
     const tx = this.db.transaction([TAKES, TAKE_CHUNKS], 'readonly');
     const exists = reqP<number>(tx.objectStore(TAKES).count(id));
-    const chunks = reqP<TakeChunkRecord[]>(tx.objectStore(TAKE_CHUNKS).index(BY_TAKE).getAll(IDBKeyRange.only(id)));
-    const [count, rows] = await Promise.all([exists, chunks]); // both settled, so a failed tx leaves nothing unhandled
+    const parts: Blob[] = [];
+    let total = 0;
+    const walked = new Promise<void>((resolve, reject) => {
+      // Equal index keys come back in primary-key (seq) order, which is append order.
+      const req = tx.objectStore(TAKE_CHUNKS).index(BY_TAKE).openCursor(IDBKeyRange.only(id));
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) return resolve();
+        const data = (cursor.value as TakeChunkRecord).data;
+        parts.push(new Blob([data])); // copies the chunk out of the cursor's value; `data` is garbage right after
+        total += data.byteLength;
+        cursor.continue();
+      };
+      req.onerror = () => reject(toStorageError(req.error));
+    });
+    const [count] = await Promise.all([exists, walked]); // both settled, so a failed tx leaves nothing unhandled
     if (count === 0) throw new Error(`take ${id} does not exist`);
-    const parts = rows.map((c) => c.data);
-    const total = parts.reduce((sum, p) => sum + p.byteLength, 0);
     const pad = total & 1 ? [new Uint8Array(1)] : []; // RIFF chunks are word aligned; wavHeader counts this byte
     const header = wavHeader(total, EXPORT_RATE, CHANNELS, 'pcm24') as Uint8Array<ArrayBuffer>; // wavHeader allocates a plain ArrayBuffer
     return new Blob([header, ...parts, ...pad], { type: 'audio/wav' });

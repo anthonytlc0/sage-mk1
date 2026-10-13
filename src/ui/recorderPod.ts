@@ -6,9 +6,14 @@
  *
  * iPad Safari (often a Home Screen web app) shapes it:
  *  - SAVE calls `saveFile` synchronously in the tap handler, because `navigator.share` needs the tap's user activation.
- *    So a take's Blob is assembled as soon as recording stops and kept (up to a memory cap), and LOOP MIX is two
- *    steps: the first tap renders it (PREPARING...), the button becomes SAVE MIX, and the second tap saves it.
- *    A take that is not in the cache (an old one, or one evicted) is prepared by the first tap, and used by the next.
+ *    So a take's Blob is assembled as soon as recording stops and kept, and LOOP MIX is two steps: the first tap
+ *    renders it (PREPARING...), the button becomes SAVE MIX, and the second tap saves it.
+ *  - Take Blobs live in memory, next to the engine's loops, so what the pod keeps is capped (`cacheBytes`, 64 MB by
+ *    default, about 4 minutes of take). Only a take that fits is prepared on its own; the oldest are evicted to make
+ *    room, and a Blob is dropped once it has been saved. A take that is not in the cache (an old one, an evicted one,
+ *    or one over the cap) is prepared by the first tap on its SAVE or play and used by the next. Such a Blob is held on
+ *    the user's request even when it is over the cap, but only one over-cap Blob at a time, and it is let go after the
+ *    save, after the playback, or after a minute unused.
  *  - The buttons are plain `div`s with pointer handlers, never focusable: Space, Enter and Tab belong to the panel's
  *    keyboard map, and a focused `<button>` would also click on Space.
  *
@@ -24,14 +29,17 @@ import { formatClock, mixFilename, takeFilename } from '../recorder/names';
 import type { Recorder, RecorderEvent } from '../recorder/recorder';
 import { QuotaError } from '../storage/db';
 import { saveFile } from '../storage/share';
+import type { SaveResult } from '../storage/share';
 import type { TakeInfo } from '../storage/takes';
 import { TakePlayer } from './takePlayer';
 
 export interface RecorderPodOptions {
   /** The mixer behind LOOP MIX: Task 9's `renderMix`. */
   render: RenderMixFn;
-  /** Most bytes of take Blobs kept ready for SAVE and play (the newest is always kept). Default 256 MB. */
+  /** Most bytes of take Blobs kept ready for SAVE and play. Default 64 MB (`DEFAULT_CACHE_BYTES`). */
   cacheBytes?: number;
+  /** Saves a file (the share sheet or a download). Default `saveFile`; a test passes a stand-in. */
+  save?: (blob: Blob, filename: string) => Promise<SaveResult>;
 }
 
 export interface RecorderPod {
@@ -41,12 +49,14 @@ export interface RecorderPod {
   dispose(): void;
 }
 
-export const DEFAULT_CACHE_BYTES = 256 * 1024 * 1024;
+export const DEFAULT_CACHE_BYTES = 64 * 1024 * 1024;
 /** How long a message, a SAVED / FAILED note and the armed DEL stay up. */
 const NOTE_MS = 2500;
 const SAVED_MS = 1500;
 const ARM_MS = 3000;
 const TICK_MS = 100;
+/** A Blob over the cache cap, held for a tap that asked for it, is let go after this long unused. */
+const OVERCAP_HOLD_MS = 60_000;
 /** U+FE0E asks for the text form: iOS draws a bare ▶ as an emoji. */
 const PLAY = '▶︎';
 const STOP = '■';
@@ -98,6 +108,8 @@ interface Row {
   save: HTMLElement;
   del: HTMLElement;
   preparing: boolean;
+  /** SAVE was tapped and `saveFile` has not answered yet: more taps are ignored. */
+  saving: boolean;
   armed: boolean;
   armTimer: ReturnType<typeof setTimeout> | undefined;
   /** SAVED / FAILED, shown in place of SAVE for a moment. */
@@ -108,6 +120,7 @@ interface Row {
 export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controller: Controller, opts: RecorderPodOptions): RecorderPod {
   const doc = root.ownerDocument;
   const cacheBytes = opts.cacheBytes ?? DEFAULT_CACHE_BYTES;
+  const save = opts.save ?? saveFile;
 
   // ------------------------------------------------------------------------------------------------------- DOM
   const pod = el(doc, 'div', 'recorder-pod');
@@ -134,8 +147,17 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
   const cache = new Map<number, Blob>();
   const audio = doc.createElement('audio');
   audio.preload = 'none';
-  const player = new TakePlayer(audio, undefined, () => rows.forEach(updateRow));
-  let mix: { phase: 'idle' | 'preparing' | 'ready'; blob: Blob | null; at: number } = { phase: 'idle', blob: null, at: 0 };
+  /** The take that was playing when the player last changed, to tell when a playback has ended. */
+  let wasPlaying: number | null = null;
+  const player = new TakePlayer(audio, undefined, () => {
+    const was = wasPlaying;
+    wasPlaying = player.playingId;
+    if (was !== null && was !== wasPlaying) dropIfOverCap(was); // played to the end, stopped or replaced
+    rows.forEach(updateRow);
+  });
+  /** Timers that let go of an over-cap Blob nobody used for a while. */
+  const holdTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  let mix: { phase: 'idle' | 'preparing' | 'ready'; blob: Blob | null; at: number; saving: boolean } = { phase: 'idle', blob: null, at: 0, saving: false };
   let noteTimer: ReturnType<typeof setTimeout> | undefined;
   let tickTimer: ReturnType<typeof setInterval> | undefined;
   let disposed = false;
@@ -187,8 +209,9 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
 
   const unsubscribe = recorder.onChange((e: RecorderEvent) => {
     syncRecording();
+    if (e.kind === 'halted') setNote('AUDIO STOPPED: TAKE ENDED', 6000);
     if (e.kind === 'error') setNote(e.error instanceof QuotaError ? 'MEMORY FULL: TAKE ENDED' : 'REC FAILED: TAKE ENDED', 6000);
-    if (e.kind === 'stop') void refresh().then(() => prepare(e.takeId));
+    if (e.kind === 'stop') void refresh().then(() => autoPrepare(e.takeId));
   });
 
   // ------------------------------------------------------------------------------------------------------- takes list
@@ -202,6 +225,7 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
     const cold = !cache.has(r.info.id);
     r.li.classList.toggle('is-cold', cold && !r.preparing);
     r.li.classList.toggle('is-preparing', r.preparing);
+    r.save.classList.toggle('is-saving', r.saving);
     r.li.classList.toggle('is-playing', player.playingId === r.info.id);
     r.len.textContent = lengthText(r);
     r.play.textContent = player.playingId === r.info.id ? STOP : PLAY;
@@ -223,7 +247,7 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
     const save = button(doc, 'rp-save', 'save', 'Save take', 'SAVE');
     const del = button(doc, 'rp-del', 'del', 'Delete take', 'DEL');
     li.append(play, meta, save, del);
-    const row: Row = { info, li, len, play, save, del, preparing: false, armed: false, armTimer: undefined, note: null, noteTimer: undefined };
+    const row: Row = { info, li, len, play, save, del, preparing: false, saving: false, armed: false, armTimer: undefined, note: null, noteTimer: undefined };
     updateRow(row);
     return row;
   }
@@ -232,7 +256,7 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
     clearTimeout(r.armTimer);
     clearTimeout(r.noteTimer);
     player.forget(r.info.id);
-    cache.delete(r.info.id);
+    uncache(r.info.id);
     rows.delete(r.info.id);
     r.li.remove();
   }
@@ -267,27 +291,71 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
   }
 
   // ------------------------------------------------------------------------------------------------------- blob cache
-  function remember(id: number, blob: Blob): void {
+  /** Lets go of take `id`'s cached Blob (the row becomes cold: its next SAVE or play prepares it again). */
+  function uncache(id: number): void {
     cache.delete(id);
+    clearTimeout(holdTimers.get(id));
+    holdTimers.delete(id);
+  }
+
+  /**
+   * Keeps `blob` for take `id`, evicting the oldest others until the cache fits `cacheBytes`. Without `requested`, a Blob
+   * over the cap is not kept at all. With it (a tap asked for this take) it is kept even over the cap, alone: the next
+   * Blob remembered evicts it, and it is let go after a minute unused.
+   */
+  function remember(id: number, blob: Blob, requested: boolean): void {
+    uncache(id);
+    const r = rows.get(id);
+    if (blob.size > cacheBytes && !requested) {
+      if (r) updateRow(r);
+      return;
+    }
     cache.set(id, blob);
     let total = 0;
     for (const b of cache.values()) total += b.size;
     for (const [oldId, b] of cache) {
       if (total <= cacheBytes || oldId === id) break;
-      cache.delete(oldId);
+      uncache(oldId);
       total -= b.size;
-      const r = rows.get(oldId);
-      if (r) updateRow(r);
+      const old = rows.get(oldId);
+      if (old) updateRow(old);
     }
+    if (blob.size > cacheBytes) {
+      holdTimers.set(
+        id,
+        setTimeout(() => {
+          holdTimers.delete(id);
+          if (player.playingId === id) return remember(id, blob, true); // still playing: hold on
+          uncache(id);
+          const row = rows.get(id);
+          if (row) updateRow(row);
+        }, OVERCAP_HOLD_MS),
+      );
+    }
+    if (r) updateRow(r);
+  }
+
+  /** A playback of take `id` is over: an over-cap Blob is not kept for it. */
+  function dropIfOverCap(id: number): void {
+    const blob = cache.get(id);
+    if (blob && blob.size > cacheBytes) uncache(id);
+  }
+
+  /** After a take is finished: prepare it on the pod's own initiative if it fits the cache. */
+  function autoPrepare(id: number): void {
+    const frames = rows.get(id)?.info.frames;
+    if (frames === null || frames === undefined) return;
+    if (WAV_HEADER_BYTES + frames * PCM24_FRAME_BYTES > cacheBytes) return; // stays cold: a tap prepares it
+    void prepare(id, false);
   }
 
   /** Assembles take `id`'s Blob into the cache (the take must be listed). Resolves null if that failed. */
-  async function prepare(id: number): Promise<Blob | null> {
+  async function prepare(id: number, requested: boolean): Promise<Blob | null> {
     const r = rows.get(id);
     if (!r) return null;
     const hit = cache.get(id);
     if (hit) {
-      remember(id, hit); // most recently used
+      remember(id, hit, requested); // most recently used
       return hit;
     }
     if (r.preparing) return null;
@@ -296,7 +364,7 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
     try {
       const blob = await recorder.takes.blob(id);
       if (!rows.has(id) || disposed) return null; // deleted meanwhile
-      remember(id, blob);
+      remember(id, blob, requested);
       return blob;
     } catch (e) {
       console.error('assembling take failed', e);
@@ -312,34 +380,42 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
   function playTap(r: Row): void {
     const blob = cache.get(r.info.id);
     if (!blob) {
-      void prepare(r.info.id);
+      void prepare(r.info.id, true);
       return;
     }
-    remember(r.info.id, blob);
+    remember(r.info.id, blob, true);
     player.toggle(r.info.id, blob); // synchronous: iOS only starts audio inside the gesture
   }
 
   function saveTap(r: Row): void {
+    if (r.saving) return; // a share sheet or download is already on its way
     const blob = cache.get(r.info.id);
     if (!blob) {
-      void prepare(r.info.id);
+      void prepare(r.info.id, true);
       return;
     }
+    r.saving = true;
+    updateRow(r);
     // Synchronous, with nothing awaited before it: the share sheet needs this tap's user activation.
-    const result = saveFile(blob, takeFilename(r.info.createdAt));
-    void result.then((res) => {
-      if (res === 'cancelled' || disposed) return;
-      r.note = res === 'saved' ? 'SAVED' : 'FAILED';
+    const result = save(blob, takeFilename(r.info.createdAt));
+    const settle = (res: SaveResult): void => {
+      r.saving = false;
+      if (disposed) return;
+      if (res === 'saved') uncache(r.info.id); // the file is out: do not keep the take in memory
+      if (res !== 'cancelled') {
+        r.note = res === 'saved' ? 'SAVED' : 'FAILED';
+        clearTimeout(r.noteTimer);
+        r.noteTimer = setTimeout(
+          () => {
+            r.note = null;
+            updateRow(r);
+          },
+          res === 'saved' ? SAVED_MS : NOTE_MS,
+        );
+      }
       updateRow(r);
-      clearTimeout(r.noteTimer);
-      r.noteTimer = setTimeout(
-        () => {
-          r.note = null;
-          updateRow(r);
-        },
-        res === 'saved' ? SAVED_MS : NOTE_MS,
-      );
-    });
+    };
+    result.then(settle, () => settle('failed'));
   }
 
   function delTap(r: Row): void {
@@ -373,16 +449,16 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
   }
 
   async function renderMix(): Promise<void> {
-    mix = { phase: 'preparing', blob: null, at: 0 };
+    mix = { phase: 'preparing', blob: null, at: 0, saving: false };
     syncMix();
     try {
       await afterPaint(); // the label shows before the render takes the thread
       const blob = await exportLoopMix(controller, opts.render);
       if (disposed) return;
-      mix = { phase: 'ready', blob, at: Date.now() };
+      mix = { phase: 'ready', blob, at: Date.now(), saving: false };
     } catch (e) {
       if (!(e instanceof NothingToMixError)) console.error('loop mix failed', e);
-      mix = { phase: 'idle', blob: null, at: 0 };
+      mix = { phase: 'idle', blob: null, at: 0, saving: false };
       setNote(e instanceof NothingToMixError ? 'NOTHING PLAYING' : 'MIX FAILED');
     }
     syncMix();
@@ -390,15 +466,20 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
 
   function saveMix(): void {
     const { blob, at } = mix;
-    if (!blob) return;
-    const result = saveFile(blob, mixFilename(at)); // synchronous, as for a take
-    void result.then((res) => {
+    if (!blob || mix.saving) return; // already on its way
+    mix.saving = true;
+    mixBtn.classList.add('is-saving');
+    const result = save(blob, mixFilename(at)); // synchronous, as for a take
+    const settle = (res: SaveResult): void => {
+      mixBtn.classList.remove('is-saving');
       if (disposed) return;
+      mix.saving = false;
       if (res === 'saved') {
-        mix = { phase: 'idle', blob: null, at: 0 };
+        mix = { phase: 'idle', blob: null, at: 0, saving: false };
         syncMix();
       } else if (res === 'failed') setNote('SAVE FAILED');
-    });
+    };
+    result.then(settle, () => settle('failed'));
   }
 
   // ------------------------------------------------------------------------------------------------------- taps
@@ -419,7 +500,7 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
         else if (mix.phase === 'ready') saveMix();
         break;
       case 'mix-discard':
-        mix = { phase: 'idle', blob: null, at: 0 };
+        mix = { phase: 'idle', blob: null, at: 0, saving: false };
         syncMix();
         break;
       case 'play':
@@ -452,6 +533,8 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
         clearTimeout(r.noteTimer);
       }
       player.dispose();
+      for (const t of holdTimers.values()) clearTimeout(t);
+      holdTimers.clear();
       cache.clear();
       rows.clear();
       pod.remove();
