@@ -272,7 +272,8 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
   /**
    * Closes the mic and opens it again with the current SETUP MIC PROCESS (echoCancellation): the old tracks are
    * stopped first (a second getUserMedia mutes the first on iOS), then the new stream is connected to the worklet.
-   * If no mic can be had it emits NO INPUT and asks for TAP POWER TO RESUME (as a lost mic does). Never rejects.
+   * If no mic can be had it emits NO INPUT, and asks for TAP POWER TO RESUME only when a mic worked before (as a lost
+   * mic does); a host that never had one stays NO INPUT only. Never rejects.
    * A `settings` command with a new MIC PROCESS calls it too, and the controller calls it through its `restartMic`
    * hook: a request made while one is queued and not yet started joins it, so the two give one reopen; a request made
    * while one runs queues another, so the last setting always wins.
@@ -282,8 +283,15 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
     const run = this.serial(async () => {
       this.micRestart = null; // started: a later request queues a new restart
       if (this.stopped) return;
-      if (!(await this.reopenMic()) && !this.stopped) this.lostAudio();
-    }).catch((e: unknown) => this.log('engine: mic restart failed', e));
+      if (await this.reopenMic()) return;
+      if (this.stopped) return;
+      // A mic that worked before is lost audio (TAP POWER TO RESUME); without ever having had one (a desktop with no
+      // mic) it is NO INPUT only, as at power-on: the looper works without input and a resume could not help.
+      if (this.micExpected) this.lostAudio();
+      else this.dispatch(NO_INPUT);
+    }).catch((e: unknown) => {
+      this.log('engine: mic restart failed', e);
+    });
     this.micRestart = run;
     return run;
   }

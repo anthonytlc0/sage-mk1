@@ -70,7 +70,6 @@ export interface ControllerOptions {
 /** What FACTORY RESET returns to the factory state (Owner's Manual p. 24). */
 export type FactoryResetTarget = (typeof FACTORY_RESET_TARGETS)[number];
 
-
 /** How long a popup message stays up by default. */
 // INFERRED: the manual gives no time; the plan's NO INPUT case uses 2 s.
 export const MESSAGE_MS = 2000;

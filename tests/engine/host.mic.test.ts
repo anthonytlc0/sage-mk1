@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { defaultSystem } from '../../src/schema/system';
 import { freeSettings } from './helpers';
-import { FakeNav, settle, startHost } from './hostFakes';
+import { FakeContext, FakeNav, settle, startHost } from './hostFakes';
 
 describe('EngineHost.restartMic (MENU > SETUP > MIC PROCESS)', () => {
   it('stops the old tracks, asks for the mic again with the current echoCancellation, and reconnects it', async () => {
@@ -47,7 +47,7 @@ describe('EngineHost.restartMic (MENU > SETUP > MIC PROCESS)', () => {
     expect(live).toHaveLength(1);
   });
 
-  it('gives NO INPUT when the mic cannot be had again', async () => {
+  it('a host that had a mic and cannot get it back gives NO INPUT and asks for TAP POWER TO RESUME', async () => {
     const nav = new FakeNav();
     const rig = await startHost({ nav, system: defaultSystem() });
     nav.fail = true;
@@ -55,6 +55,36 @@ describe('EngineHost.restartMic (MENU > SETUP > MIC PROCESS)', () => {
     await settle();
     expect(rig.host.micAvailable).toBe(false);
     expect(rig.events.some((e) => e.t === 'message' && e.text === 'NO INPUT')).toBe(true);
+    expect(rig.host.needsResume).toBe(true);
+  });
+
+  it('a host that never had a mic (a desktop without one) gives NO INPUT only: no TAP POWER TO RESUME', async () => {
+    const nav = new FakeNav();
+    nav.fail = true;
+    const rig = await startHost({ nav });
+    await settle();
+    // MENU > SETUP > MIC PROCESS: the settings path skips a host without a stream, the controller hook still calls
+    rig.host.send(freeSettings((_m, s) => {
+      s.setup.micProcess = true;
+    }));
+    await rig.host.restartMic();
+    await settle();
+    expect(nav.constraints).toHaveLength(2); // it did try
+    expect(rig.events.filter((e) => e.t === 'message' && e.text === 'NO INPUT').length).toBeGreaterThanOrEqual(1);
+    expect(rig.host.needsResume).toBe(false);
+  });
+
+  it('never rejects, even when reconnecting the mic throws', async () => {
+    const rig = await startHost();
+    rig.ctx.createMediaStreamSource = () => {
+      throw new Error('boom');
+    };
+    await expect(rig.host.restartMic()).resolves.toBeUndefined();
+    expect(rig.logs.some(([m]) => m === 'engine: mic restart failed')).toBe(true);
+    // and a later restart still runs
+    rig.ctx.createMediaStreamSource = FakeContext.prototype.createMediaStreamSource.bind(rig.ctx);
+    await expect(rig.host.restartMic()).resolves.toBeUndefined();
+    expect(rig.host.micAvailable).toBe(true);
   });
 
   it('does nothing once the host is stopped', async () => {
