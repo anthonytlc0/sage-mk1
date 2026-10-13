@@ -7,7 +7,8 @@
  *  - It is a `div` with role="switch", never focusable: Space and Enter belong to the panel's keyboard map.
  *  - The prompt covers the panel (so taps on a looper without audio do nothing) but not the shelf: POWER and the
  *    recorder pod stay usable above it. A tap on the prompt itself always retries the resume. Once a retry has failed
- *    the prompt says the next POWER tap switches off (ruling R58), and the POWER LED blinks faster.
+ *    (or one has gone unanswered for a while) the prompt says the next POWER tap switches off (ruling R58), and the
+ *    POWER LED blinks faster.
  */
 
 import type { PowerState, ResumePrompt } from '../app/unit';
@@ -16,6 +17,7 @@ import type { PowerState, ResumePrompt } from '../app/unit';
 const PROMPT_TEXT: Record<Exclude<ResumePrompt, 'none'>, readonly [string, string, string]> = {
   resume: ['AUDIO STOPPED', 'TAP POWER TO RESUME', ''],
   resuming: ['AUDIO STOPPED', 'RESUMING...', ''],
+  slow: ['NOT RESPONDING', 'TAP POWER TO SWITCH OFF', ''],
   off: ['RESUME FAILED', 'TAP POWER TO SWITCH OFF', 'TAP HERE TO TRY AGAIN'],
 };
 

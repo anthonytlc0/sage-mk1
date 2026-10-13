@@ -181,8 +181,9 @@ body {
   animation: power-blink 0.5s steps(1, end) infinite;
 }
 
-/* After a failed resume the next POWER tap switches off: the LED blinks fast. */
-.power-switch[data-resume='off'] .power-led {
+/* After a failed (or unanswered) resume the next POWER tap switches off: the LED blinks fast. */
+.power-switch[data-resume='off'] .power-led,
+.power-switch[data-resume='slow'] .power-led {
   animation: power-blink 0.16s steps(1, end) infinite;
 }
 
@@ -228,6 +229,7 @@ body {
 
 .power-switch[data-resume='resume'],
 .power-switch[data-resume='resuming'],
+.power-switch[data-resume='slow'],
 .power-switch[data-resume='off'] {
   border-color: #6b2125;
   box-shadow:

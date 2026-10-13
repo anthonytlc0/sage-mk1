@@ -70,7 +70,7 @@ export async function bootApp(root: HTMLElement): Promise<void> {
   root.append(shelf);
 
   const unit = new SageUnit({
-    stores: openStores(),
+    openStores: () => openStores(),
     startEngine: (system) => EngineHost.start(system ? { system } : {}),
     requestPersistence,
     mountPod: (recorder, controller) => mountRecorderPod(shelf, recorder, controller, { render: getLoopMixRenderer() }),

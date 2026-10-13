@@ -132,8 +132,9 @@ interface RigOptions {
   engine?: (log: string[]) => ShellFake;
   startEngine?: UnitDeps['startEngine'];
   bootMs?: number;
-  /** What the unit gets as its stores (default: the opened, seeded stores). */
-  stores?: (opened: ShellStores) => Promise<ShellStores>;
+  /** What each open of the stores gives the unit (default: the opened, seeded stores); `call` counts from 1. */
+  stores?: (opened: ShellStores, call: number) => Promise<ShellStores>;
+  resumeOffAfterMs?: number;
   storageTimeoutMs?: number;
   abortAfterMs?: number;
 }
@@ -156,9 +157,13 @@ async function rig(opts: RigOptions = {}) {
       }),
   );
   const requestPersistence = vi.fn(async () => true);
-  const unitStores = opts.stores ? opts.stores(stores) : Promise.resolve(stores);
+  let opens = 0;
+  const openFn = vi.fn((): Promise<ShellStores> => {
+    opens++;
+    return opts.stores ? opts.stores(stores, opens) : Promise.resolve(stores);
+  });
   const unit = new SageUnit({
-    stores: unitStores,
+    openStores: openFn,
     startEngine,
     requestPersistence,
     mountPod: () => {
@@ -172,10 +177,11 @@ async function rig(opts: RigOptions = {}) {
     bootMs: opts.bootMs ?? 20,
     ...(opts.storageTimeoutMs !== undefined ? { storageTimeoutMs: opts.storageTimeoutMs } : {}),
     ...(opts.abortAfterMs !== undefined ? { abortAfterMs: opts.abortAfterMs } : {}),
+    ...(opts.resumeOffAfterMs !== undefined ? { resumeOffAfterMs: opts.resumeOffAfterMs } : {}),
   });
   units.push(unit);
   if (!opts.stores) await unit.ready(); // the stored system settings are read ahead of the POWER tap
-  return { unit, stores, engine, win, doc, wakeLock, pods, started, startEngine, requestPersistence, log };
+  return { unit, stores, engine, win, doc, wakeLock, pods, started, startEngine, requestPersistence, openStores: openFn, log };
 }
 
 type Rig = Awaited<ReturnType<typeof rig>>;
@@ -473,6 +479,29 @@ describe('SageUnit: TAP POWER TO RESUME', () => {
   });
 });
 
+describe('SageUnit: a resume that never answers', () => {
+  it('POWER is ignored at first, then (after the resume has run for a while) switches off by the normal path', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()), resumeOffAfterMs: 60 });
+    await powerOn(r);
+    const clean = vi.spyOn(r.stores.recovery, 'markCleanShutdown');
+    r.engine.resumeGate = new Promise(() => {}); // getUserMedia never answers
+    r.engine.setNeedsResume(true);
+    r.unit.tap();
+    expect(r.unit.resumePrompt).toBe('resuming');
+    r.unit.tap(); // too soon: still trying
+    expect(r.unit.state).toBe('on');
+    await sleep(80);
+    expect(r.unit.resumePrompt).toBe('slow'); // the prompt now says POWER switches off
+    r.unit.retryResume(); // a prompt tap cannot start another: one is still running
+    expect(r.engine.resumes).toHaveLength(1);
+    r.unit.tap();
+    await r.unit.settled();
+    expect(r.unit.state).toBe('off');
+    expect(r.engine.stopped).toBe(true);
+    expect(clean).toHaveBeenCalled();
+  });
+});
+
 // ---------------------------------------------------------------------------------------------------------- power-off
 
 describe('SageUnit: POWER off and page hide', () => {
@@ -611,11 +640,53 @@ describe('SageUnit: a power-on that cannot finish', () => {
     err.mockRestore();
   });
 
-  it('memory 01 that never loads: STORAGE ERROR, the controller let go, the engine stopped', async () => {
-    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+  it('memory 01 loading slower than the storage timeout (a big phrase on an old iPad) still powers on', async () => {
+    const r = await rig({
+      seed: (s) => s.system.save(calibrated()),
+      stores: async (s) => {
+        const load = s.memories.load.bind(s.memories);
+        s.memories.load = async (slot) => {
+          await sleep(150);
+          return load(slot);
+        };
+        return s;
+      },
+      storageTimeoutMs: 40,
+    });
+    r.unit.tap();
+    await r.unit.settled();
+    expect(r.unit.state).toBe('on');
+    expect(r.unit.error).toBeNull();
+    expect(r.unit.menu!.depth).toBe(1); // the play screen
+    expect(r.engine.stopped).toBe(false);
+  });
+
+  it('memory 01 that never loads is not timed out: the unit waits, and POWER (after the abort time) abandons it', async () => {
     const r = await rig({
       stores: async (s) => {
         s.memories.load = () => never();
+        return s;
+      },
+      storageTimeoutMs: 40,
+      abortAfterMs: 80,
+    });
+    r.unit.tap();
+    await sleep(120);
+    expect(r.unit.state).toBe('booting');
+    r.unit.tap();
+    await r.unit.settled();
+    expect(r.unit.state).toBe('off');
+    expect(r.unit.error).toBeNull();
+    expect(r.unit.controller).toBeNull();
+    expect(r.engine.stopped).toBe(true);
+    expect(r.pods).toEqual([]);
+  });
+
+  it('system settings that never load: STORAGE ERROR after the timeout, the engine stopped', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const r = await rig({
+      stores: async (s) => {
+        s.system.load = () => never();
         return s;
       },
       storageTimeoutMs: 40,
@@ -624,9 +695,45 @@ describe('SageUnit: a power-on that cannot finish', () => {
     await r.unit.settled();
     expect(r.unit.state).toBe('off');
     expect(r.unit.error).toBe('STORAGE ERROR');
-    expect(r.unit.controller).toBeNull();
     expect(r.engine.stopped).toBe(true);
-    expect(r.pods).toEqual([]);
+    err.mockRestore();
+  });
+
+  it('storage that failed to open is opened again at the next power-on', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const r = await rig({
+      seed: (s) => s.system.save(calibrated()),
+      // the open at load fails, and so does the one the first power-on tries again
+      stores: (s, call) => (call <= 2 ? Promise.reject(new Error('open failed')) : Promise.resolve(s)),
+    });
+    await sleep(0);
+    r.unit.tap();
+    await r.unit.settled();
+    expect(r.unit.error).toBe('STORAGE ERROR');
+    expect(r.openStores).toHaveBeenCalledTimes(2);
+    await powerOn(r);
+    expect(r.unit.state).toBe('on');
+    expect(r.openStores).toHaveBeenCalledTimes(3);
+    r.unit.tap(); // and an open that worked is kept
+    await r.unit.settled();
+    await powerOn(r);
+    expect(r.openStores).toHaveBeenCalledTimes(3);
+    err.mockRestore();
+  });
+
+  it('storage whose open timed out is opened again at the next power-on', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const r = await rig({
+      seed: (s) => s.system.save(calibrated()),
+      stores: (s, call) => (call === 1 ? never() : Promise.resolve(s)),
+      storageTimeoutMs: 40,
+    });
+    r.unit.tap();
+    await r.unit.settled();
+    expect(r.unit.error).toBe('STORAGE ERROR');
+    await powerOn(r);
+    expect(r.unit.state).toBe('on');
+    expect(r.openStores).toHaveBeenCalledTimes(2);
     err.mockRestore();
   });
 
