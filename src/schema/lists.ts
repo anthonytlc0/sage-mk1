@@ -83,5 +83,8 @@ export const DISPLAY_MODES = ['MEMORY NUMBER', 'TRACK STATUS', 'LOOP TRACKS', 'L
 export const INDICATOR_MODES = ['STATUS', 'LOOP POSITION', 'LEVEL'] as const;
 export const LOOP_STATUS_COLORS = ['OFF', 'RED', 'GREEN', 'AMBER', 'BLUE', 'PURPLE', 'CYAN', 'WHITE'] as const;
 
-/** FACTORY RESET is an action, not a stored parameter. */
-export const FACTORY_RESET_TARGETS = ['MEMORY', 'SYSTEM', 'MEM+SYS'] as const;
+/**
+ * FACTORY RESET is an action, not a stored parameter. Labelled as on the Owner's Manual p. 24 (the Parameter Guide's
+ * table abbreviates the last one to MEM+SYS).
+ */
+export const FACTORY_RESET_TARGETS = ['MEMORY', 'SYSTEM', 'MEMORY+SYSTEM'] as const;

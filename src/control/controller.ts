@@ -11,14 +11,17 @@
 
 import { faderGain } from '../dsp/mixer';
 import { Framebuffer } from '../lcd/framebuffer';
-import { defaultMemory } from '../schema/params';
-import type { MemorySettings } from '../schema/types';
+import { defaultMemory, defaultSystem } from '../schema/params';
+import type { FACTORY_RESET_TARGETS } from '../schema/params';
+import type { MemorySettings, SystemSettings } from '../schema/types';
 import { TRACKS } from '../shared/ids';
 import type { ButtonId, ControlEvent } from '../shared/ids';
 import { STATUS_HZ } from '../shared/constants';
 import type { PanelState } from '../shared/panel';
 import type { EngineCommand, EngineEvent, EngineStatus, TrackAudio } from '../shared/protocol';
 import { QuotaError } from '../storage/db';
+import { FileTooLarge, defaultMaxDecodedBytes } from '../storage/memoryFile';
+import type { BackupContents, MemoryContents } from '../storage/memoryFile';
 import { SLOT_COUNT } from '../storage/memoryStore';
 import type { MemoryStore } from '../storage/memoryStore';
 import type { Recovery } from '../storage/recovery';
@@ -57,7 +60,15 @@ export interface Stores {
 export interface ControllerOptions {
   /** Where `pagehide` is listened for; defaults to `window` when there is one. */
   events?: Pick<EventTarget, 'addEventListener' | 'removeEventListener'>;
+  /**
+   * Reopens the mic with the current SETUP MIC PROCESS (the app passes `() => host.restartMic()`). Called after the
+   * new settings have gone to the engine whenever MIC PROCESS changes.
+   */
+  restartMic?: () => Promise<void>;
 }
+
+/** What FACTORY RESET returns to the factory state (Owner's Manual p. 24). */
+export type FactoryResetTarget = (typeof FACTORY_RESET_TARGETS)[number];
 
 /** How long a popup message stays up by default. */
 // INFERRED: the manual gives no time; the plan's NO INPUT case uses 2 s.
@@ -68,6 +79,8 @@ export const CHECKPOINT_DEBOUNCE_MS = 2000;
 export const SYSTEM_SAVE_DEBOUNCE_MS = 500;
 /** `exportTracks` gives up when the engine has not answered by then. */
 export const EXPORT_TIMEOUT_MS = 20000;
+/** `calibrate` gives up when the engine has not answered by then (the measurement itself takes 4.5 s). */
+export const CALIBRATE_TIMEOUT_MS = 10000;
 /**
  * Statuses (about half a second) after which tempos sent but never echoed are taken as overtaken by the engine (it
  * changed the tempo right after applying them), so its own tempo can be adopted. Real echoes take a few statuses.
@@ -131,6 +144,15 @@ class TempoEcho {
 
 const EMPTY_TRACKS = (): (TrackAudio | null)[] => TRACKS.map(() => null);
 
+/**
+ * What a LATENCY calibration recorded: the mic capture, and the frames at which the clicks were played, as indices
+ * into `capture` (capture-relative, not status or context frames; see engine/calibration.ts).
+ */
+export interface Calibration {
+  capture: Float32Array;
+  clickFrames: number[];
+}
+
 export class Controller {
   readonly session = new Session();
   private _status: EngineStatus | null = null;
@@ -151,6 +173,8 @@ export class Controller {
   private systemSaveTimer: ReturnType<typeof setTimeout> | undefined;
   private nextReqId = 1;
   private readonly exports = new Map<number, { resolve: (tracks: (TrackAudio | null)[]) => void; timer: ReturnType<typeof setTimeout> }>();
+  private readonly calibrations = new Map<number, { resolve: (r: Calibration) => void; timer: ReturnType<typeof setTimeout> }>();
+  private readonly restartMic: ControllerOptions['restartMic'];
   private readonly tempoEcho = new TempoEcho();
   /** Counts the engine's audioDirty pulses, so WRITE can tell whether the audio changed while it was saving. */
   private audioSeq = 0;
@@ -183,6 +207,7 @@ export class Controller {
     this.unsubscribe = engine.on((e) => this.onEngineEvent(e));
     this.events = opts.events ?? (typeof window !== 'undefined' ? window : undefined);
     this.events?.addEventListener('pagehide', this.onPageHideListener);
+    this.restartMic = opts.restartMic;
   }
 
   /** The latest engine status, or null before the first one. */
@@ -242,16 +267,18 @@ export class Controller {
     this._now = t;
     this.fb.clear();
     this.lcd.render(this.fb, this);
-    return this.panel.update(this._status, this.session.memory, this.session.system, this.buttons.undoMode, this.fb.data);
+    return this.panel.update(this._status, this.session.memory, this.session.effectiveSystem, this.buttons.undoMode, this.fb.data);
   }
 
   /**
    * Validates and stores a parameter (memory or system, by its schema scope) and pushes `settings` to the engine.
-   * `track` is the index of a `*` id. A tempo change also sends `tempo`, so the transport and `memory.tempo` never
-   * disagree. A system change is saved to the system store shortly after. A value that does not change sends nothing.
-   * Throws for an unknown id or a bad value or index.
+   * `track` is the index of a `*` id (a track, or a key such as 'MIC1'). A tempo change also sends `tempo`, so the
+   * transport and `memory.tempo` never disagree. A system change is saved to the system store shortly after; a system
+   * parameter whose PREFERENCE is MEMORY goes into the memory instead (`memory.prefs`, unsaved until WRITE). A MIC
+   * PROCESS change also reopens the mic (the `restartMic` option). A value that does not change sends nothing. Throws
+   * for an unknown id or a bad value or index.
    */
-  setParam(id: string, value: unknown, track?: number): void {
+  setParam(id: string, value: unknown, track?: number | string): void {
     const { scope, changed } = this.session.set(id, value, track);
     if (!changed) return;
     if (scope === 'system') this.scheduleSystemSave();
@@ -261,6 +288,7 @@ export class Controller {
       this.tempoEcho.sent(bpm);
       this.engine.send({ t: 'tempo', bpm });
     }
+    if (id === 'setup.micProcess') this.reopenMic();
   }
 
   /**
@@ -282,6 +310,7 @@ export class Controller {
   async write(slot: number): Promise<'ok' | 'NOT EMPTY' | 'MEMORY FULL'> {
     if (slot !== this.session.slot && (await this.stores.memories.hasAudio(slot))) return 'NOT EMPTY';
     const seq = this.loadSeq;
+    this.session.snapshotPrefs(); // the PREFERENCE = MEMORY groups are saved with the memory
     const settings = structuredClone(this.session.memory);
     const audioSeq = this.audioSeq;
     const tracks = await this.requestTracks();
@@ -351,6 +380,135 @@ export class Controller {
     });
   }
 
+  /**
+   * LATENCY calibration: has the engine play its clicks and record the mic (`calibrate`), and resolves with what it
+   * recorded. Rejects if the engine has not answered within CALIBRATE_TIMEOUT_MS.
+   */
+  requestCalibration(): Promise<Calibration> {
+    const reqId = this.nextReqId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.calibrations.delete(reqId);
+        reject(new Error(`engine did not return a calibration for request ${reqId}`));
+      }, CALIBRATE_TIMEOUT_MS);
+      this.calibrations.set(reqId, { resolve, timer });
+      this.engine.send({ t: 'calibrate', reqId });
+    });
+  }
+
+  /**
+   * RECOVER? ENTER: the crash checkpoint becomes the current memory again, in the slot it was made in, as unsaved
+   * work (WRITE saves it). The checkpoint is kept until the memory is saved or replaced, so a second crash still has it.
+   */
+  restoreRecovery(rec: { slot: number; settings: MemorySettings; tracks: (TrackAudio | null)[] }): void {
+    ++this.loadSeq;
+    this.loadSession(rec.slot, rec.settings, rec.tracks, false);
+    this.session.paramsDirty = true;
+    if (rec.tracks.some((t) => t !== null)) this.session.audioDirty = true;
+  }
+
+  /**
+   * Replaces the system settings (FACTORY RESET SYSTEM, RESTORE ALL): pushed to the engine and saved at once. A
+   * different MIC PROCESS reopens the mic.
+   */
+  async replaceSystem(system: SystemSettings): Promise<void> {
+    const micBefore = this.session.system.setup.micProcess;
+    this.session.system = system;
+    this.pushSettings();
+    if (system.setup.micProcess !== micBefore) this.reopenMic();
+    clearTimeout(this.systemSaveTimer);
+    this.systemSaveTimer = undefined;
+    await this.saveSystem();
+  }
+
+  /**
+   * FACTORY RESET (Owner's Manual p. 24): MEMORY clears memories 01-99 (and so the current memory, unsaved work
+   * included); SYSTEM restores `defaultSystem()`; MEMORY+SYSTEM does both. When clearing fails partway the error is
+   * passed on, but the current memory is reloaded from what storage holds first, so the session never claims a
+   * cleared slot still holds its old, saved memory.
+   */
+  async factoryReset(target: FactoryResetTarget): Promise<void> {
+    if (target !== 'SYSTEM') {
+      try {
+        for (let slot = 1; slot <= SLOT_COUNT; slot++) await this.stores.memories.clear(slot);
+      } finally {
+        await this.selectMemory(this.session.slot);
+      }
+    }
+    if (target !== 'MEMORY') await this.replaceSystem(defaultSystem());
+  }
+
+  /**
+   * IMPORT MEMORY: stores an imported memory in `slot`. A slot holding a phrase is refused with NOT EMPTY (as WRITE
+   * does), and so is the current memory while it holds unsaved work. Importing into the current memory loads it.
+   * MEMORY FULL when storage refuses the write.
+   */
+  async importMemory(slot: number, contents: MemoryContents): Promise<'ok' | 'NOT EMPTY' | 'MEMORY FULL'> {
+    if ((slot === this.session.slot && this.session.dirty) || (await this.stores.memories.hasAudio(slot))) return 'NOT EMPTY';
+    try {
+      await this.stores.memories.save(slot, contents.settings, contents.tracks);
+    } catch (e) {
+      if (e instanceof QuotaError) return 'MEMORY FULL';
+      throw e;
+    }
+    if (slot === this.session.slot) await this.selectMemory(slot);
+    return 'ok';
+  }
+
+  /** EXPORT MEMORY: the current memory as it is now (unsaved edits and PREFERENCE = MEMORY groups included) and its audio. */
+  async exportCurrent(): Promise<MemoryContents> {
+    const settings = this.session.memoryForSave();
+    const tracks = await this.requestTracks();
+    return { settings, tracks };
+  }
+
+  /**
+   * BACKUP ALL: the 99 stored memories (null for an empty slot) and the system settings. The memories are loaded one
+   * by one with a running total of their audio (frames x 8 bytes, as `packBackup` counts it): once it passes
+   * `maxDecodedBytes` this throws `FileTooLarge` at once, before the rest are loaded, and what was loaded is dropped.
+   */
+  async backupAll(maxDecodedBytes: number = defaultMaxDecodedBytes()): Promise<BackupContents> {
+    const memories: (MemoryContents | null)[] = [];
+    let bytes = 0;
+    for (let slot = 1; slot <= SLOT_COUNT; slot++) {
+      const rec = await this.stores.memories.load(slot);
+      if (rec) {
+        for (const t of rec.tracks) if (t) bytes += t.L.length * 8;
+        if (bytes > maxDecodedBytes) {
+          memories.length = 0; // let the loaded audio go before the error travels up
+          throw new FileTooLarge(bytes, maxDecodedBytes);
+        }
+      }
+      memories.push(rec ? { settings: rec.settings, tracks: rec.tracks } : null);
+    }
+    return { system: structuredClone(this.session.system), memories };
+  }
+
+  /**
+   * RESTORE ALL: every slot becomes the backup's (an empty one is cleared), the system settings are replaced, and the
+   * current memory is loaded again. MEMORY FULL when storage refuses a write (the slots before it are restored). Any
+   * other failure is passed on, after the current memory has been reloaded from what storage now holds.
+   */
+  async restoreAll(backup: BackupContents): Promise<'ok' | 'MEMORY FULL'> {
+    let result: 'ok' | 'MEMORY FULL' = 'ok';
+    try {
+      try {
+        for (let slot = 1; slot <= SLOT_COUNT; slot++) {
+          const m = backup.memories[slot - 1];
+          if (m) await this.stores.memories.save(slot, m.settings, m.tracks);
+          else await this.stores.memories.clear(slot);
+        }
+      } catch (e) {
+        if (!(e instanceof QuotaError)) throw e;
+        result = 'MEMORY FULL';
+      }
+      await this.replaceSystem(backup.system);
+    } finally {
+      await this.selectMemory(this.session.slot);
+    }
+    return result;
+  }
+
   /** Writes the recovery checkpoint now (unsaved work only). */
   async checkpointNow(): Promise<void> {
     clearTimeout(this.checkpointTimer);
@@ -358,7 +516,7 @@ export class Controller {
     if (this.poweredOff || !this.session.dirty) return;
     const gen = this.checkpointGen;
     const slot = this.session.slot;
-    const settings = structuredClone(this.session.memory);
+    const settings = this.session.memoryForSave();
     try {
       const tracks = await this.requestTracks();
       if (gen !== this.checkpointGen) return; // saved or reloaded meanwhile: this work is no longer unsaved
@@ -400,6 +558,8 @@ export class Controller {
     void this.flushSystemSave();
     for (const { timer } of this.exports.values()) clearTimeout(timer);
     this.exports.clear();
+    for (const { timer } of this.calibrations.values()) clearTimeout(timer);
+    this.calibrations.clear();
     this.checkpointGen++;
     clearTimeout(this.messageTimer);
     clearTimeout(this.checkpointTimer);
@@ -410,8 +570,13 @@ export class Controller {
 
   private pushSettings(): void {
     this.tempoEcho.sent(this.session.memory.tempo);
-    // The engine copies these (EngineHost posts them through a MessagePort), so passing the live objects is safe.
-    this.engine.send({ t: 'settings', memory: this.session.memory, system: this.session.system });
+    // The engine copies these (EngineHost posts them through a MessagePort), so passing the live objects is safe. The
+    // system settings sent are those in effect (PREFERENCE = MEMORY groups from the memory).
+    this.engine.send({ t: 'settings', memory: this.session.memory, system: this.session.effectiveSystem });
+  }
+
+  private reopenMic(): void {
+    this.restartMic?.().catch((e: unknown) => console.error('reopening the mic failed', e));
   }
 
   private async loadSlot(slot: number, discardCheckpoint: boolean): Promise<void> {
@@ -452,11 +617,20 @@ export class Controller {
         }
         return;
       }
+      case 'calibration': {
+        const pending = this.calibrations.get(e.reqId);
+        if (pending) {
+          this.calibrations.delete(e.reqId);
+          clearTimeout(pending.timer);
+          pending.resolve({ capture: e.capture, clickFrames: e.clickFrames });
+        }
+        return;
+      }
       case 'message':
         this.showMessage(e.text);
         return;
       default:
-        return; // recorderBlock and calibration belong to the recorder and the latency screen
+        return; // recorderBlock belongs to the recorder
     }
   }
 

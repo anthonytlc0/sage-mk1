@@ -350,8 +350,8 @@ export class ButtonRouter {
         return;
       case 'track':
       case 'fx': {
-        // TODO(T21: PREFERENCE=MEMORY, ruling R26): with CTL FUNC PREFERENCE MODE PLAY / MODE UNDO = MEMORY the
-        // functions come from the memory (memory.prefs.ctl); nothing writes those copies yet, so the system ones are used.
+        // session.get reads the settings in effect: with CTL FUNC PREFERENCE MODE PLAY / MODE UNDO = MEMORY the
+        // functions come from the memory (memory.prefs.ctl; ruling R26).
         const table = this.undo ? 'panelUndo' : 'panelPlay';
         const fnId = this.host.session.get(`ctl.${table}.${part}.${track}`) as string;
         const action = PANEL_ACTIONS.get(fnId) ?? OFF_ACTION;

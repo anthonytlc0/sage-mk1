@@ -3,6 +3,7 @@ import { strFromU8, strToU8, zipSync } from 'fflate';
 import type { Zippable } from 'fflate';
 import { defaultMemory, defaultSystem } from '../../src/schema/params';
 import {
+  FileTooLarge,
   MAX_DECODED_BYTES,
   TOUCH_MAX_DECODED_BYTES,
   UnsupportedFile,
@@ -290,8 +291,8 @@ describe('unpackMemory: tracks', () => {
     reject(zipMem(memDoc(), { 'track1.wav': encodeWav([ramp(50, 1)], 48000, 'float32') }));
     reject(zipMem(meta(44100), { 'track1.wav': goodWav(1000) }));                              // rate disagrees with memory.json
     reject(zipMem(meta(100), { 'track1.wav': encodeWav([ramp(50, 1), ramp(50, 2)], 100, 'float32') })); // absurd rate
-    expect(() => unpackMemory(zipMem(memDoc(), { 'track1.wav': goodWav(1000) }), 48000, { maxDecodedBytes: 7999 })).toThrow(UnsupportedFile);
-    expect(() => unpackMemory(zipMem(memDoc(), { 'track1.wav': goodWav(1000) }), 96000, { maxDecodedBytes: 12_000 })).toThrow(UnsupportedFile); // would grow past the cap
+    expect(() => unpackMemory(zipMem(memDoc(), { 'track1.wav': goodWav(1000) }), 48000, { maxDecodedBytes: 7999 })).toThrow(FileTooLarge);
+    expect(() => unpackMemory(zipMem(memDoc(), { 'track1.wav': goodWav(1000) }), 96000, { maxDecodedBytes: 12_000 })).toThrow(FileTooLarge); // would grow past the cap
     expect(decode).not.toHaveBeenCalled();
     unpackMemory(zipMem(memDoc(), { 'track1.wav': goodWav(1000) }), 48000); // the baseline does decode
     expect(decode).toHaveBeenCalledTimes(1);
@@ -392,28 +393,37 @@ describe('unpackMemory: size cap', () => {
     expect(() => unpackBackup(backup, 48000, { maxDecodedBytes: 20_000 })).not.toThrow();
   });
 
-  it('accepts a file up to the cap and rejects one over it (frames x 2 channels x 4 bytes)', () => {
+  it('accepts a file up to the cap and rejects one over it (frames x 2 channels x 4 bytes) with FileTooLarge', () => {
     const file = zipMem(memDoc(), { 'track1.wav': goodWav(1000) }); // 1000 frames: 8000 bytes decoded
     expect(() => unpackMemory(file, 48000, { maxDecodedBytes: 8000 })).not.toThrow();
-    expect(() => unpackMemory(file, 48000, { maxDecodedBytes: 7999 })).toThrow(UnsupportedFile);
+    let caught: unknown;
+    try {
+      unpackMemory(file, 48000, { maxDecodedBytes: 7999 });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(FileTooLarge);
+    expect(caught).not.toBeInstanceOf(UnsupportedFile);
+    expect((caught as FileTooLarge).bytes).toBe(8000);
+    expect((caught as FileTooLarge).limit).toBe(7999);
   });
 
   it('rejects before inflating when the WAV entries alone are far over the cap', () => {
     const file = zipMem(memDoc(), { 'track1.wav': goodWav(100_000) });
-    expect(() => unpackMemory(file, 48000, { maxDecodedBytes: 1000 })).toThrow(UnsupportedFile);
+    expect(() => unpackMemory(file, 48000, { maxDecodedBytes: 1000 })).toThrow(FileTooLarge);
   });
 
   it('sums the tracks of a file', () => {
     const file = zipMem(memDoc({ tracks: [goodMeta, goodMeta, null, null, null] }), { 'track1.wav': goodWav(1000), 'track2.wav': goodWav(1000) });
     expect(() => unpackMemory(file, 48000, { maxDecodedBytes: 16000 })).not.toThrow();
-    expect(() => unpackMemory(file, 48000, { maxDecodedBytes: 12000 })).toThrow(UnsupportedFile);
+    expect(() => unpackMemory(file, 48000, { maxDecodedBytes: 12000 })).toThrow(FileTooLarge);
   });
 
   it('counts the resampled size when upsampling would grow a track past the cap', () => {
     const wav = encodeWav([ramp(1000, 1), ramp(1000, 2)], 8000, 'float32');          // 8 KB decoded; 48 KB at 48 kHz
     const file = zipMem(memDoc({ tracks: [{ ...goodMeta, sampleRate: 8000 }, null, null, null, null] }), { 'track1.wav': wav });
     expect(() => unpackMemory(file, 8000, { maxDecodedBytes: 20_000 })).not.toThrow();
-    expect(() => unpackMemory(file, 48000, { maxDecodedBytes: 20_000 })).toThrow(UnsupportedFile);
+    expect(() => unpackMemory(file, 48000, { maxDecodedBytes: 20_000 })).toThrow(FileTooLarge);
     expect(() => unpackMemory(file, 48000, { maxDecodedBytes: 100_000 })).not.toThrow();
   });
 });
@@ -500,7 +510,7 @@ describe('unpackBackup: untrusted files', () => {
       ...memFiles('m01/', goodWav(1000)), ...memFiles('m02/', goodWav(1000)),
     });
     expect(() => unpackBackup(two, 48000, { maxDecodedBytes: 16000 })).not.toThrow();
-    expect(() => unpackBackup(two, 48000, { maxDecodedBytes: 12000 })).toThrow(UnsupportedFile);
+    expect(() => unpackBackup(two, 48000, { maxDecodedBytes: 12000 })).toThrow(FileTooLarge);
   });
 
   it('corrects the stored system settings like a stored memory', () => {
@@ -538,7 +548,7 @@ describe('the cap per device', () => {
 
   it('unpackMemory uses the touch cap on a touch device and the desktop cap otherwise', () => {
     const file = declaring500MiB();
-    expect(() => unpackMemory(file, 48000, { nav: { maxTouchPoints: 5 } })).toThrow(UnsupportedFile);
+    expect(() => unpackMemory(file, 48000, { nav: { maxTouchPoints: 5 } })).toThrow(FileTooLarge);
     expect(unpackMemory(file, 48000, { nav: { maxTouchPoints: 0 } }).tracks[0]!.L).toHaveLength(100);
   });
 
@@ -549,7 +559,7 @@ describe('the cap per device', () => {
       'm01/track1.wav': [goodWav(100), { level: 0 }],
     });
     const file = declareSize(zip, 'm01/track1.wav', 500 * 1024 * 1024);
-    expect(() => unpackBackup(file, 48000, { nav: { maxTouchPoints: 5 } })).toThrow(UnsupportedFile);
+    expect(() => unpackBackup(file, 48000, { nav: { maxTouchPoints: 5 } })).toThrow(FileTooLarge);
     expect(unpackBackup(file, 48000, { nav: { maxTouchPoints: 0 } }).memories[0]!.tracks[0]!.L).toHaveLength(100);
   });
 

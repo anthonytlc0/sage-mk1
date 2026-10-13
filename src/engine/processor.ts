@@ -59,6 +59,7 @@ import type { MemorySettings, SystemSettings } from '../schema/types';
 import { STATUS_HZ } from '../shared/constants';
 import { TRACKS } from '../shared/ids';
 import type { EngineCommand, EngineEvent, EngineStatus, TimedCommand, TrackExportMeta } from '../shared/protocol';
+import { Calibrator } from './calibration';
 import { DESKTOP_MEMORY_BUDGET, PROCESSOR_NAME, RECORDER_BLOCK } from './config';
 
 /** The part of a MessagePort the engine uses (an AudioWorkletNode's port on either side, or a FakePort). */
@@ -154,6 +155,9 @@ export class SageProcessor {
   /** Frames the core still records silence for after an interrupt. */
   private gate = 0;
 
+  /** The LATENCY calibration in progress (engine/calibration.ts), or null. */
+  private calib: Calibrator | null = null;
+
   private recOn = false;
   private recL = new Float32Array(RECORDER_BLOCK);
   private recR = new Float32Array(RECORDER_BLOCK);
@@ -244,6 +248,14 @@ export class SageProcessor {
     const outR = b.out[1];
     this.masterOut.process(outL, outR, n);
     if (perf !== null) this.masterPerf.process(perf[0], perf[1], n);
+
+    // 5b. A LATENCY calibration replaces what is heard with its clicks (with 5 ms fades) and records the raw mic.
+    if (this.calib !== null) {
+      if (this.calib.process(mic !== undefined && mic.length >= n ? mic : undefined, outL, outR, n)) {
+        this.post(this.calib.event(), [this.calib.capture.buffer]);
+      }
+      if (this.calib.finished) this.calib = null;
+    }
 
     // 6. Out.
     const destR = dest[1];
@@ -352,7 +364,10 @@ export class SageProcessor {
         this.core.command(cmd);
         this.gate = this.xf;
         return;
-      // TODO(T21): `calibrate` (the click and the capture) arrives with the LATENCY screen; the core ignores it.
+      case 'calibrate':
+        // a second one restarts the measurement, already muted
+        this.calib = new Calibrator(cmd.reqId, this.sr, this.calib !== null);
+        return;
       default:
         this.core.command(cmd, coreAt);
         return;
