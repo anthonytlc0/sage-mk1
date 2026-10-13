@@ -5,17 +5,21 @@
  *
  * Presses that wait for a measure line (QUANTIZE, LOOP SYNC MODE MEASURE) are not queued commands: each track holds
  * its own armed slot and fires it at the exact frame as it renders (see track.ts), so the queue only ever holds
- * presses dated by the caller.
+ * presses dated by the caller. The one exception is a PLAY MODE SINGLE start, which stops the other SINGLE tracks:
+ * the block is split at its frame and it fires before any track renders that frame, so they stop on it exactly.
+ *
+ * ALL START/STOP, the SINGLE change and MEMORY FULL's reclaiming of undo history span tracks, so they live here.
  *
  * `process` allocates nothing apart from the tracks' 1-second recording chunks. Command and settings handling may
- * allocate a little (a fresh take shell when a track is cleared), but only once per user action.
+ * allocate a little (a fresh take shell when a track is cleared, the undo history's snapshots), but only once per user
+ * action.
  */
 import { ChunkPool } from './chunks';
 import { Transport } from './transport';
 import { xfadeFrames } from './fade';
 import { LoopSync } from './sync';
 import { Track } from './track';
-import type { TrackHost } from './track';
+import type { ArmUnit, SnapSlot, TrackHost } from './track';
 import { defaultMemory } from '../schema/memory';
 import { defaultSystem } from '../schema/system';
 import type { MemorySettings, SystemSettings } from '../schema/types';
@@ -43,6 +47,8 @@ export type CoreStatus = Pick<
 const QUEUE_CAPACITY = 64;
 /** Room for every distinct EngineMessage; repeats of a pending message are dropped. */
 const MESSAGE_CAPACITY = 8;
+/** The order in which undo history gives way when the memory budget runs out: the least useful first. */
+const RECLAIM_ORDER: readonly SnapSlot[] = ['redo', 'mark', 'recBack', 'undo'];
 
 export class LooperCore {
   /** The five tracks, in order. Exposed for the engine's later tasks and for tests. */
@@ -93,9 +99,12 @@ export class LooperCore {
       audioChanged: () => {
         this.audioDirty = true;
       },
+      singleChange: (self, now) => this.singleChange(self, now),
+      singleStarted: (self) => this.singleStarted(self),
     };
     this.tracks = TRACKS.map((i) => new Track(i, host));
     this.sync.attach(this.tracks);
+    this.pool.reclaim = () => this.reclaim();
   }
 
   /** The timeline frame at the start of the next block. */
@@ -165,8 +174,14 @@ export class LooperCore {
     let pos = 0;
     while (pos < n) {
       this.applyDue(this._frame + pos);
+      // A SINGLE start due here fires before any track renders this frame (it stops the other SINGLE tracks).
+      for (let i = 0; i < tracks.length; i++) tracks[i].fireSingleStart(this._frame + pos);
       let end = n;
       if (this.queueLength > 0) end = Math.min(n, this.queueAt[0] - this._frame);
+      for (let i = 0; i < tracks.length; i++) {
+        const due = tracks[i].singleArmFrame - this._frame;
+        if (due > pos && due < end) end = due;
+      }
       for (let i = 0; i < tracks.length; i++) {
         const o = out.tracks[i];
         tracks[i].render(inL, inR, o[0], o[1], pos, end, this._frame);
@@ -252,11 +267,118 @@ export class LooperCore {
       case 'speedMoment':
         this.tracks[cmd.track]?.speedMoment(cmd.speed);
         return;
-      // Not yet: undo/redo, marks and ALL START/STOP (Task 8).
+      case 'undoRedo':
+        this.tracks[cmd.track]?.undoRedo();
+        return;
+      case 'markSet':
+        this.tracks[cmd.track]?.markSet();
+        return;
+      case 'markClear':
+        this.tracks[cmd.track]?.markClear();
+        return;
+      case 'markBack':
+        this.tracks[cmd.track]?.markBack();
+        return;
+      case 'recBack':
+        this.tracks[cmd.track]?.recBack();
+        return;
+      case 'allStartStop':
+        this.allStartStop(now);
+        return;
       // Engine-only, handled outside the core: fader (the mixer), exportTracks, recorder, calibrate.
       default:
         return;
     }
+  }
+
+  /**
+   * ALL START/STOP at `now` (Owner's Manual p. 4). If any track is recording, playing or overdubbing, every track
+   * stops: a recording or pass ends first, then STOP MODE applies, and armed starts are cancelled. Otherwise the tracks
+   * set in ALL START TRK that hold a loop start together: at once, or, when one of them would wait for a line (LOOP
+   * SYNC MODE MEASURE or LOOP LENGTH with the grid running), all of them at the latest such line.
+   *
+   * INFERRED: with PLAY MODE SINGLE only one SINGLE track can play, so only one of them starts: the current track when
+   * it is one, otherwise the first. (ALL STOP TRK is for MIDI stop, phase 4; this button stops every track.)
+   */
+  private allStartStop(now: number): void {
+    const tracks = this.tracks;
+    for (let i = 0; i < tracks.length; i++) {
+      if (!tracks[i].running) continue;
+      for (let j = 0; j < tracks.length; j++) tracks[j].allStop();
+      return;
+    }
+    const play = this.memory.play;
+    let single = -1;
+    for (let i = 0; i < tracks.length; i++) {
+      if (play.allStartTrk[i] !== true || tracks[i].state !== 'stopped' || !this.isSingle(i)) continue;
+      if (single < 0 || i === play.currentTrack) single = i;
+    }
+    let at = now;
+    let unit: ArmUnit = 'measure';
+    for (let i = 0; i < tracks.length; i++) {
+      if (!this.allStarts(i, single)) continue;
+      const line = tracks[i].startLine(now);
+      if (line > at) {
+        at = line;
+        unit = tracks[i].lineUnit;
+      }
+    }
+    for (let i = 0; i < tracks.length; i++) if (this.allStarts(i, single)) tracks[i].allStart(now, at, unit);
+  }
+
+  /** Whether ALL START starts track `i` (`single`: the one SINGLE track that may start, or -1). */
+  private allStarts(i: number, single: number): boolean {
+    return this.memory.play.allStartTrk[i] === true && this.tracks[i].state === 'stopped' && (!this.isSingle(i) || i === single);
+  }
+
+  private isSingle(i: number): boolean {
+    return this.memory.track[i]?.playMode === 'SINGLE';
+  }
+
+  /**
+   * S.TRK CHANGE (Parameter Guide p. 4): where `self` takes over from the other SINGLE tracks playing. IMMEDIATE: at
+   * once (with LOOP SYNC MODE MEASURE the start itself waits for the measure line, and the change with it); LOOP END:
+   * when the first of them reaches its loop end; MEASURE: at the next measure line. `now` when none is playing.
+   */
+  private singleChange(self: Track, now: number): number {
+    const tracks = this.tracks;
+    let end = Infinity;
+    for (let i = 0; i < tracks.length; i++) {
+      const t = tracks[i];
+      if (t === self || !this.isSingle(i) || (t.state !== 'playing' && t.state !== 'overdubbing')) continue;
+      end = Math.min(end, t.framesToLoopEnd);
+    }
+    if (end === Infinity) return now;
+    switch (this.memory.play.sTrkChange) {
+      case 'LOOP END':
+        return now + end;
+      case 'MEASURE':
+        return this.sync.boundary(now, this.sync.measure());
+      default:
+        return now;
+    }
+  }
+
+  /** PLAY MODE SINGLE: `self` started, so every other SINGLE track that is playing stops (Parameter Guide p. 2). */
+  private singleStarted(self: Track): void {
+    const tracks = this.tracks;
+    for (let i = 0; i < tracks.length; i++) if (tracks[i] !== self && this.isSingle(i)) tracks[i].yieldToSingle();
+  }
+
+  /**
+   * The pool's budget has run out: undo history gives way before anything is refused (INFERRED: the history is a
+   * convenience, the performance is not). One snapshot per call, in RECLAIM_ORDER across the tracks: first those that
+   * alone hold some chunk (letting go of them frees memory), then any (snapshots that share chunks only with each
+   * other). False when no snapshot holding audio is left.
+   */
+  private reclaim(): boolean {
+    const tracks = this.tracks;
+    for (let pass = 0; pass < 2; pass++) {
+      for (let k = 0; k < RECLAIM_ORDER.length; k++) {
+        for (let i = 0; i < tracks.length; i++) if (tracks[i].dropHistory(RECLAIM_ORDER[k], pass === 0)) return true;
+      }
+    }
+    return false;
   }
 
   /** Apply, in order, every queued command dated at or before `frame`. */

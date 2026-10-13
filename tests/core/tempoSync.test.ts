@@ -12,6 +12,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { at, configure, dc, makeCore, makeOutput, ramp, recPlay, run, stop, trk, XF } from './harness';
 import type { LooperCore } from '../../src/core/looper';
 import { AudioTake } from '../../src/core/chunks';
+import type { EngineCommand } from '../../src/shared/protocol';
 
 const SR48 = 48000;
 const tone = (hz: number, sr = SR48, amp = 1) => (f: number): number => amp * Math.sin((2 * Math.PI * hz * f) / sr);
@@ -549,6 +550,45 @@ describe('flushPendingWrites (for Task 8 snapshots)', () => {
     expect(core.tracks[0].flushPendingWrites()).toBe(false); // the 5 ms punch-out tail is still writing
     run(core, XF, dc(0.5));
     expect(core.tracks[0].flushPendingWrites()).toBe(true);
+  });
+});
+
+describe('audio() just after a pass at a rate other than 1 (binding note 2)', () => {
+  /**
+   * A 2 s loop of 440 Hz at 1.5x (XFADE), overdubbed with 660 Hz from frame 100000 (position 6000); at 148000
+   * (position 78000) `end` ends the pass, then `after` frames run. While the loop still plays, the last ~6000 frames of
+   * the pass are only gathered until the read heads have passed them (up to ~129 ms).
+   */
+  function dubbed(end: EngineCommand, after: number): LooperCore {
+    const core = makeCore({ track: [{ tempoSyncMode: 'XFADE' }] }, { sampleRate: SR48 });
+    at(core, 0, recPlay(), tone(440, SR48, 0.4));
+    at(core, 96000, recPlay(), tone(440, SR48, 0.4));
+    configure(core, { tempo: 180 });
+    at(core, 100000, recPlay(), tone(660, SR48, 0.4));
+    at(core, 148000, end, tone(660, SR48, 0.4));
+    run(core, after, tone(660, SR48, 0.4));
+    return core;
+  }
+
+  /** Frames of `got` that differ from `want` inside the pass, short of its last 1500 (where the tail still writes). */
+  function missing(got: Float32Array, want: Float32Array): number {
+    let n = 0;
+    for (let j = 7000; j < 78000 - 1500; j++) if (Math.abs(got[j] - want[j]) > 1e-6) n++;
+    return n;
+  }
+
+  it.each([
+    ['2 frames after a punch-out (the loop plays on)', recPlay(), 2],
+    ['at the STOP frame itself', stop(), 0],
+  ] as const)('%s it holds the gathered end of the pass, baked into the copy only', (_name, end, after) => {
+    const core = dubbed(end, after);
+    const got = core.getTrackAudio(0)!.L;
+    const ref = dubbed(end, after);
+    run(ref, 48000, tone(660, SR48, 0.4));
+    const want = ref.getTrackAudio(0)!.L;
+    expect(missing(got, want)).toBe(0);
+    run(core, 48000, tone(660, SR48, 0.4));
+    expect(core.getTrackAudio(0)!.L).toEqual(want); // the live take was not touched by the bake
   });
 });
 

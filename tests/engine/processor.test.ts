@@ -676,3 +676,69 @@ describe('the AudioWorklet registration', () => {
     expect(status?.status?.memoryBudget).toBe(5 * 1024 * 1024);
   });
 });
+
+describe('SageProcessor undo/redo, marks and ALL START/STOP (Task 8)', () => {
+  const track0 = (port: ReturnType<typeof makeProcessor>['port']) => port.events('status').at(-1)!.status.tracks[0]!;
+
+  it('the commands reach the core: undoRedo, markSet, markClear, markBack, recBack, allStartStop', () => {
+    const { p, port } = makeProcessor();
+    send(port, freeSettings());
+    send(port, { t: 'recPlay', track: 0 });
+    run(p, SR, 0.5);
+    send(port, { t: 'recPlay', track: 0 });
+    run(p, SR, 0.5);
+    send(port, { t: 'recPlay', track: 0 }); // overdub
+    run(p, SR, 0.25);
+    send(port, { t: 'recPlay', track: 0 });
+    run(p, 1600);
+    expect(track0(port)).toMatchObject({ state: 'playing', canUndo: true, canRedo: false, hasMark: false });
+    send(port, { t: 'undoRedo', track: 0 });
+    run(p, 1600);
+    expect(track0(port)).toMatchObject({ canUndo: false, canRedo: true });
+    send(port, { t: 'markSet', track: 0 });
+    run(p, 1600);
+    expect(track0(port).hasMark).toBe(true);
+    send(port, { t: 'markClear', track: 0 });
+    send(port, { t: 'recBack', track: 0 });
+    run(p, 1600);
+    expect(track0(port)).toMatchObject({ hasMark: false, canUndo: true, canRedo: false });
+    send(port, { t: 'markBack', track: 0 }); // no mark: back to the recording again
+    send(port, { t: 'allStartStop' });
+    run(p, 1600);
+    expect(track0(port)).toMatchObject({ state: 'stopped', canUndo: true });
+    send(port, { t: 'allStartStop' });
+    run(p, 1600);
+    expect(track0(port).state).toBe('playing');
+  });
+
+  /**
+   * Binding notes 2 and 6: an export taken at the STOP that ends an overdub at 1.5x (XFADE) must hold the ~6000
+   * gathered frames still to land, as Track.audio() does: the processor streams `Track.exportSnapshot()`.
+   */
+  it('an export taken at the STOP ending an XFADE overdub at 1.5x holds the whole pass', () => {
+    const sine = (hz: number) => (f: number): number => 0.4 * Math.sin((2 * Math.PI * hz * f) / SR);
+    function dubThenStop(): { p: SageProcessor; port: ReturnType<typeof makeProcessor>['port'] } {
+      const { p, port } = makeProcessor();
+      send(port, freeSettings((m) => {
+        m.track[0]!.tempoSyncMode = 'XFADE';
+      }));
+      send(port, { t: 'recPlay', track: 0 });
+      run(p, 96000, sine(440)); // a 2 s loop at tempo 120
+      send(port, { t: 'recPlay', track: 0 });
+      send(port, { t: 'tempo', bpm: 180 }); // plays at 1.5x from here
+      run(p, 4000, sine(440));
+      send(port, { t: 'recPlay', track: 0 }); // punch in at position 6000
+      run(p, 48000, sine(660));
+      send(port, { t: 'stop', track: 0 }); // position 78000: the pass ends and the track stops
+      return { p, port };
+    }
+    const now = dubThenStop();
+    const got = exportTracks(now.p, now.port)[0]!.L;
+    const later = dubThenStop();
+    run(later.p, 48000);
+    const want = exportTracks(later.p, later.port)[0]!.L;
+    let missing = 0;
+    for (let j = 7000; j < 76500; j++) if (Math.abs(got[j]! - want[j]!) > 1e-6) missing++;
+    expect(missing).toBe(0);
+  });
+});
