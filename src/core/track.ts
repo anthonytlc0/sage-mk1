@@ -39,16 +39,35 @@
  *    at the cut, so it outlives the take. A 1SHOT retrigger is the same release crossfaded with a ramp-in from the
  *    start.
  *
+ * Tempo sync and speed (Parameter Guide p. 3 TEMPO SYNC, p. 4 SPEED CHANGE):
+ *  - rate = (TEMPO SYNC SW ? memory tempo / recorded tempo : 1) x {HALF 0.5, NORMAL 1, DOUBLE 2}, read live each step
+ *    and clamped to 0.25..4 (TEMPO TOO SLOW / TEMPO TOO FAST). A held SPEED MOMENT overrides the speed. SPEED CHANGE
+ *    IMMEDIATE switches at once; LOOP END at the seam.
+ *  - A synced loop's recorded tempo is the exact tempo of its whole-frame length (`measures` measures). A tempo change
+ *    keeps a playing loop in step (the grid keeps its phase).
+ *  - At rate 1 ("exact": the rate is within half a frame per pass of 1, as it is for a synced loop at its own grid
+ *    tempo with SPEED NORMAL) the loop plays and overdubs whole frames, sample for sample. A loop whose length is not a
+ *    whole number of grid frames is kept on the grid by moving the seam a frame earlier or later now and then
+ *    (controller ruling R45), at the crossfaded seam, so it never drifts by a frame.
+ *  - At any other rate the playhead is fractional: PITCH reads between samples (resampleRead.ts), XFADE stretches
+ *    (timestretch.ts), and an overdub is written at the playhead (PITCH) or time-compressed in splices (XFADE) and
+ *    gathered until the read heads have passed (resampleWrite.ts). When the rate comes back to 1, the next seam
+ *    returns to the exact path.
+ *
  * Nothing here allocates while rendering. Scratch buffers are per track; the only allocations are the take's own
  * 1-second chunks while recording (or copy-on-write), and a fresh take shell when one is cleared.
  */
 import { AudioTake } from './chunks';
 import type { ChunkPool } from './chunks';
-import { deriveTempo, noteFrames, snapLength } from './transport';
+import { deriveTempo, noteFrames } from './transport';
 import type { Transport } from './transport';
 import { Ramp, fadeTimeFrames, punchInGain, punchOutGain } from './fade';
 import { phraseOffset } from './sync';
 import type { LoopSync, SyncTrack } from './sync';
+import { readInterpolated } from './resampleRead';
+import { SPLAT_MAX_WIDTH, SpliceWriter, SplatWriter } from './resampleWrite';
+import { XfadeStretcher } from './timestretch';
+import { TEMPO_MAX, TEMPO_MIN } from '../shared/constants';
 import type { FadeTime, MeasureSetting, MemorySettings, TrackSettings } from '../schema/types';
 import type { TrackIndex } from '../shared/ids';
 import type { EngineMessage, TrackAudio, TrackState, TrackStatus } from '../shared/protocol';
@@ -72,7 +91,15 @@ export interface TrackHost {
 /** Frames per inner render step, and the size of the scratch buffers. */
 const STEP = 256;
 
+/** Playback rates outside this range raise TEMPO TOO SLOW / TEMPO TOO FAST and play at the limit (the brief). */
+export const RATE_MIN = 0.25;
+export const RATE_MAX = 4;
+/** A rate this close to 1 is 1, so float noise between equal tempos keeps a loop on the exact, sample-for-sample path. */
+const RATE_EPSILON = 1e-12;
+/** TEMPO SYNC SPEED as a rate factor. */
+export const SPEED_FACTOR = { HALF: 0.5, NORMAL: 1, DOUBLE: 2 } as const;
 type DubMode = TrackSettings['dubMode'];
+type Speed = TrackSettings['tempoSyncSpeed'];
 /** What follows a recording. */
 type EndAction = 'play' | 'dub' | 'stop';
 /** The grid an armed action waits on: measure lines, or LOOP LENGTH lines. */
@@ -102,6 +129,17 @@ interface Arm {
   action: 'rec' | 'play' | null;
   frame: number;
   unit: ArmUnit;
+}
+
+/**
+ * A loop's playback rate (the brief): `(tempoSyncSw ? tempo / recordedTempo : 1) * SPEED_FACTOR[speed]`, before
+ * clamping to RATE_MIN..RATE_MAX. Within RATE_EPSILON of 1 it is exactly 1. A recorded tempo that is not a positive
+ * number gives no tempo sync.
+ */
+export function playbackRate(tempoSyncSw: boolean, tempo: number, recordedTempo: number, speed: Speed): number {
+  const synced = tempoSyncSw && recordedTempo > 0 && Number.isFinite(recordedTempo);
+  const r = (synced ? tempo / recordedTempo : 1) * SPEED_FACTOR[speed];
+  return Math.abs(r - 1) < RATE_EPSILON ? 1 : r;
 }
 
 /** Reverse samples `[from, from + n)` of `a` in place. */
@@ -156,6 +194,81 @@ export class Track implements SyncTrack {
   /** The punch-out still to write after an overdub ended. */
   private readonly dubTail: Tail = { pos: 0, left: 0, replace: false };
 
+  // Tempo sync and speed ------------------------------------------------------------------------------------------
+  /** The speed playing now. SPEED CHANGE LOOP END holds a new one back until the seam. */
+  private speed: Speed = 'NORMAL';
+  /** A held SPEED MOMENT, which overrides TEMPO SYNC SPEED while held. */
+  private moment: 'HALF' | 'DOUBLE' | null = null;
+  /** Which limit the rate is past (+1 fast, -1 slow, 0 neither), so each excursion raises its message once. */
+  private rateWarn: -1 | 0 | 1 = 0;
+  /**
+   * The playhead is a whole frame and the rate is 1 (within half a frame per pass): playback reads and overdubs write
+   * whole frames, exactly as without tempo sync. Any other rate leaves this path (to interpolated reads and splatted
+   * writes); the next seam at rate 1, or the next jump of the playhead, comes back to it.
+   */
+  private exact = true;
+  /**
+   * On the exact path: where the current pass ideally began (at the loop's true length on the timeline, `length /
+   * rate`) relative to where it actually began, in frames. Each seam moves the next pass's start by a frame when that
+   * keeps this nearest zero, so the loop stays within a frame of its ideal timing (ruling R45).
+   */
+  private seamPhase = 0;
+  /** A seam correction skipped a frame while overdubbing: the pass's next input frame is written to it as well. */
+  private seamSkip = false;
+  /**
+   * The next frame at the playhead (a whole frame inside the loop) is a replay: it plays `lastRaw` and a pass drops its
+   * input frame there (set when a late REC->DUB loop starts a frame early, on a frame the overshoot dub wrote).
+   */
+  private replayNext = false;
+  /** The last sample `readPlayback` produced, before that step's writes: a replayed frame plays it again. */
+  private lastRawL = 0;
+  private lastRawR = 0;
+  /** Phase of an aligned start (`alignedPosition`), for `seamPhase`. */
+  private alignPhase = 0;
+  /** The playhead in stream frames (counting on past the loop end): where the read heads are for `writer`. */
+  private readPos = 0;
+  /** Stream frame of the next splatted input frame. */
+  private wq = 0;
+  /** Stream frame just past the last input frame splatted: the end of the punched span once the input stops. */
+  private wqEnd = 0;
+  /** The splatted stream is writing through splices (XFADE), else splatting at the playhead (PITCH). */
+  private streamXfade = false;
+  /** The rate the splatted stream last ran at (a punch-out tail keeps it after the track stops). */
+  private wRate = 1;
+  /** Frames left of a splatted punch-out tail, and whether it replaces. */
+  private wTail = 0;
+  private wTailReplace = false;
+  /** The read heads of the step just rendered were the stretcher's. */
+  private usedHeads = false;
+  private readonly stretch: XfadeStretcher;
+  /** The stretcher's source position is the playhead (cleared by every jump; it is re-seeded when next used). */
+  private stretchSynced = false;
+  private readonly writer: SplatWriter;
+  /** Time-compresses an XFADE overdub into splices for `writer`. */
+  private readonly splice: SpliceWriter;
+  /**
+   * How far from the playhead a gathered write can land: the larger of the stretcher heads' lag (1.5 grains, 4320
+   * frames at 48 kHz) and a splice's reach at 4x (6167), plus the kernel: 6173 frames at 48 kHz.
+   */
+  private readonly writeBack: number;
+  /**
+   * How far behind the playhead gathered writes are written, past every read head and every later write: 6175 frames
+   * (about 129 ms) at 48 kHz, for PITCH and XFADE alike. A loop shorter than that hears an overdub a pass late.
+   */
+  private readonly writeDelay: number;
+  /** Keep-gain and input gain of each input frame of a splatted step (see resampleWrite.ts). */
+  private readonly alphaBuf = new Float32Array(STEP);
+  private readonly betaBuf = new Float32Array(STEP);
+
+  // A grid recording across tempo changes (dispatch note c) ------------------------------------------------------
+  /** Measures recorded up to the last tempo change, and the take length then. */
+  private recMu = 0;
+  private recFr = 0;
+  /** The measure length (frames) since the last tempo change. */
+  private recM = 0;
+  /** A grid recording's start was rounded to a whole frame: the measure line it stood for, minus the frame. */
+  private recResidual = 0;
+
   /** Largest absolute output sample since the last `status()`. */
   private peakAbs = 0;
 
@@ -179,6 +292,14 @@ export class Track implements SyncTrack {
     this._recordedTempo = host.transport.bpm;
     this.relBufL = new Float32Array(host.xfade);
     this.relBufR = new Float32Array(host.xfade);
+    this.stretch = new XfadeStretcher(host.sr);
+    const grain = this.stretch.grainFrames;
+    this.splice = new SpliceWriter(grain);
+    this.writeBack = Math.max(Math.ceil(1.5 * grain), this.splice.reach) + SPLAT_MAX_WIDTH + 2;
+    this.writeDelay = this.writeBack + 2;
+    // Gathered frames span the write delay plus the reach of a step's writes ahead of where the flush stopped (a
+    // splice's reach, or a step at 4x, twice over for margin).
+    this.writer = new SplatWriter(this.writeDelay + this.writeBack + 2 * RATE_MAX * STEP + 64);
   }
 
   get state(): TrackState {
@@ -232,8 +353,22 @@ export class Track implements SyncTrack {
     return this.cfg.measure === 'AUTO';
   }
 
-  /** The grid moved (a tempo or beat change): aim the armed action at the same line, now at a new frame. */
+  /**
+   * The grid moved (a tempo or beat change): aim the armed action at the same line, now at a new frame. A grid
+   * recording banks the measures it has recorded at the old measure length, so its end (a waiting press, or a fixed
+   * length) stays on the same musical line (dispatch note c) rather than being recomputed from its start at the new
+   * length, which could land before what is already recorded and trim it.
+   */
   retarget(frame: number): void {
+    if (this._state === 'recording') {
+      const M = this.host.sync.measure();
+      if (this.syncMode() === 'grid' && this.recM > 0) {
+        const len = this._take.length;
+        this.recMu += (len - this.recFr) / this.recM;
+        this.recFr = len;
+      }
+      this.recM = M;
+    }
     if (this.arm.action === null) return;
     this.arm.frame = this.host.sync.boundary(frame, this.unitFrames(this.arm.unit));
   }
@@ -314,6 +449,14 @@ export class Track implements SyncTrack {
     }
   }
 
+  /**
+   * SPEED MOMENT: `speed` overrides TEMPO SYNC SPEED while held; null lets go. It switches at the SPEED CHANGE timing
+   * like any speed change (INFERRED: the guide gives one timing for "the playback speed").
+   */
+  speedMoment(speed: 'HALF' | 'DOUBLE' | null): void {
+    this.moment = speed;
+  }
+
   /** Empty the track: its take is released and replaced by a fresh one. A playing loop ramps out over 5 ms. */
   clear(): void {
     // A first recording still running had no loop yet: clearing it leaves the track as it was before.
@@ -385,6 +528,17 @@ export class Track implements SyncTrack {
     this._state = 'recording'; // the take is always fresh and empty here
     this.recStart = frame;
     this.recEnd = null;
+    this.recMu = 0;
+    this.recFr = 0;
+    this.recM = this.host.sync.measure();
+    this.recResidual = 0;
+    if (this.syncMode() === 'grid') {
+      // The measure line nearest the start (a line rounded to a whole frame, when the recording waited for one).
+      const sync = this.host.sync;
+      const M = this.recM;
+      const r = sync.origin + Math.round((frame - sync.origin) / M) * M - frame;
+      if (Math.abs(r) < 1) this.recResidual = r;
+    }
   }
 
   /**
@@ -408,8 +562,7 @@ export class Track implements SyncTrack {
       return;
     }
     const len = this._take.length;
-    const M = this.host.sync.measure();
-    const measures = this.fixedMeasures() ?? Math.round(snapLength(len, M) / M);
+    const measures = this.fixedMeasures() ?? Math.max(1, Math.round(this.recordedMeasures()));
     const target = this.measuresToFrames(measures);
     if (target > len) {
       // INFERRED (spec: Behaviors to verify): an early press keeps recording to the line.
@@ -453,14 +606,14 @@ export class Track implements SyncTrack {
       return;
     }
     const len = this._take.length;
-    const M = this.host.sync.measure();
-    const whole = Math.floor(len / M + 1e-9);
+    const recorded = this.recordedMeasures();
+    const whole = Math.floor(recorded + 1e-9);
     if (whole >= 1) {
-      this.closeLoop(Math.min(len, Math.round(whole * M)), next, whole);
+      this.closeLoop(Math.min(len, this.framesFor(whole)), next, whole);
     } else if (len <= 2 * this.host.xfade) {
       this.reset();
     } else {
-      this.closeLoop(len, next, len / M);
+      this.closeLoop(len, next, recorded);
     }
   }
 
@@ -470,7 +623,8 @@ export class Track implements SyncTrack {
    * Frames recorded past `T` (a late press, or a trim) are the input that followed the loop end, so they get exactly
    * what an on-time press would have done with that input: their first 5 ms are crossfaded into the loop start (the
    * seam), and with REC->DUB the pass dubs all of them onto the loop start by its DUB MODE rules. Then they are
-   * dropped, and playback (and the pass) pick up where the loop has got to since `T`, in step with the grid at once.
+   * dropped, and playback (and the pass) pick up where the loop has got to since `T`, in step with the grid at once:
+   * `rate * over` frames on, at the rate the loop now plays at.
    */
   private closeLoop(T: number, next: EndAction, measures: number | null): void {
     const take = this._take;
@@ -484,8 +638,12 @@ export class Track implements SyncTrack {
     this.recEnd = null;
     this._measures = measures;
     this._loopSeq = this.host.sync.nextSeq();
+    // A synced loop's tempo is the exact tempo at which its T frames are `measures` measures (dispatch note b): T is a
+    // whole number of frames and a measure rarely is, so the memory tempo would leave tempo sync playing it a fraction
+    // of a frame per measure off the grid, drifting without end. At this tempo `memory tempo / recorded tempo` makes
+    // one pass exactly `measures` measures of the grid. (It is also exact after a tempo change mid-recording, note c.)
     // INFERRED: a free loop has no tempo of its own; it takes the memory tempo of the moment its recording ends.
-    this._recordedTempo = this.host.transport.bpm;
+    this._recordedTempo = measures !== null ? this.loopTempo(T, measures) : this.host.transport.bpm;
     this.host.audioChanged();
     if (next === 'stop') {
       if (over > 0) take.truncate(T);
@@ -493,39 +651,130 @@ export class Track implements SyncTrack {
       return;
     }
     // INFERRED: playback straight after a recording starts at full level (after the 5 ms ramp-in from the silent
-    // recording); START MODE applies to starts from stopped.
+    // recording); START MODE applies to starts from stopped. It starts at the speed set now (it was not playing).
+    this.speed = this.targetSpeed();
+    this.rateWarn = 0;
+    this.stretchSynced = false;
     this._state = 'playing';
     this.stopping = null;
     this.env.set(1);
     this.mute.set(1);
     this.rampIn();
+    const rate = this.rateAt(this.speed);
+    this.exact = this.isUnity(rate);
+    this.seamPhase = 0;
     // REC->DUB on a REVERSE or 1SHOT track, which cannot overdub, ends in playback (INFERRED).
-    if (next === 'dub' && this.canDub()) {
-      // The pass as it would have run from the line: from position 0, under the seam crossfade. An OVERDUB pass ramps
-      // in with the seam (the two input gains sum to 1); a REPLACE pass writes the input at full gain, since the seam
-      // already fades it in over the old audio (a second ramp would dip the level by 1 - u + u^2).
+    const dub = next === 'dub' && this.canDub();
+    if (this.exact) {
+      this.readPos = 0;
+      const into = over % T;
+      let p = this.cfg.reverse ? T - 1 - into : into;
+      let shift = 0;
+      if (rate !== 1) {
+        // A loop a fraction of a frame off its grid length (ruling R45): this pass ideally began where the recording's
+        // (rounded) start line plus its passes since put it. Start it a frame early or late when that keeps it nearest
+        // the grid over the pass, as `correctSeam` does at each seam, so it is within 0.75 of a frame from the start.
+        const drift = T / rate - T;
+        let phase = this.recResidual + (1 + Math.floor(over / T)) * drift;
+        shift = -Math.round(phase + drift / 2);
+        shift = shift < -1 ? -1 : shift > 1 ? 1 : shift;
+        phase += shift;
+        this.seamPhase = phase;
+        p = this.cfg.reverse ? p - shift : p + shift;
+        if (p >= T) p -= T;
+        else if (p < -1) p += T;
+      }
+      // Starting a frame early replays the frame just before: the loop's last (frame -1 or T), or, after a late
+      // REC->DUB press, the last frame the overshoot dub is about to write. Either way it plays as it was before any
+      // pass wrote it, and the live pass drops its first input frame there rather than writing that frame twice.
+      const replay = shift < 0 && (p === -1 || p === T || (dub && over > 0));
+      if (replay) {
+        this._take.read(p < 0 ? T - 1 : p >= T ? 0 : p, this.tmpL, this.tmpR, 0, 1); // before the overshoot dub
+        this.lastRawL = this.tmpL[0];
+        this.lastRawR = this.tmpR[0];
+      }
+      if (dub) {
+        // The pass as it would have run from the line: from position 0, under the seam crossfade. An OVERDUB pass
+        // ramps in with the seam (the two input gains sum to 1); a REPLACE pass writes the input at full gain, since
+        // the seam already fades it in over the old audio (a second ramp would dip the level by 1 - u + u^2).
+        this.beginPass(true, this.cfg.dubMode === 'OVERDUB' ? 0 : xf);
+        if (over > 0) this.dubOvershoot(T, over);
+      }
+      if (over > 0) take.truncate(T);
+      if (shift > 0 && dub) this.seamSkip = true;
+      this.replayNext = replay && p >= 0 && p < T; // (frames -1 and T replay by position)
+      this.playhead = p;
+      this.readPos = p;
+      return;
+    }
+    // Any other rate: the overshoot is splatted (a REC->DUB pass) and playback resumes between samples.
+    const skip = over > 0 ? over - Math.min(over, Math.ceil(T / rate)) : 0; // the cap of note d, see dubOvershoot
+    this.readPos = rate * skip;
+    if (dub) {
       this.beginPass(true, this.cfg.dubMode === 'OVERDUB' ? 0 : xf);
-      if (over > 0) this.dubOvershoot(T, over);
+      if (over > 0) this.dubOvershootSplat(T, over, skip, rate);
     }
     if (over > 0) take.truncate(T);
-    const into = over % T;
-    this.playhead = this.cfg.reverse ? T - 1 - into : into;
+    const into = (rate * over) % T;
+    let p = this.cfg.reverse ? T - 1 - into : into;
+    if (p < 0) p += T;
+    this.playhead = p;
+    this.readPos = dub ? this.wq : p;
+  }
+
+  /**
+   * The tempo at which `frames` frames are `measures` measures of the current beat (as `deriveTempo` computes it),
+   * clamped to TEMPO_MIN..TEMPO_MAX: the memory file refuses a recorded tempo outside the range. (At the very ends of
+   * the range a measure is a whole number of frames at the usual sample rates, so the clamp costs no drift there; it
+   * does mean a loop whose derived tempo was clamped plays at rate 1, off the grid, as before tempo sync.)
+   */
+  private loopTempo(frames: number, measures: number): number {
+    const t = this.host.transport;
+    const perMeasure = (t.beat.num * 4) / t.beat.den;
+    const bpm = (measures * perMeasure * 60 * t.sr) / frames;
+    return bpm < TEMPO_MIN ? TEMPO_MIN : bpm > TEMPO_MAX ? TEMPO_MAX : bpm;
   }
 
   /**
    * A late REC->DUB end press: run the pass over the loop positions `[0, over)` with the recorded overshoot
    * (`take[T, T + over)`) as its input, as it would have run live from the line, wrapping at `T`. `passFrames` carries
    * on from there, so the live pass continues the same ramp.
+   *
+   * INFERRED (dispatch note d): an overshoot longer than the loop, which only happens when the length shrinks under a
+   * running recording (a MEASURE or LOOP LENGTH change), dubs only its last loop length. Each loop position is then
+   * written once, by the last pass over it, so one callback never does more than a loop length of work. REPLACE
+   * passes come out exactly as before (the last pass overwrote the earlier ones anyway); an OVERDUB pass keeps only
+   * that last layer of the overshoot.
    */
   private dubOvershoot(T: number, over: number): void {
     const { rawL, rawR } = this;
-    let k = 0;
+    let k = over > T ? over - T : 0;
+    this.passFrames += k; // the skipped frames' ramp has run its course
     while (k < over && this._state === 'overdubbing') {
       const pos = k % T;
       const m = Math.min(STEP, over - k, T - pos);
       this._take.read(T + k, rawL, rawR, 0, m);
       this.playhead = pos;
       this.writePass(rawL, rawR, 0, m);
+      k += m;
+    }
+  }
+
+  /**
+   * `dubOvershoot` at a rate other than 1: the overshoot frames from `skip` on are splatted at stream frame
+   * `rate * k`, as the live pass would have written them, wrapping at `T` (flushed as it goes, so the gathering ring
+   * stays small). The cap is the same: at most one loop length (`T / rate` input frames). XFADE splices it, as live.
+   */
+  private dubOvershootSplat(T: number, over: number, skip: number, rate: number): void {
+    const { rawL, rawR } = this;
+    this.passFrames += skip;
+    let k = skip;
+    while (k < over && this._state === 'overdubbing') {
+      const m = Math.min(STEP, over - k);
+      this._take.read(T + k, rawL, rawR, 0, m);
+      this.splatStep(rawL, rawR, 0, m, rate);
+      this.readPos = this.wq;
+      if (!this.writer.flush(this._take, this.wq - this.writeDelay, T)) this.writeFailed();
       k += m;
     }
   }
@@ -586,9 +835,26 @@ export class Track implements SyncTrack {
     return this.cfg.measure;
   }
 
-  /** `measures` in whole frames at the current tempo (never so short that the recording would be discarded). */
+  /** The recording's length in measures: those banked at tempo changes, then the rest at the current measure. */
+  private recordedMeasures(): number {
+    return this.recMu + (this._take.length - this.recFr) / this.host.sync.measure();
+  }
+
+  /**
+   * Frames from the recording's start to the end of its measure `measures`, across tempo changes: the frames banked
+   * at the last change, then the rest at the current measure length. (A length within the banked part is taken pro
+   * rata.) With no tempo change it is `round(measures * measure)`.
+   */
+  private framesFor(measures: number): number {
+    if (measures >= this.recMu) {
+      return this.recFr + Math.round((measures - this.recMu) * this.host.sync.measure());
+    }
+    return Math.round((measures * this.recFr) / this.recMu);
+  }
+
+  /** `framesFor(measures)`, never so short that the recording would be discarded. */
   private measuresToFrames(measures: number): number {
-    return Math.max(2 * this.host.xfade + 1, Math.round(measures * this.host.sync.measure()));
+    return Math.max(2 * this.host.xfade + 1, this.framesFor(measures));
   }
 
   /** The length, in measures, at which the recording ends by itself: a waiting end press, or a fixed length. */
@@ -622,29 +888,55 @@ export class Track implements SyncTrack {
       const unit: ArmUnit = cfg.loopSyncMode === 'MEASURE' ? 'measure' : 'loop';
       const at = sync.boundary(now, this.unitFrames(unit));
       if (at > now) this.setArm('play', at, unit);
-      else this.startPlayback(this.alignedPosition(now));
+      else this.startPlayback(this.alignedPosition(now), this.alignPhase);
       return;
     }
     // IMMEDIATE starts now. SYNC ADJUST, which the guide gives only "When SPEED CHANGE is set to IMMEDIATE": within
     // one measure (or beat) of a phrase line, either side, the start snaps into step with it (INFERRED: at once, at the
     // aligned position, rather than waiting for the line).
     const play = this.host.memory.play;
-    const len = this._take.length;
-    const off = phraseOffset(now, sync.origin, len);
+    const phrase = this._take.length / this.rateAt(this.targetSpeed()); // the loop's length on the timeline
+    const off = phraseOffset(now, sync.origin, phrase);
     const window = play.syncAdjust === 'BEAT' ? sync.beat() : sync.measure();
-    const near = play.speedChange === 'IMMEDIATE' && (off <= window || len - off <= window);
-    this.startPlayback(near ? this.alignedPosition(now) : this.startPosition());
+    const near = play.speedChange === 'IMMEDIATE' && (off <= window || phrase - off <= window);
+    if (near) this.startPlayback(this.alignedPosition(now), this.alignPhase);
+    else this.startPlayback(this.startPosition());
   }
 
   /**
-   * The phrase position in step with the grid at `frame`: `(frame - origin) mod length` (mirrored in REVERSE). A
-   * 1SHOT plays once from its start, so it always starts there (INFERRED).
+   * The phrase position in step with the grid at `frame` (mirrored in REVERSE). The loop spans `length / rate`
+   * timeline frames, so the position is `rate * ((frame - origin) mod (length / rate))`: at rate 1, the whole frame
+   * `(frame - origin) mod length`. A 1SHOT plays once from its start, so it always starts there (INFERRED).
    */
   private alignedPosition(frame: number): number {
+    this.alignPhase = 0;
     if (this.cfg.oneShot) return this.startPosition();
     const len = this._take.length;
-    const off = Math.round(phraseOffset(frame, this.host.sync.origin, len)) % len;
-    return this.cfg.reverse ? len - 1 - off : off;
+    const rate = this.rateAt(this.targetSpeed());
+    if (this.isUnity(rate)) {
+      // A whole frame, for the exact path. At rate 1 exactly the phrase is the take. Otherwise (a loop a fraction of a
+      // frame off its grid length) the frame is chosen to keep the coming pass centred on the grid, and its offset from
+      // the ideal start becomes the seam phase (ruling R45).
+      const phrase = len / rate;
+      const raw = phraseOffset(frame, this.host.sync.origin, phrase);
+      if (rate === 1) {
+        const off = Math.round(raw) % len;
+        return this.cfg.reverse ? len - 1 - off : off;
+      }
+      const off = (((Math.round(raw - (phrase - len) / 2) % len) + len) % len);
+      // `raw` counts timeline frames into the phrase (which is `phrase` long), so a frame that wrapped to the loop
+      // start belongs to the next phrase: wrap the phase by the phrase, not the loop length.
+      let phase = off - raw;
+      if (phase < -phrase / 2) phase += phrase;
+      else if (phase > phrase / 2) phase -= phrase;
+      this.alignPhase = phase;
+      return this.cfg.reverse ? len - 1 - off : off;
+    }
+    let off = phraseOffset(frame, this.host.sync.origin, len / rate) * rate;
+    if (off >= len) off -= len;
+    if (!this.cfg.reverse) return off;
+    const p = len - 1 - off;
+    return p < 0 ? p + len : p;
   }
 
   /** Frames between the lines an armed action waits on. */
@@ -667,15 +959,20 @@ export class Track implements SyncTrack {
     const action = this.arm.action;
     this.arm.action = null;
     if (action === 'rec') this.beginRecording(frame);
-    else if (action === 'play') this.startPlayback(this.alignedPosition(frame));
+    else if (action === 'play') this.startPlayback(this.alignedPosition(frame), this.alignPhase);
   }
 
-  /** Start playback at take position `pos`, per START MODE. */
-  private startPlayback(pos: number): void {
+  /**
+   * Start playback at take position `pos`, per START MODE, at the speed set now (the track was not playing). `phase`:
+   * the seam phase of an aligned start.
+   */
+  private startPlayback(pos: number, phase = 0): void {
+    this.speed = this.targetSpeed();
+    this.rateWarn = 0;
     this._state = 'playing';
     this.stopping = null;
     this.mute.set(1);
-    this.playhead = pos;
+    this.seek(pos, phase);
     if (this.cfg.startMode === 'FADE') {
       this.attack.set(1); // the fade itself starts from 0
       this.env.set(0);
@@ -693,8 +990,24 @@ export class Track implements SyncTrack {
   /** 1SHOT retrigger: the old position fades out (release) while the start fades in, both over 5 ms. */
   private retrigger(): void {
     this.startRelease(this.direction());
-    this.playhead = this.startPosition();
+    this.seek(this.startPosition());
     this.rampIn();
+  }
+
+  /**
+   * Jump the playhead to `pos`. Gathered overdub writes land now, since the stream they belong to has ended; a splatted
+   * punch-out tail still running is cut (only a start within 5 ms of a stop does that). The exact path resumes when
+   * `pos` is a whole frame (and the rate is 1), and the stretcher is re-seeded when next used.
+   */
+  private seek(pos: number, phase = 0): void {
+    this.flushWrites();
+    this.playhead = pos;
+    this.readPos = pos;
+    this.exact = Number.isInteger(pos);
+    this.seamPhase = phase;
+    this.seamSkip = false;
+    this.replayNext = false;
+    this.stretchSynced = false;
   }
 
   /**
@@ -707,6 +1020,7 @@ export class Track implements SyncTrack {
     this._state = 'overdubbing';
     this.passMode = this.cfg.dubMode;
     this.passFrames = passFrames;
+    if (!this.exact) this.startStream();
     if (this.passMode === 'REPLACE2') {
       if (fromRecording) this.mute.set(0);
       else this.mute.start(0, this.host.xfade);
@@ -715,11 +1029,18 @@ export class Track implements SyncTrack {
 
   /** Punch out: back to playing. `tail` keeps writing the fading input for 5 ms (not after MEMORY FULL). */
   private endPass(tail: boolean): void {
-    if (tail) {
+    this.seamSkip = false;
+    this.replayNext = false;
+    if (tail && this.exact) {
       // A tail still running from a pass that ended under 5 ms ago is cut short (a negligible overlap).
-      this.dubTail.pos = this.playhead;
+      this.dubTail.pos = this.wrapped(this.playhead);
       this.dubTail.left = this.host.xfade;
       this.dubTail.replace = this.passMode !== 'OVERDUB';
+    } else if (tail) {
+      // The splatted stream carries on for 5 ms more, fading out (see writeSplatted).
+      this.wTail = this.host.xfade;
+      this.wTailReplace = this.passMode !== 'OVERDUB';
+      this.splice.punchOut(this.wq, this.wRate);
     }
     this._state = 'playing';
     if (this.passMode === 'REPLACE2') this.mute.start(1, this.host.xfade);
@@ -748,7 +1069,24 @@ export class Track implements SyncTrack {
       return;
     }
     const { relBufL, relBufR } = this;
-    let pos = this.playhead;
+    if (!this.exact) {
+      // The next 5 ms at the current rate, as the stretcher or the interpolated read would have played them.
+      const v = dir * this.rateAt(this.speed);
+      const bounded = this.cfg.oneShot;
+      if (this.cfg.tempoSyncMode === 'XFADE') {
+        if (!this.stretchSynced) {
+          this.stretch.reset(this.playhead);
+          this.stretchSynced = true;
+        }
+        this.stretch.bounded = bounded;
+        this.stretch.peek(take, v, xf, relBufL, relBufR, 0);
+      } else {
+        for (let k = 0; k < xf; k++) readInterpolated(take, this.playhead + v * k, relBufL, relBufR, k, bounded);
+      }
+      rel.left = xf;
+      return;
+    }
+    let pos = this.wrapped(this.playhead); // a seam-corrected frame (-1 or length) is the loop's last or first
     let k = 0;
     while (k < xf) {
       if (dir > 0) {
@@ -776,10 +1114,15 @@ export class Track implements SyncTrack {
     this.attack.start(1, this.host.xfade);
   }
 
+  /** Stop. A splatted punch-out tail carries on writing (and its gathered writes land) without the playhead. */
   private toStopped(): void {
     this._state = 'stopped';
     this.stopping = null;
     this.playhead = 0;
+    this.stretchSynced = false;
+    this.seamSkip = false;
+    this.replayNext = false;
+    this.rateWarn = 0;
     this.env.set(1);
     this.mute.set(1);
     this.attack.set(1);
@@ -801,6 +1144,13 @@ export class Track implements SyncTrack {
     this.attack.set(1);
     this.recTail.left = 0;
     this.dubTail.left = 0;
+    this.writer.discard();
+    this.splice.reset(0);
+    this.wTail = 0;
+    this.exact = true;
+    this.readPos = 0;
+    this.stretchSynced = false;
+    this.rateWarn = 0;
     this.arm.action = null;
     this.recEnd = null;
     this._measures = null;
@@ -820,6 +1170,224 @@ export class Track implements SyncTrack {
   private fadeTime(f: FadeTime): number {
     const t = this.host.transport;
     return fadeTimeFrames(this.host.sr, t.bpm, t.beat, f);
+  }
+
+  // -------------------------------------------------------------------------------------------------------------------
+  // Tempo sync and speed
+  // -------------------------------------------------------------------------------------------------------------------
+
+  /** The speed the track is set to: a held SPEED MOMENT, else TEMPO SYNC SPEED. */
+  private targetSpeed(): Speed {
+    return this.moment ?? this.cfg.tempoSyncSpeed;
+  }
+
+  /**
+   * The speed playing now. A new speed applies at once with SPEED CHANGE IMMEDIATE, or on a track that is not playing
+   * (INFERRED: there is no seam to wait for, so it starts at the new speed); LOOP END waits for the seam (`advance`).
+   */
+  private currentSpeed(): Speed {
+    const target = this.targetSpeed();
+    if (target !== this.speed && (!this.sounding || this.host.memory.play.speedChange === 'IMMEDIATE')) {
+      this.speed = target;
+    }
+    return this.speed;
+  }
+
+  /**
+   * The rate counts as 1: the loop's length on the timeline is within half a frame of its length in frames. A synced
+   * loop at its own grid tempo with SPEED NORMAL always is (its length was rounded to whole frames); a real tempo or
+   * speed change never is. Such a loop plays on the exact path, its drift corrected at the seam.
+   */
+  private isUnity(rate: number): boolean {
+    return Math.abs(rate - 1) * this._take.length <= 0.5 + 1e-9;
+  }
+
+  /** A position folded into `[0, length)`: the exact path's seam-corrected frames -1 and `length` are the loop's ends. */
+  private wrapped(pos: number): number {
+    const len = this._take.length;
+    return pos < 0 ? pos + len : pos >= len ? pos - len : pos;
+  }
+
+  /** The playback rate at `speed`, clamped to RATE_MIN..RATE_MAX. */
+  private rateAt(speed: Speed): number {
+    const r = playbackRate(this.cfg.tempoSyncSw, this.host.transport.bpm, this._recordedTempo, speed);
+    return r > RATE_MAX ? RATE_MAX : r < RATE_MIN ? RATE_MIN : r;
+  }
+
+  /**
+   * The rate for the next step, read live (a tempo, speed or TEMPO SYNC change applies from the frame it lands on).
+   * Outside RATE_MIN..RATE_MAX it raises TEMPO TOO SLOW or TEMPO TOO FAST, once each time it goes out (INFERRED: the
+   * LCD message, not one per block), and plays at the limit.
+   */
+  private stepRate(): number {
+    const r = playbackRate(this.cfg.tempoSyncSw, this.host.transport.bpm, this._recordedTempo, this.currentSpeed());
+    const warn = r > RATE_MAX ? 1 : r < RATE_MIN ? -1 : 0;
+    if (warn !== this.rateWarn) {
+      this.rateWarn = warn;
+      if (warn > 0) this.host.post('TEMPO TOO FAST');
+      else if (warn < 0) this.host.post('TEMPO TOO SLOW');
+    }
+    return r > RATE_MAX ? RATE_MAX : r < RATE_MIN ? RATE_MIN : r;
+  }
+
+  /** The rate is no longer 1: from here the playhead is fractional and overdubs are splatted. */
+  private leaveExact(): void {
+    this.exact = false;
+    this.seamSkip = false;
+    this.replayNext = false;
+    this.readPos = this.playhead;
+    this.stretchSynced = false;
+    if (this._state === 'overdubbing') this.startStream();
+  }
+
+  /** Start (or carry on) the splatted write stream at the playhead. */
+  private startStream(): void {
+    this.writer.begin(this.readPos, this.writeBack);
+    this.wq = this.readPos;
+    this.wqEnd = this.readPos;
+    if (this.wTail === 0) {
+      // The input is not continuous with any earlier splices. (A pass from a recording that starts at full gain has
+      // passFrames >= the ramp already.)
+      const replace = this.passMode !== 'OVERDUB';
+      this.splice.reset(this.readPos, replace, this.passFrames, this.host.xfade, this.rateAt(this.speed));
+      this.streamXfade = this.cfg.tempoSyncMode === 'XFADE';
+    }
+  }
+
+  /** The splatted input has ended (the tail is done, or the playhead jumps): close an XFADE overdub's splices. */
+  private finishStream(): void {
+    this.splice.finish(this.writer, this.wqEnd);
+  }
+
+  /** A step's splatted writes: the pass and any punch-out tail, then whatever gathered frames are now complete. */
+  private writeSplatted(
+    inL: Float32Array,
+    inR: Float32Array,
+    a: number,
+    m: number,
+    rate: number,
+    sounding: boolean,
+    dir: 1 | -1,
+  ): void {
+    if (this._state === 'overdubbing' || this.wTail > 0) {
+      this.splatStep(inL, inR, a, m, sounding ? rate : this.wRate);
+      if (this._state !== 'overdubbing' && this.wTail === 0) this.finishStream(); // the punch-out tail just ended
+    }
+    const active = this._state === 'overdubbing' || this.wTail > 0;
+    let limit: number;
+    if (sounding && dir > 0) {
+      // Behind every read head (the stretcher's lag up to 1.5 grains) and every write still to come (a splice reaches
+      // up to 6167 frames at 48 kHz, 4x), from where the
+      // playhead will be after this step: this step's reads are done, so only the next step's reads count.
+      const next = this.readPos + rate * m;
+      limit = (active ? Math.min(this.wq, next) : next) - this.writeDelay;
+    } else {
+      // Nothing reads ahead of a stopped or reversed playhead in the stream's direction.
+      limit = active ? this.wq - SPLAT_MAX_WIDTH - 1 : Infinity;
+    }
+    if (!this.writer.flush(this._take, limit, this._take.length)) this.writeFailed();
+  }
+
+  /**
+   * Gather `m` input frames from `in[a, a + m)` into the writer, at `rate` take frames per input frame from stream
+   * frame `wq`, with the pass's punch-in gain and the tail's punch-out gain composed per DUB MODE (the tail's write,
+   * then the pass's, as on the exact path).
+   *
+   * INFERRED (overdub at a rate other than 1): PITCH splats each input frame at the fractional playhead, so the next
+   * pass at the same rate plays it back as played (tape-style, like the playback). XFADE time-compresses the input by
+   * the rate in splices that keep its pitch (`SpliceWriter`), placed at the playhead, so the stretcher plays it back at
+   * the pitch it was played. (Splatting at the playhead would store it time-compressed, and the stretcher would then
+   * play it back pitch-shifted by 1 / rate.)
+   */
+  private splatStep(inL: Float32Array, inR: Float32Array, a: number, m: number, rate: number): void {
+    const xfade = this.cfg.tempoSyncMode === 'XFADE';
+    if (xfade !== this.streamXfade) this.switchWritePath(xfade, rate);
+    const xf = this.host.xfade;
+    const passing = this._state === 'overdubbing';
+    const tail = this.wTail;
+    const tailReplace = this.wTailReplace;
+    const passReplace = this.passMode !== 'OVERDUB';
+    const j0 = this.passFrames;
+    const { alphaBuf, betaBuf, writer } = this;
+    for (let k = 0; k < m; k++) {
+      let al = 1;
+      let be = 0;
+      if (k < tail) {
+        const g = punchOutGain(tail - k, xf);
+        if (tailReplace) {
+          al *= 1 - g;
+          be = be * (1 - g) + g;
+        } else {
+          be += g;
+        }
+      }
+      if (passing) {
+        const g = punchInGain(j0 + k, xf);
+        if (passReplace) {
+          al *= 1 - g;
+          be = be * (1 - g) + g;
+        } else {
+          be += g;
+        }
+      }
+      alphaBuf[k] = al;
+      betaBuf[k] = be;
+    }
+    const width = rate > 1 ? rate : 1;
+    const scale = rate / width;
+    const q0 = this.wq;
+    // Only the frames that carry input: after a punch-out tail ends, the rest of the step writes nothing.
+    const live = passing ? m : Math.min(m, tail);
+    if (xfade) {
+      const splice = this.splice;
+      // (The splices apply the punch gains by take position: see SpliceWriter.)
+      for (let k = 0; k < live; k++) splice.push(writer, q0 + rate * k, rate, inL[a + k], inR[a + k]);
+    } else {
+      for (let k = 0; k < live; k++) {
+        writer.deposit(q0 + rate * k, width, scale, inL[a + k], inR[a + k], alphaBuf[k], betaBuf[k]);
+      }
+    }
+    this.wRate = rate;
+    this.wqEnd = q0 + rate * live;
+    this.wq = q0 + rate * m;
+    if (passing) this.passFrames = j0 + m;
+    this.wTail = tail > m ? tail - m : 0;
+  }
+
+  /**
+   * TEMPO SYNC MODE changed in the middle of a splatted pass (or its tail). The old write path is closed at the
+   * playhead, keeping everything it wrote, and the new one carries on from there: PITCH splats from the playhead on
+   * (the splices are finished there: their gaps filled, nothing kept past it); XFADE opens fresh splices anchored at
+   * the playhead, past the PITCH writes, with the pass's punch-in ramp as far as it has got (and a running punch-out
+   * fade carried on).
+   */
+  private switchWritePath(toXfade: boolean, rate: number): void {
+    if (toXfade) {
+      const xf = this.host.xfade;
+      this.splice.reset(this.wq, this.passMode !== 'OVERDUB', this.passFrames, xf, rate);
+      if (this.wTail > 0) this.splice.punchOut(this.wq - rate * (xf - this.wTail), rate);
+    } else {
+      this.splice.finish(this.writer, this.wqEnd);
+    }
+    this.streamXfade = toXfade;
+  }
+
+  /** Write every gathered frame now (the stream ended with a jump of the playhead), cutting a splatted tail. */
+  private flushWrites(): void {
+    this.finishStream();
+    this.wTail = 0;
+    if (this.writer.pending && !this.writer.flush(this._take, Infinity, this._take.length)) {
+      this.host.post('MEMORY FULL');
+    }
+  }
+
+  /** A gathered write could not get a chunk (MEMORY FULL): the stream ends where it is, like a failed `writePass`. */
+  private writeFailed(): void {
+    this.host.post('MEMORY FULL');
+    this.wTail = 0;
+    this.writer.discard();
+    this.splice.reset(0);
+    if (this._state === 'overdubbing') this.endPass(false);
   }
 
   // -------------------------------------------------------------------------------------------------------------------
@@ -872,28 +1440,36 @@ export class Track implements SyncTrack {
         continue;
       }
       const sounding = this.sounding;
-      if (!sounding && this.rel.left === 0 && this.recTail.left === 0 && this.dubTail.left === 0) {
+      const splatting = this.wTail > 0 || this.writer.pending;
+      if (!sounding && this.rel.left === 0 && this.recTail.left === 0 && this.dubTail.left === 0 && !splatting) {
         outL.fill(0, a, to);
         outR.fill(0, a, to);
         return;
       }
       const dir = this.direction();
-      const m = this.stepLength(to - a, sounding, dir);
+      const rate = sounding ? this.stepRate() : this.wRate;
+      if (sounding && this.exact && !this.isUnity(rate)) this.leaveExact();
+      const m = this.stepLength(to - a, sounding, dir, rate);
       const relN = Math.min(m, this.rel.left);
       // Reads first (the output is the audio before this step's writes)...
-      if (sounding) this.readPlayback(m, dir);
+      if (sounding) this.readPlayback(m, dir, rate);
       // ...then the tails, then the pass. A recording's seam crossfade must land before a REC->DUB pass adds to the
-      // same frames, or it would scale the overdub layer down.
+      // same frames, or it would scale the overdub layer down. (Splatted writes are gathered and land later still.)
       if (this.recTail.left > 0) this.writeTail(this.recTail, inL, inR, a, m);
       if (this.dubTail.left > 0) this.writeTail(this.dubTail, inL, inR, a, m);
-      if (this._state === 'overdubbing') this.writePass(inL, inR, a, m);
+      if (this.exact) {
+        if (this._state === 'overdubbing') this.writePass(inL, inR, a, m);
+      } else if (this._state === 'overdubbing' || splatting) {
+        this.writeSplatted(inL, inR, a, m, rate, sounding, dir);
+      }
       if (sounding || relN > 0) {
         this.emit(outL, outR, a, m, sounding, relN);
       } else {
         outL.fill(0, a, a + m);
         outR.fill(0, a, a + m);
       }
-      if (sounding) this.advance(m, dir);
+      this.replayNext = false; // a replayed frame lasts one step of one frame
+      if (sounding) this.advance(m, dir, rate);
       a += m;
     }
   }
@@ -946,32 +1522,118 @@ export class Track implements SyncTrack {
   }
 
   /** Frames to render in one step: up to the loop end (in the play direction) and the end of a FADE stop. */
-  private stepLength(max: number, sounding: boolean, dir: 1 | -1): number {
+  private stepLength(max: number, sounding: boolean, dir: 1 | -1, rate: number): number {
     let m = Math.min(max, STEP);
     if (sounding) {
-      m = Math.min(m, dir > 0 ? this._take.length - this.playhead : this.playhead + 1);
+      const len = this._take.length;
+      const p = this.playhead;
+      let left: number;
+      if (!this.exact) left = this.framesToSeam(len, p, dir, rate);
+      else if (p < 0 || p >= len || this.replayNext) left = 1; // a replayed frame (seam correction)
+      else left = dir > 0 ? len - p : p + 1;
+      m = Math.min(m, left);
       if (this.stopping === 'FADE') m = Math.min(m, Math.max(1, this.env.remaining));
     }
     return m;
   }
 
-  /** The take's audio under the next `m` frames of the playhead into `rawL`/`rawR`, in play order. */
-  private readPlayback(m: number, dir: 1 | -1): void {
+  /**
+   * Frames until the playhead `p`, moving `rate` per frame in direction `dir`, crosses the loop end: the first frame
+   * count `k` at which `p + rate * k >= len` (forwards) or `p - rate * k < 0` (backwards), so the last frame read is
+   * still inside the loop and the next lands past the seam.
+   */
+  private framesToSeam(len: number, p: number, dir: 1 | -1, rate: number): number {
+    let k: number;
     if (dir > 0) {
-      this._take.read(this.playhead, this.rawL, this.rawR, 0, m);
+      k = Math.max(1, Math.ceil((len - p) / rate));
+      while (k > 1 && p + rate * (k - 1) >= len) k--;
+      while (p + rate * k < len) k++;
     } else {
-      this._take.read(this.playhead - m + 1, this.rawL, this.rawR, 0, m);
-      reverseInPlace(this.rawL, 0, m);
-      reverseInPlace(this.rawR, 0, m);
+      k = Math.max(1, Math.floor(p / rate) + 1);
+      while (k > 1 && p - rate * (k - 1) < 0) k--;
+      while (p - rate * k >= 0) k++;
     }
+    return k;
   }
 
-  /** Write `m` frames of input at the playhead per the pass's DUB MODE, with the punch-in ramp. */
+  /**
+   * The take's audio under the next `m` frames of the playhead into `rawL`/`rawR`, in play order: whole frames on the
+   * exact path; otherwise TEMPO SYNC MODE PITCH reads between samples at the rate (tape-style), and XFADE runs the
+   * stretcher, whose source position is the playhead.
+   */
+  private readPlayback(m: number, dir: 1 | -1, rate: number): void {
+    const { rawL, rawR } = this;
+    const len = this._take.length;
+    this.usedHeads = false;
+    if (this.exact) {
+      if (this.playhead < 0 || this.playhead >= len || this.replayNext) {
+        // A replayed frame (seam correction, m is 1): the frame as it sounded a moment ago. An overdub pass has written
+        // it since, and that layer must not be heard until the next pass.
+        rawL[0] = this.lastRawL;
+        rawR[0] = this.lastRawR;
+      } else if (dir > 0) {
+        this._take.read(this.playhead, rawL, rawR, 0, m);
+      } else {
+        this._take.read(this.playhead - m + 1, rawL, rawR, 0, m);
+        reverseInPlace(rawL, 0, m);
+        reverseInPlace(rawR, 0, m);
+      }
+      this.lastRawL = rawL[m - 1];
+      this.lastRawR = rawR[m - 1];
+      return;
+    }
+    const v = dir * rate;
+    if (this.cfg.tempoSyncMode === 'XFADE') {
+      if (!this.stretchSynced) {
+        this.stretch.reset(this.playhead);
+        this.stretchSynced = true;
+      }
+      // A 1SHOT plays once: its heads read silence past the take's ends rather than wrapping to its other end.
+      this.stretch.bounded = this.cfg.oneShot;
+      this.stretch.render(this._take, v, m, rawL, rawR, 0);
+      this.usedHeads = true;
+      return;
+    }
+    // INFERRED: a switch from XFADE to PITCH mid-loop drops the stretcher at once (a small step in the output).
+    this.stretchSynced = false;
+    const p = this.playhead;
+    const bounded = this.cfg.oneShot;
+    for (let k = 0; k < m; k++) readInterpolated(this._take, p + v * k, rawL, rawR, k, bounded);
+  }
+
+  /**
+   * Write `m` frames of input at the playhead per the pass's DUB MODE, with the punch-in ramp. After a seam correction
+   * skipped a frame, the first input frame is written to the skipped frame too, so no frame misses a pass (a hole
+   * there would step by the whole layer and grow with every pass). A replayed frame's input frame is dropped: the
+   * playhead sits outside the take, and `AudioTake.write` writes nothing there.
+   */
   private writePass(inL: Float32Array, inR: Float32Array, a: number, m: number): void {
     const xf = this.host.xfade;
     const j0 = this.passFrames;
     const { srcL, srcR, tmpL, tmpR } = this;
     const replace = this.passMode !== 'OVERDUB';
+    if (this.replayNext) {
+      this.passFrames = j0 + m; // a replayed frame (m is 1): its input frame is dropped, as at frame -1
+      return;
+    }
+    if (this.seamSkip) {
+      this.seamSkip = false;
+      const g = punchInGain(j0, xf);
+      const at = this.playhead - 1;
+      if (replace) {
+        this._take.read(at, tmpL, tmpR, 0, 1);
+        srcL[0] = tmpL[0] * (1 - g) + inL[a] * g;
+        srcR[0] = tmpR[0] * (1 - g) + inR[a] * g;
+      } else {
+        srcL[0] = inL[a] * g;
+        srcR[0] = inR[a] * g;
+      }
+      if (!this._take.write(at, srcL, srcR, 1, replace ? 'replace' : 'add')) {
+        this.host.post('MEMORY FULL');
+        this.endPass(false);
+        return;
+      }
+    }
     if (replace) {
       // The audio being replaced as it is now, after any tail written this step.
       this._take.read(this.playhead, tmpL, tmpR, 0, m);
@@ -1072,12 +1734,36 @@ export class Track implements SyncTrack {
     rel.left = relLeft - relN;
   }
 
-  /** Move the playhead `m` frames on; handle the loop end (wrap, 1SHOT end, LOOP stop) and the end of a FADE stop. */
-  private advance(m: number, dir: 1 | -1): void {
+  /**
+   * Move the playhead on by `m` frames at `rate`; handle the loop end (wrap, a SPEED CHANGE LOOP END, 1SHOT end, LOOP
+   * stop, the exact path's seam correction, a return to the exact path) and the end of a FADE stop. A fractional
+   * playhead keeps its fraction across the seam.
+   */
+  private advance(m: number, dir: 1 | -1, rate: number): void {
     const len = this._take.length;
-    this.playhead += dir * m;
-    if (this.playhead >= len || this.playhead < 0) {
-      this.playhead = dir > 0 ? 0 : len - 1;
+    const step = this.exact ? dir * m : dir * rate * m;
+    this.playhead = this.usedHeads ? this.stretch.position : this.playhead + step;
+    this.readPos += step;
+    // Only `length` (forwards) or below 0 (backwards) is past the seam. A seam-corrected frame (-1 forwards, `length`
+    // backwards) is already past it and steps back into the loop, also when the step that leaves it is fractional (a
+    // tempo change on that very frame must not cross the seam a second time).
+    const past = dir > 0 ? this.playhead >= len : this.playhead < 0;
+    if (!past && !this.exact && (this.playhead < -1 || this.playhead > len)) {
+      // Only after the play direction flipped: fold back into the loop without a seam.
+      const folded = ((this.playhead % len) + len) % len;
+      if (this.stretchSynced) this.stretch.shift(folded - this.playhead);
+      this.playhead = folded;
+    }
+    if (past) {
+      const shift = this.playhead >= len ? -len : len;
+      this.playhead += shift; // exact: len -> 0 forwards, -1 -> len - 1 backwards
+      if (this.stretchSynced) this.stretch.shift(shift);
+      if (this.playhead >= len || this.playhead < 0) {
+        // Only a loop shorter than one step at 4x gets here.
+        this.playhead = ((this.playhead % len) + len) % len;
+        this.stretchSynced = false;
+      }
+      this.speed = this.targetSpeed(); // the seam: where SPEED CHANGE LOOP END switches
       if (this.cfg.oneShot || this.stopping === 'LOOP') {
         // The release runs on from the wrapped position: the seam crossfade made it the loop end's continuation.
         // (INFERRED: the 5 ms ramp follows the loop end rather than taking the loop's last 5 ms.)
@@ -1086,8 +1772,54 @@ export class Track implements SyncTrack {
         this.toStopped();
         return;
       }
+      if (this.exact) this.correctSeam(dir, rate);
+      else if (this.isUnity(this.rateAt(this.speed))) this.enterExactAtSeam(dir);
     }
     if (this.stopping === 'FADE' && !this.env.active) this.toStopped();
+  }
+
+  /**
+   * The exact path at the seam (ruling R45). The loop's true length on the timeline is `length / rate`, a fraction of
+   * a frame off its length in frames; `seamPhase` holds how far the pass just ended ran from that ideal. The next pass
+   * starts a frame early (replaying the frame just played, as frame -1 or `length`), on time, or a frame late (skipping
+   * the loop's first frame), whichever keeps the error centred on zero over the coming pass, so it stays within 0.75
+   * of a frame. Both land in the seam crossfade. During an overdub a replayed frame plays as it was before the pass
+   * wrote it and its input frame is dropped, and a skipped frame is written with the next input frame too (INFERRED:
+   * a one-sample stall or skip in that layer, at the crossfaded seam).
+   */
+  private correctSeam(dir: 1 | -1, rate: number): void {
+    const len = this._take.length;
+    const drift = len / rate - len; // ideal pass length minus actual, in frames (at most 0.5)
+    if (drift === 0 && this.seamPhase === 0) return;
+    let shift = -Math.round(this.seamPhase + 1.5 * drift);
+    if (shift < -1) shift = -1;
+    else if (shift > 1) shift = 1;
+    this.seamPhase += drift + shift;
+    this.playhead = dir > 0 ? shift : len - 1 - shift;
+    if (shift > 0 && this._state === 'overdubbing') this.seamSkip = true;
+  }
+
+  /**
+   * The rate is back to 1 (a tempo nudged back, a speed or SPEED MOMENT back to NORMAL, TEMPO SYNC SW off): at this
+   * seam the fractional playhead rounds to a whole frame and the exact path resumes, keeping the fraction as its seam
+   * phase, crossfaded over 5 ms. Gathered writes land now (they are behind the playhead) and a running pass carries on
+   * writing whole frames.
+   */
+  private enterExactAtSeam(dir: 1 | -1): void {
+    // The stretched (or interpolated) playback fades out over 5 ms from where it is, through the release voice, while
+    // the exact read ramps in, as `retrigger` does: a cut here would click.
+    this.startRelease(dir);
+    const len = this._take.length;
+    const frac = this.playhead;
+    let p = Math.round(frac);
+    if (p >= len) p = len - 1;
+    this.seamPhase = dir > 0 ? p - frac : frac - p;
+    this.flushWrites();
+    this.playhead = p;
+    this.readPos = p;
+    this.exact = true;
+    this.stretchSynced = false;
+    this.rampIn();
   }
 
   // -------------------------------------------------------------------------------------------------------------------
@@ -1110,20 +1842,44 @@ export class Track implements SyncTrack {
       stopping: this.stopping !== null,
       autoRecWaiting: false,
       // INFERRED: the playhead's place in the take, so it runs 1 -> 0 in REVERSE; 0 when not playing.
-      position: sounding && len > 0 ? this.playhead / len : 0,
+      position: sounding && len > 0 ? this.wrapped(this.playhead) / len : 0,
       lengthFrames: len, // grows while recording
       measures: this._measures, // null for free loops
       peak,
       canUndo: false,
       canRedo: false,
       hasMark: false,
-      speed: 'NORMAL',
+      speed: this.currentSpeed(),
     };
   }
 
-  /** A copy of the loop, or null while the track is empty or its first recording is still running. */
+  /**
+   * Write every gathered overdub frame into the take now. Returns true when the take is then complete: no pass and no
+   * punch-out tail (on either path) is still writing to it.
+   *
+   * Undo/redo, REC BACK, MARK and any other snapshot of the take (Task 8) must call this first, and snapshot only once
+   * it returns true. At a rate other than 1 an overdub's writes are gathered and land `writeDelay` behind the playhead
+   * (6175 frames, about 129 ms at 48 kHz, PITCH and XFADE alike) after the pass; the punch-out tail writes for 5 ms
+   * after the press on every path. While a pass or tail is still running, only the frames it can no longer reach are
+   * written (writing the rest early would lose their later contributions) and it returns false: call it again once the
+   * tail has ended.
+   */
+  flushPendingWrites(): boolean {
+    const active = this._state === 'overdubbing' || this.wTail > 0;
+    if (this.writer.pending) {
+      const limit = active ? Math.min(this.wq, this.readPos) - this.writeDelay : Infinity;
+      if (!this.writer.flush(this._take, limit, this._take.length)) this.writeFailed();
+    }
+    return !active && this.dubTail.left === 0 && this.recTail.left === 0 && !this.writer.pending;
+  }
+
+  /**
+   * A copy of the loop, or null while the track is empty or its first recording is still running. Pending overdub
+   * writes land first (`flushPendingWrites`).
+   */
   audio(): TrackAudio | null {
     if (this._state === 'empty' || this._state === 'recording') return null;
+    this.flushPendingWrites();
     const { L, R } = this._take.toArrays();
     return { L, R, sampleRate: this.host.sr, recordedTempo: this._recordedTempo, measures: this._measures };
   }

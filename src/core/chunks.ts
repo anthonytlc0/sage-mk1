@@ -101,6 +101,24 @@ export class AudioTake {
     return this.len;
   }
 
+  /** Frames per chunk (the pool's: one second). */
+  get chunkFrames(): number {
+    return this.pool.chunkFrames;
+  }
+
+  /**
+   * Chunk `ci`'s left samples, for reads in tight loops (resampleRead.ts), where `read` per sample would cost too much.
+   * Read only: writing through it would bypass copy-on-write. `ci` must be below `ceil(length / chunkFrames)`.
+   */
+  chunkL(ci: number): Float32Array {
+    return this.chunks[ci].L;
+  }
+
+  /** Chunk `ci`'s right samples; see `chunkL`. */
+  chunkR(ci: number): Float32Array {
+    return this.chunks[ci].R;
+  }
+
   /**
    * Add `n` frames from `L`/`R`, reading from `offset`. Returns false on MEMORY FULL: the frames that fit in the chunks
    * already held are still written, `length` stops at the last frame written, and nothing further is attempted. Also
