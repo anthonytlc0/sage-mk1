@@ -215,6 +215,11 @@ export class Track implements SyncTrack {
   private seamPhase = 0;
   /** A seam correction skipped a frame while overdubbing: the pass's next input frame is written to it as well. */
   private seamSkip = false;
+  /**
+   * The next frame at the playhead (a whole frame inside the loop) is a replay: it plays `lastRaw` and a pass drops its
+   * input frame there (set when a late REC->DUB loop starts a frame early, on a frame the overshoot dub wrote).
+   */
+  private replayNext = false;
   /** The last sample `readPlayback` produced, before that step's writes: a replayed frame plays it again. */
   private lastRawL = 0;
   private lastRawR = 0;
@@ -226,6 +231,8 @@ export class Track implements SyncTrack {
   private wq = 0;
   /** Stream frame just past the last input frame splatted: the end of the punched span once the input stops. */
   private wqEnd = 0;
+  /** The splatted stream is writing through splices (XFADE), else splatting at the playhead (PITCH). */
+  private streamXfade = false;
   /** The rate the splatted stream last ran at (a punch-out tail keeps it after the track stops). */
   private wRate = 1;
   /** Frames left of a splatted punch-out tail, and whether it replaces. */
@@ -660,6 +667,32 @@ export class Track implements SyncTrack {
     const dub = next === 'dub' && this.canDub();
     if (this.exact) {
       this.readPos = 0;
+      const into = over % T;
+      let p = this.cfg.reverse ? T - 1 - into : into;
+      let shift = 0;
+      if (rate !== 1) {
+        // A loop a fraction of a frame off its grid length (ruling R45): this pass ideally began where the recording's
+        // (rounded) start line plus its passes since put it. Start it a frame early or late when that keeps it nearest
+        // the grid over the pass, as `correctSeam` does at each seam, so it is within 0.75 of a frame from the start.
+        const drift = T / rate - T;
+        let phase = this.recResidual + (1 + Math.floor(over / T)) * drift;
+        shift = -Math.round(phase + drift / 2);
+        shift = shift < -1 ? -1 : shift > 1 ? 1 : shift;
+        phase += shift;
+        this.seamPhase = phase;
+        p = this.cfg.reverse ? p - shift : p + shift;
+        if (p >= T) p -= T;
+        else if (p < -1) p += T;
+      }
+      // Starting a frame early replays the frame just before: the loop's last (frame -1 or T), or, after a late
+      // REC->DUB press, the last frame the overshoot dub is about to write. Either way it plays as it was before any
+      // pass wrote it, and the live pass drops its first input frame there rather than writing that frame twice.
+      const replay = shift < 0 && (p === -1 || p === T || (dub && over > 0));
+      if (replay) {
+        this._take.read(p < 0 ? T - 1 : p >= T ? 0 : p, this.tmpL, this.tmpR, 0, 1); // before the overshoot dub
+        this.lastRawL = this.tmpL[0];
+        this.lastRawR = this.tmpR[0];
+      }
       if (dub) {
         // The pass as it would have run from the line: from position 0, under the seam crossfade. An OVERDUB pass
         // ramps in with the seam (the two input gains sum to 1); a REPLACE pass writes the input at full gain, since
@@ -668,29 +701,8 @@ export class Track implements SyncTrack {
         if (over > 0) this.dubOvershoot(T, over);
       }
       if (over > 0) take.truncate(T);
-      const into = over % T;
-      let p = this.cfg.reverse ? T - 1 - into : into;
-      if (rate !== 1) {
-        // A loop a fraction of a frame off its grid length (ruling R45): this pass ideally began where the recording's
-        // (rounded) start line plus its passes since put it. Start it a frame early or late when that keeps it nearest
-        // the grid over the pass, as `correctSeam` does at each seam, so it is within 0.75 of a frame from the start.
-        const drift = T / rate - T;
-        let phase = this.recResidual + (1 + Math.floor(over / T)) * drift;
-        let shift = -Math.round(phase + drift / 2);
-        shift = shift < -1 ? -1 : shift > 1 ? 1 : shift;
-        phase += shift;
-        this.seamPhase = phase;
-        p = this.cfg.reverse ? p - shift : p + shift;
-        if (p >= T) p -= T;
-        else if (p < -1) p += T;
-        if (p === -1 || p === T) {
-          // A replayed frame: the frame before the loop start, as it was recorded.
-          this._take.read(p < 0 ? T - 1 : 0, this.tmpL, this.tmpR, 0, 1);
-          this.lastRawL = this.tmpL[0];
-          this.lastRawR = this.tmpR[0];
-        }
-        if (shift > 0 && dub) this.seamSkip = true;
-      }
+      if (shift > 0 && dub) this.seamSkip = true;
+      this.replayNext = replay && p >= 0 && p < T; // (frames -1 and T replay by position)
       this.playhead = p;
       this.readPos = p;
       return;
@@ -912,9 +924,11 @@ export class Track implements SyncTrack {
         return this.cfg.reverse ? len - 1 - off : off;
       }
       const off = (((Math.round(raw - (phrase - len) / 2) % len) + len) % len);
+      // `raw` counts timeline frames into the phrase (which is `phrase` long), so a frame that wrapped to the loop
+      // start belongs to the next phrase: wrap the phase by the phrase, not the loop length.
       let phase = off - raw;
-      if (phase < -len / 2) phase += len;
-      else if (phase > len / 2) phase -= len;
+      if (phase < -phrase / 2) phase += phrase;
+      else if (phase > phrase / 2) phase -= phrase;
       this.alignPhase = phase;
       return this.cfg.reverse ? len - 1 - off : off;
     }
@@ -992,6 +1006,7 @@ export class Track implements SyncTrack {
     this.exact = Number.isInteger(pos);
     this.seamPhase = phase;
     this.seamSkip = false;
+    this.replayNext = false;
     this.stretchSynced = false;
   }
 
@@ -1015,6 +1030,7 @@ export class Track implements SyncTrack {
   /** Punch out: back to playing. `tail` keeps writing the fading input for 5 ms (not after MEMORY FULL). */
   private endPass(tail: boolean): void {
     this.seamSkip = false;
+    this.replayNext = false;
     if (tail && this.exact) {
       // A tail still running from a pass that ended under 5 ms ago is cut short (a negligible overlap).
       this.dubTail.pos = this.wrapped(this.playhead);
@@ -1105,6 +1121,7 @@ export class Track implements SyncTrack {
     this.playhead = 0;
     this.stretchSynced = false;
     this.seamSkip = false;
+    this.replayNext = false;
     this.rateWarn = 0;
     this.env.set(1);
     this.mute.set(1);
@@ -1217,6 +1234,7 @@ export class Track implements SyncTrack {
   private leaveExact(): void {
     this.exact = false;
     this.seamSkip = false;
+    this.replayNext = false;
     this.readPos = this.playhead;
     this.stretchSynced = false;
     if (this._state === 'overdubbing') this.startStream();
@@ -1232,6 +1250,7 @@ export class Track implements SyncTrack {
       // passFrames >= the ramp already.)
       const replace = this.passMode !== 'OVERDUB';
       this.splice.reset(this.readPos, replace, this.passFrames, this.host.xfade, this.rateAt(this.speed));
+      this.streamXfade = this.cfg.tempoSyncMode === 'XFADE';
     }
   }
 
@@ -1281,6 +1300,8 @@ export class Track implements SyncTrack {
    * play it back pitch-shifted by 1 / rate.)
    */
   private splatStep(inL: Float32Array, inR: Float32Array, a: number, m: number, rate: number): void {
+    const xfade = this.cfg.tempoSyncMode === 'XFADE';
+    if (xfade !== this.streamXfade) this.switchWritePath(xfade, rate);
     const xf = this.host.xfade;
     const passing = this._state === 'overdubbing';
     const tail = this.wTail;
@@ -1317,7 +1338,7 @@ export class Track implements SyncTrack {
     const q0 = this.wq;
     // Only the frames that carry input: after a punch-out tail ends, the rest of the step writes nothing.
     const live = passing ? m : Math.min(m, tail);
-    if (this.cfg.tempoSyncMode === 'XFADE') {
+    if (xfade) {
       const splice = this.splice;
       // (The splices apply the punch gains by take position: see SpliceWriter.)
       for (let k = 0; k < live; k++) splice.push(writer, q0 + rate * k, rate, inL[a + k], inR[a + k]);
@@ -1331,6 +1352,24 @@ export class Track implements SyncTrack {
     this.wq = q0 + rate * m;
     if (passing) this.passFrames = j0 + m;
     this.wTail = tail > m ? tail - m : 0;
+  }
+
+  /**
+   * TEMPO SYNC MODE changed in the middle of a splatted pass (or its tail). The old write path is closed at the
+   * playhead, keeping everything it wrote, and the new one carries on from there: PITCH splats from the playhead on
+   * (the splices are finished there: their gaps filled, nothing kept past it); XFADE opens fresh splices anchored at
+   * the playhead, past the PITCH writes, with the pass's punch-in ramp as far as it has got (and a running punch-out
+   * fade carried on).
+   */
+  private switchWritePath(toXfade: boolean, rate: number): void {
+    if (toXfade) {
+      const xf = this.host.xfade;
+      this.splice.reset(this.wq, this.passMode !== 'OVERDUB', this.passFrames, xf, rate);
+      if (this.wTail > 0) this.splice.punchOut(this.wq - rate * (xf - this.wTail), rate);
+    } else {
+      this.splice.finish(this.writer, this.wqEnd);
+    }
+    this.streamXfade = toXfade;
   }
 
   /** Write every gathered frame now (the stream ended with a jump of the playhead), cutting a splatted tail. */
@@ -1429,6 +1468,7 @@ export class Track implements SyncTrack {
         outL.fill(0, a, a + m);
         outR.fill(0, a, a + m);
       }
+      this.replayNext = false; // a replayed frame lasts one step of one frame
       if (sounding) this.advance(m, dir, rate);
       a += m;
     }
@@ -1489,7 +1529,7 @@ export class Track implements SyncTrack {
       const p = this.playhead;
       let left: number;
       if (!this.exact) left = this.framesToSeam(len, p, dir, rate);
-      else if (p < 0 || p >= len) left = 1; // a seam-corrected repeat of the loop's last (or, reversed, first) frame
+      else if (p < 0 || p >= len || this.replayNext) left = 1; // a replayed frame (seam correction)
       else left = dir > 0 ? len - p : p + 1;
       m = Math.min(m, left);
       if (this.stopping === 'FADE') m = Math.min(m, Math.max(1, this.env.remaining));
@@ -1526,7 +1566,7 @@ export class Track implements SyncTrack {
     const len = this._take.length;
     this.usedHeads = false;
     if (this.exact) {
-      if (this.playhead < 0 || this.playhead >= len) {
+      if (this.playhead < 0 || this.playhead >= len || this.replayNext) {
         // A replayed frame (seam correction, m is 1): the frame as it sounded a moment ago. An overdub pass has written
         // it since, and that layer must not be heard until the next pass.
         rawL[0] = this.lastRawL;
@@ -1572,6 +1612,10 @@ export class Track implements SyncTrack {
     const j0 = this.passFrames;
     const { srcL, srcR, tmpL, tmpR } = this;
     const replace = this.passMode !== 'OVERDUB';
+    if (this.replayNext) {
+      this.passFrames = j0 + m; // a replayed frame (m is 1): its input frame is dropped, as at frame -1
+      return;
+    }
     if (this.seamSkip) {
       this.seamSkip = false;
       const g = punchInGain(j0, xf);

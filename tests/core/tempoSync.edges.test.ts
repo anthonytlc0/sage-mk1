@@ -277,3 +277,103 @@ describe('the exact path against the grid', () => {
     expect(trk(core).position).toBeLessThan(10 / L);
   });
 });
+
+describe('fix round 3', () => {
+  /** A synced one-measure loop at `bpm` recorded from measure line `line` with REC->DUB OVERDUB, pressed `late` frames late. */
+  function lateDub(bpm: number, line: number, late: number) {
+    const core = makeCore(
+      { tempo: bpm, rec: { recAction: 'REC->DUB' }, track: [{ loopSyncSw: true, dubMode: 'OVERDUB' }] },
+      { sampleRate: SR },
+    );
+    rhythmOn(core);
+    const M = (4 * 60 * SR) / bpm;
+    const L = Math.round(M);
+    const start = Math.round(line * M);
+    const input = tone(100, 0.5);
+    at(core, Math.round(start / 2), recPlay(), input); // armed: recording starts on line `line`
+    at(core, start + L + late, recPlay(), input); // late: the overshoot is dubbed onto the loop start
+    expect(trk(core).state).toBe('overdubbing');
+    run(core, 2000, input);
+    core.command(recPlay());
+    run(core, 600, input);
+    expect(core.tracks[0].flushPendingWrites()).toBe(true);
+    return { take: core.getTrackAudio(0)!.L, L };
+  }
+
+  // A: the close-time seam correction may start the loop a frame early (shift -1). With a late REC->DUB press that
+  // frame is the last one the overshoot dub wrote; the live pass must not add its first input frame there again.
+  it.each([1, 2, 3])('A: a late REC->DUB press at 124 bpm from measure line %i writes no frame twice', (line) => {
+    const { take } = lateDub(124, line, 500);
+    // Recorded tone plus one dubbed layer: content-level second differences stay below about 5e-3 (the seam crossfade
+    // and the punch-in ramp included). A frame dubbed twice steps by the layer's value (0.76 to 1.0 here).
+    let worst = 0;
+    for (let i = 1; i < 3000; i++) worst = Math.max(worst, loopD2(take, i));
+    expect(worst).toBeLessThan(0.01);
+  });
+
+  it('A: the same at 133 bpm (where the correction starts the loop a frame late)', () => {
+    const { take } = lateDub(133, 1, 500);
+    let worst = 0;
+    for (let i = 1; i < 3000; i++) worst = Math.max(worst, loopD2(take, i));
+    expect(worst).toBeLessThan(0.01);
+  });
+
+  // B: TEMPO SYNC MODE changed in the middle of an overdub at a rate other than 1.
+  it.each([
+    ['XFADE', 'PITCH', 1.5],
+    ['XFADE', 'PITCH', 2],
+    ['PITCH', 'XFADE', 1.5],
+    ['PITCH', 'XFADE', 2],
+  ] as const)('B: %s to %s in the middle of an overdub at %fx keeps both parts, with no hole or spill', (from, to, rate) => {
+    const core = makeCore({ track: [{ tempoSyncMode: from }] }, { sampleRate: SR });
+    at(core, 0, recPlay(), dc(0));
+    at(core, 96000, recPlay(), dc(0)); // a silent 2 s loop at tempo 120
+    configure(core, { tempo: 120 * rate }); // playing at `rate` from 96000
+    const input = (f: number): number => (f < 98000 ? 0 : f < 107600 ? 0.25 : 0.1);
+    at(core, 98000, recPlay(), input); // punch in at position 2000 x rate
+    at(core, 107600, { t: 'tempo', bpm: 120 * rate }, input); // (no-op: run to the switch)
+    configure(core, { track: [{ tempoSyncMode: to }] }); // the switch, as the input steps to 0.1
+    at(core, 117200, recPlay(), input); // punch out
+    run(core, 800, input);
+    expect(core.tracks[0].flushPendingWrites()).toBe(true);
+    const take = core.getTrackAudio(0)!.L;
+    const xf = 240;
+    const pIn = 2000 * rate;
+    const pSw = pIn + 9600 * rate;
+    const pOut = pSw + 9600 * rate;
+    const pEnd = pOut + xf * rate;
+    const near = 8 + 2 * rate; // the step from 0.25 to 0.1 lands within this of the switch
+    let wrongBefore = 0;
+    let wrongAfter = 0;
+    let spill = 0;
+    for (let j = Math.ceil(pIn + xf * rate) + 1; j < pSw - near; j++) if (Math.abs(take[j] - 0.25) > 1e-6) wrongBefore++;
+    for (let j = Math.ceil(pSw + near); j < Math.floor(pOut) - 1; j++) if (Math.abs(take[j] - 0.1) > 1e-6) wrongAfter++;
+    for (let j = Math.ceil(pEnd) + 1; j < 96000; j++) if (take[j] !== 0) spill++;
+    for (let j = 0; j < Math.floor(pIn) - 1; j++) if (take[j] !== 0) spill++;
+    let rises = 0; // the step must only go down
+    for (let j = Math.floor(pSw - near); j < Math.ceil(pSw + near); j++) if (take[j + 1] > take[j] + 1e-6) rises++;
+    expect({ wrongBefore, wrongAfter, spill, rises }).toEqual({ wrongBefore: 0, wrongAfter: 0, spill: 0, rises: 0 });
+  });
+
+  // C: an aligned start (armed on MEASURE) chooses its frame and seam phase from the phrase; the phase must be measured
+  // against the phrase, not the loop length, or the first passes run more than 0.75 of a frame off the grid.
+  it.each([133, 124])('C: a MEASURE-armed restart at %i bpm stays within 0.75 of a frame of the grid', (bpm) => {
+    const core = makeCore({ tempo: bpm, track: [{ loopSyncSw: true, loopSyncMode: 'MEASURE' }] }, { sampleRate: SR });
+    rhythmOn(core);
+    const M = (4 * 60 * SR) / bpm;
+    const L = Math.round(M);
+    at(core, 0, recPlay(), dc(0));
+    at(core, L, recPlay(), dc(0));
+    at(core, L + 1000, { t: 'stop', track: 0 }, dc(0));
+    at(core, Math.round(3.5 * M), recPlay()); // armed for the line at 4 measures
+    expect(trk(core).pending).toBe('play');
+    runTo(core, Math.round(4 * M) + 10);
+    expect(trk(core).state).toBe('playing');
+    let worst = 0;
+    for (let t = 0; t < 40 * SR; t += 997) {
+      run(core, 997);
+      worst = Math.max(worst, Math.abs(gridError(core)));
+    }
+    expect(worst).toBeLessThanOrEqual(0.75);
+  }, 60_000);
+});
