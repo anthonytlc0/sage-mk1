@@ -135,7 +135,9 @@ export function attachPointer(view: PanelView, emit: Emit): () => void {
   const cancelAll = (t: number): void => {
     for (const id of [...active.keys()]) finish(id, t, null);
   };
-  const onBlur = (e: Event): void => cancelAll(e.timeStamp);
+  const onBlur = (e: Event): void => {
+    if (e.target === win) cancelAll(e.timeStamp); // the window lost focus, not just an element in the page
+  };
   const onVisibility = (e: Event): void => {
     if (doc.visibilityState === 'hidden') cancelAll(e.timeStamp);
   };

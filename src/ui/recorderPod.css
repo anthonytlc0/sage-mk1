@@ -1,7 +1,8 @@
 /* The recorder pod: a small separate device on the tabletop, in the panel's matte charcoal. No hardware labels. */
 
 .recorder-pod {
-  /* Task 23 places it for good; for now it sits in the tabletop's bottom-right corner. */
+  /* On its own (the e2e harness) it sits in the bottom-right corner; the app shell lays it out along the shelf
+     (shell.css). */
   position: fixed;
   right: calc(12px + env(safe-area-inset-right, 0px));
   bottom: calc(12px + env(safe-area-inset-bottom, 0px));

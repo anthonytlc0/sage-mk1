@@ -475,3 +475,29 @@ describe('messages', () => {
     expect(c.message).toBeNull();
   });
 });
+
+describe('mic mute: MIC IN MUTE and the MIXER (ruling R34)', () => {
+  it('the MIXER mic mute mutes the engine mic; the mic stays muted while either it or MIC IN MUTE is on', () => {
+    const { c, engine } = setup();
+    c.setParam('ctl.panelPlay.track.0', 'MIC IN MUTE');
+    engine.reset();
+    const mutes = () => engine.commands('micMute').map((m) => m.on);
+
+    c.setMixerMicMute(true);
+    expect(mutes()).toEqual([true]);
+    c.setMixerMicMute(true); // no change: nothing sent
+    expect(mutes()).toEqual([true]);
+
+    c.handle({ kind: 'press', id: 'trk1.track', t: 10 }); // MIC IN MUTE on: still muted
+    c.handle({ kind: 'release', id: 'trk1.track', t: 20 });
+    expect(c.micMuted).toBe(true);
+    c.setMixerMicMute(false); // the mixer unmutes, MIC IN MUTE still holds it
+    expect(mutes()).toEqual([true, true, true]);
+
+    c.handle({ kind: 'press', id: 'trk1.track', t: 30 }); // MIC IN MUTE off: now the mic is open
+    c.handle({ kind: 'release', id: 'trk1.track', t: 40 });
+    expect(c.micMuted).toBe(false);
+    expect(mutes()).toEqual([true, true, true, false]);
+    expect(engine.last('micMute')).toEqual({ t: 'micMute', on: false });
+  });
+});

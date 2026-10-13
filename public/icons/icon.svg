@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Sage MK1 icon: a stylised loop-indicator ring LED around a dark REC button. Original artwork. -->
+  <defs>
+    <radialGradient id="bg" cx="0.5" cy="0.45" r="0.75">
+      <stop offset="0" stop-color="#1f2024"/>
+      <stop offset="0.6" stop-color="#121214"/>
+      <stop offset="1" stop-color="#0b0b0c"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0.45" stop-color="#ff2f1c" stop-opacity="0"/>
+      <stop offset="0.62" stop-color="#ff2f1c" stop-opacity="0.38"/>
+      <stop offset="0.78" stop-color="#ff2f1c" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#ff2f1c" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="seg" gradientUnits="userSpaceOnUse" cx="256" cy="256" r="176">
+      <stop offset="0.750" stop-color="#ff2a1f"/>
+      <stop offset="0.875" stop-color="#ff8a74"/>
+      <stop offset="1" stop-color="#ff2a1f"/>
+    </radialGradient>
+    <radialGradient id="hot" gradientUnits="userSpaceOnUse" cx="256" cy="256" r="176">
+      <stop offset="0.750" stop-color="#ff6a52"/>
+      <stop offset="0.875" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#ff6a52"/>
+    </radialGradient>
+    <linearGradient id="cap" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3c3d42"/>
+      <stop offset="1" stop-color="#18191c"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="url(#bg)"/>
+  <circle cx="256" cy="256" r="236" fill="url(#glow)"/>
+  <circle cx="256" cy="256" r="184" fill="#060607"/>
+  <path d="M262.76 80.13A176 176 0 0 1 294.99 84.37L285.24 127.28A132 132 0 0 0 261.07 124.10Z" fill="url(#seg)"/><path d="M308.04 87.87A176 176 0 0 1 338.08 100.31L317.56 139.24A132 132 0 0 0 295.03 129.90Z" fill="url(#seg)"/><path d="M349.79 107.07A176 176 0 0 1 375.58 126.86L345.69 159.15A132 132 0 0 0 326.34 144.30Z" fill="url(#seg)"/><path d="M385.14 136.42A176 176 0 0 1 404.93 162.21L367.70 185.66A132 132 0 0 0 352.85 166.31Z" fill="url(#seg)"/><path d="M411.69 173.92A176 176 0 0 1 424.13 203.96L382.10 216.97A132 132 0 0 0 372.76 194.44Z" fill="url(#seg)"/><path d="M427.63 217.01A176 176 0 0 1 431.87 249.24L387.90 250.93A132 132 0 0 0 384.72 226.76Z" fill="url(#seg)"/><path d="M431.87 262.76A176 176 0 0 1 427.63 294.99L384.72 285.24A132 132 0 0 0 387.90 261.07Z" fill="url(#seg)"/><path d="M424.13 308.04A176 176 0 0 1 411.69 338.08L372.76 317.56A132 132 0 0 0 382.10 295.03Z" fill="url(#seg)"/><path d="M404.93 349.79A176 176 0 0 1 385.14 375.58L352.85 345.69A132 132 0 0 0 367.70 326.34Z" fill="url(#seg)"/><path d="M375.58 385.14A176 176 0 0 1 349.79 404.93L326.34 367.70A132 132 0 0 0 345.69 352.85Z" fill="url(#seg)"/><path d="M338.08 411.69A176 176 0 0 1 308.04 424.13L295.03 382.10A132 132 0 0 0 317.56 372.76Z" fill="url(#seg)"/><path d="M294.99 427.63A176 176 0 0 1 262.76 431.87L261.07 387.90A132 132 0 0 0 285.24 384.72Z" fill="url(#seg)"/><path d="M249.24 431.87A176 176 0 0 1 217.01 427.63L226.76 384.72A132 132 0 0 0 250.93 387.90Z" fill="url(#seg)"/><path d="M203.96 424.13A176 176 0 0 1 173.92 411.69L194.44 372.76A132 132 0 0 0 216.97 382.10Z" fill="url(#seg)"/><path d="M162.21 404.93A176 176 0 0 1 136.42 385.14L166.31 352.85A132 132 0 0 0 185.66 367.70Z" fill="url(#seg)"/><path d="M126.86 375.58A176 176 0 0 1 107.07 349.79L144.30 326.34A132 132 0 0 0 159.15 345.69Z" fill="url(#seg)"/><path d="M100.31 338.08A176 176 0 0 1 87.87 308.04L129.90 295.03A132 132 0 0 0 139.24 317.56Z" fill="url(#seg)"/><path d="M84.37 294.99A176 176 0 0 1 80.13 262.76L124.10 261.07A132 132 0 0 0 127.28 285.24Z" fill="url(#hot)"/><path d="M80.13 249.24A176 176 0 0 1 84.37 217.01L127.28 226.76A132 132 0 0 0 124.10 250.93Z" fill="#34363b"/><path d="M87.87 203.96A176 176 0 0 1 100.31 173.92L139.24 194.44A132 132 0 0 0 129.90 216.97Z" fill="#34363b"/><path d="M107.07 162.21A176 176 0 0 1 126.86 136.42L159.15 166.31A132 132 0 0 0 144.30 185.66Z" fill="#34363b"/><path d="M136.42 126.86A176 176 0 0 1 162.21 107.07L185.66 144.30A132 132 0 0 0 166.31 159.15Z" fill="#34363b"/><path d="M173.92 100.31A176 176 0 0 1 203.96 87.87L216.97 129.90A132 132 0 0 0 194.44 139.24Z" fill="#34363b"/><path d="M217.01 84.37A176 176 0 0 1 249.24 80.13L250.93 124.10A132 132 0 0 0 226.76 127.28Z" fill="#34363b"/>
+  <circle cx="256" cy="256" r="118" fill="#060607"/>
+  <circle cx="256" cy="256" r="104" fill="url(#cap)"/>
+  <circle cx="256" cy="256" r="101" fill="none" stroke="#d3d7dc" stroke-opacity="0.35" stroke-width="3"/>
+  <circle cx="256" cy="256" r="30" fill="#e2252d"/>
+  <circle cx="248" cy="247" r="10" fill="#ffffff" fill-opacity="0.25"/>
+</svg>

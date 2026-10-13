@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { KEYMAP, KeyboardInput, type KeyInfo, type SpecialKey } from '../../src/ui/input/keyboard';
+import { KEYMAP, KeyboardInput, attachKeyboard, type KeyInfo, type SpecialKey } from '../../src/ui/input/keyboard';
 import { ALL_BUTTON_IDS } from '../../src/ui/panelLayout';
 import type { ButtonId, ControlEvent } from '../../src/shared/ids';
 
@@ -196,5 +196,56 @@ describe('KeyboardInput', () => {
     const kb = new KeyboardInput((e) => void out.push(e));
     expect(kb.keyDown(key('Backquote', { key: '`' }), 1)).toBe(true);
     expect(out).toEqual([]);
+  });
+});
+
+/**
+ * A stand-in window for attachKeyboard: it keeps every listener whatever its phase, and `fire` calls the listeners for
+ * a type with an event whose `target` the test chooses. A capture-phase window listener would also be called for the
+ * blur of an element (blur does not bubble, but every event passes the window while capturing), so the guard must
+ * look at the target.
+ */
+function fakeWindow() {
+  const listeners = new Map<string, Set<(e: Event) => void>>();
+  const win = {
+    addEventListener(type: string, fn: (e: Event) => void) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type)!.add(fn);
+    },
+    removeEventListener(type: string, fn: (e: Event) => void) {
+      listeners.get(type)?.delete(fn);
+    },
+    performance: { now: () => 1000 },
+  };
+  const fire = (type: string, init: Record<string, unknown>): void => {
+    const e = { type, timeStamp: 0, preventDefault() {}, ...init } as unknown as Event;
+    for (const fn of [...(listeners.get(type) ?? [])]) fn(e);
+  };
+  return { win: win as unknown as Window, fire };
+}
+
+describe('attachKeyboard', () => {
+  const keydown = (code: string, key: string, target: unknown, timeStamp: number) => ({
+    code, key, target, timeStamp, shiftKey: false, ctrlKey: false, metaKey: false, altKey: false, repeat: false,
+  });
+
+  it('releases held keys when the window itself loses focus, not when an element in the page does (blur of a field)', () => {
+    const { win, fire } = fakeWindow();
+    const out: ControlEvent[] = [];
+    const detach = attachKeyboard(win, (e) => void out.push(e));
+    const field = { closest: () => null }; // an element in the page (not a text field, so the key is ours)
+    fire('keydown', keydown('KeyA', 'a', field, 10));
+    expect(out).toEqual([{ kind: 'press', id: 'trk1.rec', t: 10 }]);
+
+    fire('blur', { target: field, timeStamp: 20 }); // an element lost focus: the key is still down
+    expect(out).toHaveLength(1);
+
+    fire('blur', { target: win, timeStamp: 30 }); // the window lost focus (the user switched away)
+    expect(out).toEqual([
+      { kind: 'press', id: 'trk1.rec', t: 10 },
+      { kind: 'release', id: 'trk1.rec', t: 30 },
+    ]);
+    detach();
+    expect(out).toHaveLength(2);
   });
 });

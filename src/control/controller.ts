@@ -158,8 +158,10 @@ export class Controller {
   private _status: EngineStatus | null = null;
   private _message: string | null = null;
   private _now = 0;
-  /** MIC IN MUTE is on (the engine was last sent `micMute` on). */
+  /** MIC IN MUTE is on (a PANEL function toggled it). */
   private _micMuted = false;
+  /** The MIXER has the mic muted (`setMixerMicMute`). */
+  private _mixerMicMuted = false;
 
   private readonly buttons: ButtonRouter;
   private readonly fb = new Framebuffer();
@@ -199,7 +201,7 @@ export class Controller {
       lcdShow: (req) => this.lcd.show(req, this),
       toggleMicMute: (t) => {
         this._micMuted = !this._micMuted;
-        this.engine.send({ t: 'micMute', on: this._micMuted }, t);
+        this.sendMicMute(t);
       },
     };
     this.buttons = new ButtonRouter(host);
@@ -232,6 +234,16 @@ export class Controller {
   /** The mic is muted by a MIC IN MUTE function. */
   get micMuted(): boolean {
     return this._micMuted;
+  }
+
+  /**
+   * The MIXER's mute of the mic input (the app shell wires `MenuOptions.onMute` here, ruling R34). The engine's one mic
+   * is muted while this or MIC IN MUTE is on, so neither undoes the other.
+   */
+  setMixerMicMute(on: boolean): void {
+    if (on === this._mixerMicMuted) return;
+    this._mixerMicMuted = on;
+    this.sendMicMute();
   }
 
   isHeld(id: ButtonId): boolean {
@@ -573,6 +585,10 @@ export class Controller {
     // The engine copies these (EngineHost posts them through a MessagePort), so passing the live objects is safe. The
     // system settings sent are those in effect (PREFERENCE = MEMORY groups from the memory).
     this.engine.send({ t: 'settings', memory: this.session.memory, system: this.session.effectiveSystem });
+  }
+
+  private sendMicMute(eventTime?: number): void {
+    this.engine.send({ t: 'micMute', on: this._micMuted || this._mixerMicMuted }, eventTime);
   }
 
   private reopenMic(): void {

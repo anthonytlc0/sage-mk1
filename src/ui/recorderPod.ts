@@ -34,8 +34,8 @@ import type { TakeInfo } from '../storage/takes';
 import { TakePlayer } from './takePlayer';
 
 export interface RecorderPodOptions {
-  /** The mixer behind LOOP MIX: Task 9's `renderMix`. */
-  render: RenderMixFn;
+  /** The mixer behind LOOP MIX: Task 9's `renderMix`. Null until it exists: LOOP MIX then says NOT READY (ruling R56). */
+  render: RenderMixFn | null;
   /** Most bytes of take Blobs kept ready for SAVE and play. Default 64 MB (`DEFAULT_CACHE_BYTES`). */
   cacheBytes?: number;
   /** Saves a file (the share sheet or a download). Default `saveFile`; a test passes a stand-in. */
@@ -449,11 +449,16 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
   }
 
   async function renderMix(): Promise<void> {
+    const render = opts.render;
+    if (render === null) {
+      setNote('NOT READY'); // no mixer yet: nothing is asked of the engine
+      return;
+    }
     mix = { phase: 'preparing', blob: null, at: 0, saving: false };
     syncMix();
     try {
       await afterPaint(); // the label shows before the render takes the thread
-      const blob = await exportLoopMix(controller, opts.render);
+      const blob = await exportLoopMix(controller, render);
       if (disposed) return;
       mix = { phase: 'ready', blob, at: Date.now(), saving: false };
     } catch (e) {

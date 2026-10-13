@@ -14,6 +14,8 @@ interface OpenOptions {
   cache?: number;
   /** Replace saveFile with a stand-in the spec answers by hand (`__rec.saves`, `__rec.releaseSave`). */
   fakeSave?: boolean;
+  /** No mixer behind LOOP MIX (`render: null`), as in the app until Task 9's renderMix exists (ruling R56). */
+  noRender?: boolean;
 }
 
 async function open(page: Page, opts: OpenOptions | string = {}): Promise<void> {
@@ -22,6 +24,7 @@ async function open(page: Page, opts: OpenOptions | string = {}): Promise<void> 
   if (o.db) q.set('db', o.db);
   if (o.cache !== undefined) q.set('cache', String(o.cache));
   if (o.fakeSave) q.set('save', 'fake');
+  if (o.noRender) q.set('render', 'none');
   await page.goto(q.size ? `${HARNESS}?${q}` : HARNESS);
   await page.waitForFunction(() => document.documentElement.dataset.ready === '1');
 }
@@ -339,5 +342,21 @@ test.describe('recorder pod: memory and saving', () => {
     await expect(rec(page)).not.toHaveClass(/is-on/, { timeout: 5000 });
     await expect(takeRows(page)).toHaveCount(1);
     await expect(page.locator('.rp-note')).toHaveText('AUDIO STOPPED: TAKE ENDED');
+  });
+});
+
+test.describe('recorder pod: no mixer yet', () => {
+  test('LOOP MIX says NOT READY, asks the engine for nothing and stays LOOP MIX (ruling R56)', async ({ page }) => {
+    const errors: string[] = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    page.on('console', (m) => {
+      if (m.type() === 'error') errors.push(m.text());
+    });
+    await open(page, { noRender: true });
+    await mix(page).click();
+    await expect(page.locator('.rp-note')).toHaveText('NOT READY');
+    await expect(mix(page)).toHaveText('LOOP MIX');
+    expect(await page.evaluate(() => window.__rec.engine.sent.filter((s) => s.cmd.t === 'exportTracks').length)).toBe(0);
+    expect(errors).toEqual([]);
   });
 });

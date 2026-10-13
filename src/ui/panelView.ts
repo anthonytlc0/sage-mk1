@@ -302,7 +302,7 @@ export function mountPanel(root: HTMLElement): PanelView {
     el('rect', { x: L.x - 37, y: L.y - 11, width: L.w + 74, height: L.h + 24, rx: 6, fill: '#000', opacity: 0.5, transform: 'translate(0 3)' }, lcdG);
     el('rect', { x: L.x - 37, y: L.y - 11, width: L.w + 74, height: L.h + 24, rx: 6, fill: 'url(#g-bezel)' }, lcdG);
     el('rect', { x: L.x - 10, y: L.y - 7, width: L.w + 20, height: L.h + 15, rx: 3, fill: '#0a0b0c' }, lcdG);
-    lcdGlass = el('rect', { x: L.x, y: L.y, width: L.w, height: L.h, fill: DEFAULT_PALETTE.pixelOff }, lcdG);
+    lcdGlass = el('rect', { x: L.x, y: L.y, width: L.w, height: L.h, fill: DEFAULT_PALETTE.pixelOff, class: 'lcd-glass' }, lcdG);
   }
 
   // ---------------------------------------------------------------- controls
