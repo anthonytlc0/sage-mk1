@@ -104,8 +104,10 @@ function isEditable(target: EventTarget | null): boolean {
 }
 
 /**
- * Listens on `win` (capture phase, so nothing in the page can swallow a key first). On `blur` every held key is
- * released, so a key does not stay down when the user tabs away. Returns a detach function, which also releases.
+ * Listens on `win` (keys in the capture phase, so nothing in the page can swallow a key first). When the window loses
+ * focus every held key is released, so a key does not stay down when the user tabs away; the blur of an element inside
+ * the page (a text field, the recorder pod) is not the window's and releases nothing. Returns a detach function, which
+ * also releases.
  */
 export function attachKeyboard(win: Window, emit: Emit, onSpecialKey?: (k: SpecialKey) => void): () => void {
   const kb = new KeyboardInput(emit, onSpecialKey);
@@ -128,7 +130,10 @@ export function attachKeyboard(win: Window, emit: Emit, onSpecialKey?: (k: Speci
   const onKeyUp = (e: KeyboardEvent): void => {
     if (kb.keyUp(e.code, e.key, e.timeStamp)) e.preventDefault();
   };
-  const onBlur = (e: Event): void => kb.releaseAll(e.timeStamp);
+  const onBlur = (e: Event): void => {
+    // Only the window's own blur: a window listener also sees an element's blur if it is ever registered for capture.
+    if (e.target === win) kb.releaseAll(e.timeStamp);
+  };
 
   win.addEventListener('keydown', onKeyDown, true);
   win.addEventListener('keyup', onKeyUp, true);

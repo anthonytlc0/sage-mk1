@@ -1,6 +1,5 @@
-// TODO(T23): the app shell replaces this file (bootApp). Until then the entry only keeps a reference to the engine, so
-// the build bundles the AudioWorklet and its whole import graph, and the dev server can start it from the console
-// after a click: `await sageEngine.start()`.
-import { EngineHost } from './engine/host';
+import { bootApp } from './app';
 
-(globalThis as { sageEngine?: typeof EngineHost }).sageEngine = EngineHost;
+const root = document.getElementById('app');
+if (!root) throw new Error('Sage MK1: the #app element is missing');
+bootApp(root).catch((e: unknown) => console.error('Sage MK1 did not start', e));

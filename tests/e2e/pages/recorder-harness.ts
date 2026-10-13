@@ -5,7 +5,8 @@
  *  - `db`    the database name, so a spec can reload the page and find its takes again;
  *  - `cache` the pod's `cacheBytes` (to exercise eviction with small takes);
  *  - `save=fake` replaces `saveFile` with a stand-in that records each call and answers when the spec says
- *    (`__rec.releaseSave(result)`), to hold a save in flight.
+ *    (`__rec.releaseSave(result)`), to hold a save in flight;
+ *  - `render=none` mounts the pod with no mixer (`render: null`), as the app does until Task 9's renderMix exists.
  *
  * It also stands in for the shell: Backquote calls `toggleRecord()`, as the input layer's `onSpecialKey('recorder')` will.
  */
@@ -149,7 +150,7 @@ engine.emit({ t: 'status', status: engine.template });
 const recorder = new Recorder(engine, takes, SR);
 const cache = params.get('cache');
 const pod = mountRecorderPod(root, recorder, controller, {
-  render,
+  render: params.get('render') === 'none' ? null : render,
   ...(cache ? { cacheBytes: Number(cache) } : {}),
   ...(params.get('save') === 'fake' ? { save: fakeSave } : {}),
 });

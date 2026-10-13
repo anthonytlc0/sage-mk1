@@ -584,6 +584,28 @@ test.describe('keyboard', () => {
     expect(await events(page)).toHaveLength(4);
   });
 
+  test('an element in the page losing focus releases nothing: only the window losing focus does', async ({ page }) => {
+    await page.evaluate(() => {
+      const probe = document.createElement('div');
+      probe.id = 'probe-focus';
+      probe.tabIndex = 0;
+      document.body.append(probe);
+    });
+    await page.keyboard.down('KeyA');
+    const m = await pointOf(page, 'trk2.rec');
+    await page.mouse.move(m.x, m.y);
+    await page.mouse.down();
+    await page.evaluate(() => {
+      const probe = document.getElementById('probe-focus')!;
+      probe.focus();
+      probe.blur(); // a blur event on the element, not on the window
+    });
+    expect(shape(await events(page))).toEqual(['press:trk1.rec', 'press:trk2.rec']);
+    await page.keyboard.up('KeyA');
+    await page.mouse.up();
+    expect(shape(await events(page))).toEqual(['press:trk1.rec', 'press:trk2.rec', 'release:trk1.rec', 'release:trk2.rec']);
+  });
+
   test('keys typed into an input or textarea are the field\'s, not the looper\'s', async ({ page }) => {
     await logKeys(page);
     await page.evaluate(() => {
