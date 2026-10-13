@@ -71,8 +71,9 @@ export class FakeContext implements HostContext {
   readonly sources: { stream: HostStream; node: FakeNode }[] = [];
   /** resume() rejects. */
   resumeFails = false;
-  /** resume() never settles (no user activation). */
+  /** resume() does not settle (no user activation) until `finishResume()`. */
   resumeHangs = false;
+  private readonly pendingResumes: (() => void)[] = [];
 
   getOutputTimestamp(): AudioTimestamp {
     return this.timestamp;
@@ -88,10 +89,16 @@ export class FakeContext implements HostContext {
   }
   resume(): Promise<void> {
     this.calls.push('resume');
-    if (this.resumeHangs) return new Promise(() => {});
+    if (this.resumeHangs) return new Promise((resolve) => this.pendingResumes.push(resolve));
     if (this.resumeFails) return Promise.reject(new Error('resume refused'));
     this.setState('running');
     return Promise.resolve();
+  }
+  /** A hung resume() finally goes through: the context runs and the promise resolves. */
+  finishResume(): void {
+    this.resumeHangs = false;
+    this.setState('running');
+    for (const resolve of this.pendingResumes.splice(0)) resolve();
   }
   async close(): Promise<void> {
     this.calls.push('close');
@@ -156,6 +163,8 @@ export interface Rig {
   processor: SageProcessor;
   /** The host's end of the worklet port: `posted` holds every TimedCommand the host sent. */
   hostPort: FakePort;
+  /** The processor's end: `posted` holds every event the processor sent the host. */
+  procPort: FakePort;
   /** Everything the host passed to `log`. */
   logs: [string, unknown][];
   /** Every event the host delivered to its handlers (subscribed right after start). */
@@ -188,7 +197,7 @@ export async function startHost(
   });
   const events: EngineEvent[] = [];
   host.on((e) => events.push(e));
-  return { host, ctx, nav, doc, node: node!, processor: processor!, hostPort, logs, events };
+  return { host, ctx, nav, doc, node: node!, processor: processor!, hostPort, procPort, logs, events };
 }
 
 /** The commands the host has sent through the worklet port, in order. */

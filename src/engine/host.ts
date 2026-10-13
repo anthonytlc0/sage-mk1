@@ -11,11 +11,18 @@
  *    iOS 27 every page crackles while an echo-cancelled mic is open). What the browser actually gave is logged.
  *  - `latencyHint` is ignored and there is no input-latency API, so latency is estimated until it is calibrated
  *    (SETUP LATENCY), and `outputLatency` reads 0 until the context plays, so the estimate is redone once it runs.
- *  - Audio is lost in the background, on a call, to Siri. Going hidden, or the context going `interrupted` /
- *    `suspended` while a track records or overdubs, sends `interrupt` (the core ends those passes as if STOP were
- *    pressed and keeps the audio). Back to visible: `suspend()` then `resume()` (WebKit bug 276016), and the mic is
- *    opened again if its track ended or was muted. If either fails the LCD gets NO INPUT, and the app shell offers TAP
- *    POWER TO RESUME, which calls `resume({ retryMic: true })` from the tap.
+ *  - Audio is lost in the background, on a call, to Siri (ruling R37). Every change of the context to `interrupted` or
+ *    `suspended` that the host did not cause sends `interrupt` (the core ends rec/dub passes as if STOP were pressed,
+ *    keeps the audio and cancels armed actions; sending it twice is harmless). On a touch device going hidden sends it
+ *    too; a desktop tab keeps its audio in the background, so there the context's own state decides. Back to visible:
+ *    `suspend()` then `resume()` (WebKit bug 276016) if the context is not running, and the mic is opened again if its
+ *    track ended or was muted. A context that comes back to `running` by itself (after Siri or a call) gets an ended
+ *    mic reopened too.
+ *  - When audio cannot be brought back the LCD gets NO INPUT and `needsResume` turns true (`onNeedsResume` tells).
+ *    For Task 23: show TAP POWER TO RESUME while `needsResume` is true, and from the tap call
+ *    `resume({ retryMic: true })`. It turns false again by itself when the context does run after all (a resume that
+ *    took longer than RESUME_TIMEOUT_MS) and the mic is back. No mic at power-on (a desktop without one) is NO INPUT
+ *    only: the looper works without input, so it does not set `needsResume`.
  *
  * The browser pieces are injectable (`EngineHostOptions`) so the host runs in Node against fakes.
  */
@@ -24,8 +31,9 @@ import processorUrl from './processor.ts?worker&url';
 import type { EngineLike } from '../control/controller';
 import { defaultSystem } from '../schema/system';
 import type { SystemSettings } from '../schema/types';
-import type { EngineCommand, EngineEvent, EngineStatus, TimedCommand } from '../shared/protocol';
-import { PROCESSOR_NAME, memoryBudgetBytes } from './config';
+import type { EngineCommand, EngineEvent, TimedCommand } from '../shared/protocol';
+import { ExportAssembler, isExportEvent } from './assemble';
+import { PROCESSOR_NAME, isTouch, memoryBudgetBytes } from './config';
 import type { MessagePortLike } from './processor';
 
 /** How long `suspend()` / `resume()` may take before the resume counts as failed. */
@@ -119,7 +127,14 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
   private readonly handlers = new Set<(e: EngineEvent) => void>();
   /** Messages raised while nobody listened (NO INPUT during `start`), for the first subscriber. */
   private readonly undelivered: EngineEvent[] = [];
-  private lastStatus: EngineStatus | null = null;
+  private readonly resumeHandlers = new Set<(needsResume: boolean) => void>();
+  /** Streamed exports being put back together (ruling R47). */
+  private readonly assembler: ExportAssembler;
+  private _needsResume = false;
+  /** A mic has been open since power-on, so losing it is a loss to recover from. */
+  private micExpected = false;
+  /** Going hidden interrupts only on a touch device (R37). */
+  private readonly touch: boolean;
   private system: SystemSettings;
   private lat: Latency = { roundTripFrames: 0, outputLatencyFrames: 0 };
   private stream: HostStream | null = null;
@@ -144,6 +159,8 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
   ) {
     this.system = system;
     this.micEcho = system.setup.micProcess;
+    this.touch = isTouch(nav);
+    this.assembler = new ExportAssembler(log);
   }
 
   /**
@@ -213,21 +230,41 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
     return { ...this.lat };
   }
 
+  /** Streamed exports being reassembled (diagnostics; their full-length arrays are held until they end). */
+  get exportsInFlight(): number {
+    return this.assembler.inProgress;
+  }
+
+  /** Audio was lost and could not be brought back: the app shell shows TAP POWER TO RESUME while this is true. */
+  get needsResume(): boolean {
+    return this._needsResume;
+  }
+
+  /** Called with the new value whenever `needsResume` changes; returns the unsubscribe. */
+  onNeedsResume(handler: (needsResume: boolean) => void): () => void {
+    this.resumeHandlers.add(handler);
+    return () => {
+      this.resumeHandlers.delete(handler);
+    };
+  }
+
   /**
-   * Brings audio back: `suspend()` then `resume()` (WebKit bug 276016), then a new mic if the old one's track ended or
-   * was muted, or, with `retryMic` (from a tap: TAP POWER TO RESUME), if there was none. Emits NO INPUT and resolves
-   * false if the context does not run again or the mic cannot be had. Runs on every return to visible.
+   * Brings audio back: `suspend()` then `resume()` (WebKit bug 276016) if the context is not running, then a new mic if
+   * the old one's track ended or was muted (or an earlier reopen failed), or, with `retryMic` (from a tap: TAP POWER
+   * TO RESUME), if there never was one. Resolves true and clears `needsResume` when audio is back; otherwise emits NO
+   * INPUT, sets `needsResume` and resolves false. Runs on every return to visible. Reports nothing once stopped.
    */
   resume(opts: { retryMic?: boolean } = {}): Promise<boolean> {
     return this.serial(async () => {
       if (this.stopped) return false;
-      let ok = await this.restartContext();
-      const track = this.stream?.getAudioTracks()[0];
-      const lost = this.stream !== null && (track === undefined || track.readyState === 'ended' || track.muted);
-      if (lost || (opts.retryMic === true && !this.micAvailable)) {
+      let ok = this.ctx.state === 'running' || (await this.restartContext());
+      if (this.stopped) return false;
+      if (this.micLost(true) || (opts.retryMic === true && !this.micAvailable)) {
         if (!(await this.reopenMic())) ok = false;
       }
-      if (!ok) this.dispatch(NO_INPUT);
+      if (this.stopped) return false;
+      if (ok) this.setNeedsResume(false);
+      else this.lostAudio();
       return ok;
     });
   }
@@ -235,17 +272,18 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
   /**
    * Closes the mic and opens it again with the current SETUP MIC PROCESS (echoCancellation): the old tracks are
    * stopped first (a second getUserMedia mutes the first on iOS), then the new stream is connected to the worklet.
-   * Emits NO INPUT if no mic can be had. A `settings` command with a new MIC PROCESS calls it too, and the controller
-   * calls it through its `restartMic` hook: a request made while one is queued and not yet started joins it, so the
-   * two give one reopen; a request made while one runs queues another, so the last setting always wins.
+   * If no mic can be had it emits NO INPUT and asks for TAP POWER TO RESUME (as a lost mic does). Never rejects.
+   * A `settings` command with a new MIC PROCESS calls it too, and the controller calls it through its `restartMic`
+   * hook: a request made while one is queued and not yet started joins it, so the two give one reopen; a request made
+   * while one runs queues another, so the last setting always wins.
    */
   restartMic(): Promise<void> {
     if (this.micRestart !== null) return this.micRestart;
     const run = this.serial(async () => {
       this.micRestart = null; // started: a later request queues a new restart
       if (this.stopped) return;
-      if (!(await this.reopenMic())) this.dispatch(NO_INPUT);
-    });
+      if (!(await this.reopenMic()) && !this.stopped) this.lostAudio();
+    }).catch((e: unknown) => this.log('engine: mic restart failed', e));
     this.micRestart = run;
     return run;
   }
@@ -257,6 +295,7 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
     this.doc?.removeEventListener('visibilitychange', this.onVisibility);
     this.ctx.onstatechange = null;
     this.node.port.onmessage = null;
+    this.assembler.clear(); // drop any half-built export and its arrays
     this.detachMic();
     this.node.disconnect();
     try {
@@ -270,22 +309,60 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
 
   private readonly onVisibility = (): void => {
     if (this.stopped || this.doc === null) return;
-    if (this.doc.visibilityState === 'hidden') this.interrupt();
-    else void this.resume();
+    if (this.doc.visibilityState === 'hidden') {
+      if (this.touch) this.interrupt();
+      return;
+    }
+    this.resume().catch((e: unknown) => this.log('engine: resume failed', e));
   };
 
   private onStateChange(): void {
+    if (this.stopped) return;
     const state = this.ctx.state;
     if (state === 'running') {
       this.pushLatency(); // outputLatency reads 0 until the context plays
+      // Back by itself (after Siri or a call, or a resume that outlasted its timeout): check the mic, clear
+      // needsResume. Our own resume() checks the mic itself.
+      if (!this.resuming) this.serial(() => this.recheck()).catch((e: unknown) => this.log('engine: mic check failed', e));
       return;
     }
-    if ((state === 'interrupted' || state === 'suspended') && !this.resuming && this.passInProgress()) this.interrupt();
+    // Our own suspend() is not an interruption.
+    if ((state === 'interrupted' || state === 'suspended') && !this.resuming) this.interrupt();
   }
 
-  /** A track records or overdubs, as of the latest status. */
-  private passInProgress(): boolean {
-    return this.lastStatus?.tracks.some((t) => t.state === 'recording' || t.state === 'overdubbing') ?? false;
+  /**
+   * The mic is gone: its track ended (or, with `mutedToo`, is muted), or a reopen failed after one had been open. A
+   * page that never had a mic has not lost it.
+   */
+  private micLost(mutedToo: boolean): boolean {
+    if (this.stream === null) return this.micExpected;
+    const track = this.stream.getAudioTracks()[0];
+    return track === undefined || track.readyState === 'ended' || (mutedToo && track.muted);
+  }
+
+  /**
+   * The context runs again by itself: reopen an ended mic, and clear `needsResume` once audio is back. Only while the
+   * page is visible: from the background getUserMedia is refused or prompts unseen, and the visible resume does it.
+   */
+  private async recheck(): Promise<void> {
+    if (this.stopped || this.ctx.state !== 'running' || (this.doc !== null && this.doc.visibilityState !== 'visible')) return;
+    if (this.micLost(false) && !(await this.reopenMic())) {
+      if (!this.stopped) this.lostAudio();
+      return;
+    }
+    if (!this.stopped) this.setNeedsResume(false);
+  }
+
+  /** Audio could not be brought back: NO INPUT on the LCD, and TAP POWER TO RESUME in the shell. */
+  private lostAudio(): void {
+    this.setNeedsResume(true);
+    this.dispatch(NO_INPUT);
+  }
+
+  private setNeedsResume(value: boolean): void {
+    if (this.stopped || value === this._needsResume) return;
+    this._needsResume = value;
+    for (const h of [...this.resumeHandlers]) h(value);
   }
 
   private interrupt(): void {
@@ -310,7 +387,8 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
     const before = this.system;
     this.system = system;
     if (system.setup.latency !== before.setup.latency) this.pushLatency();
-    // MENU > SETUP > MIC PROCESS: the stream must be reopened for the new echoCancellation.
+    // MENU > SETUP > MIC PROCESS: the stream must be reopened for the new echoCancellation. One path with the
+    // controller's restartMic hook, so the two together reopen the mic once.
     if (system.setup.micProcess !== this.micEcho && this.stream !== null) void this.restartMic();
   }
 
@@ -349,6 +427,7 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
     this.stream = stream;
     this.source = source;
     this.micAvailable = true;
+    this.micExpected = true;
     return true;
   }
 
@@ -367,11 +446,17 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
   private receive(data: unknown): void {
     if (typeof data !== 'object' || data === null || typeof (data as { t?: unknown }).t !== 'string') return;
     const e = data as EngineEvent;
-    if (e.t === 'status') this.lastStatus = e.status;
+    if (isExportEvent(e)) {
+      // Internal parts of an export: handlers get only the finished `tracks` event.
+      const done = this.assembler.take(e);
+      if (done !== null) this.dispatch(done);
+      return;
+    }
     this.dispatch(e);
   }
 
   private dispatch(e: EngineEvent): void {
+    if (this.stopped) return;
     if (this.handlers.size === 0) {
       if (e.t === 'message') this.undelivered.push(e);
       return;

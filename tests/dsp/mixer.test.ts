@@ -153,6 +153,16 @@ describe('Mixer: input and the recorder bus', () => {
     expect(perf[1][7]).toBeCloseTo(0.4, 6);
   });
 
+  it('perf = null skips the recorder bus and leaves out unchanged', () => {
+    const { mixer } = setup((s) => { s.output.routing.inputThru = true; });
+    const tracks = silentTracks();
+    tracks[0] = stereo(0.25);
+    const out = stereo();
+    for (let i = 0; i < 4; i++) mixer.process(tracks, stereo(0.4), stereo(0), out, null, N);
+    expect(out[0][7]).toBeCloseTo(0.65, 6);
+    expect(out[1][7]).toBeCloseTo(0.65, 6);
+  });
+
   it('INPUT THRU ON: out has the input too', () => {
     const { mixer } = setup((s) => { s.output.routing.inputThru = true; });
     const { out, perf } = run(mixer, silentTracks(), stereo(0.4), stereo(0));

@@ -3,6 +3,7 @@ import type { LcdHost, Stores } from '../../src/control/controller';
 import type { ScreenRequest } from '../../src/control/buttons';
 import { FakeEngine } from '../../src/control/fakeEngine';
 import { QuotaError } from '../../src/storage/db';
+import type { MemoryListEntry } from '../../src/storage/memoryStore';
 import { defaultSystem } from '../../src/schema/params';
 import type { Framebuffer } from '../../src/lcd/framebuffer';
 import type { MemorySettings, SystemSettings } from '../../src/schema/types';
@@ -35,6 +36,15 @@ export class MemMemories {
   }
   async hasAudio(slot: number): Promise<boolean> {
     return this.slots.get(slot)?.tracks.some((t) => t !== null) ?? false;
+  }
+  /** How many times `list` ran. */
+  lists = 0;
+  async list(): Promise<MemoryListEntry[]> {
+    this.lists++;
+    return Array.from({ length: 99 }, (_, i) => {
+      const rec = this.slots.get(i + 1);
+      return rec ? { slot: i + 1, name: rec.settings.name, empty: false } : { slot: i + 1, name: '', empty: true };
+    });
   }
 }
 

@@ -9,7 +9,7 @@ import { BLOCK, SR, freeSettings, makeProcessor, maxAbs, run, send } from './hel
  * Runs the processor with its own output fed back to its input `delay` frames later (a speaker heard by the mic), for
  * `frames` frames. Returns the output. `delay` must be at least one block, as in a real round trip.
  */
-function loopback(p: SageProcessor, frames: number, delay: number, gain = 0.5): Float32Array {
+function loopback(p: SageProcessor, frames: number, delay: number, gain = 0.5, contextStart?: number): Float32Array {
   const out = new Float32Array(frames);
   let done = 0;
   while (done < frames) {
@@ -21,7 +21,7 @@ function loopback(p: SageProcessor, frames: number, delay: number, gain = 0.5): 
     }
     const oL = new Float32Array(n);
     const oR = new Float32Array(n);
-    p.process([[mic]], [[oL, oR]]);
+    p.process([[mic]], [[oL, oR]], contextStart === undefined ? undefined : contextStart + done);
     out.set(oL, done);
     done += n;
   }
@@ -81,6 +81,17 @@ describe('SageProcessor calibrate', () => {
     expect(computeLatency(ev.capture, ev.clickFrames, SR)).toBe(1234);
     // The status timeline is another base: it is not used here.
     expect(port.events('status').at(-1)!.status.frame).toBeGreaterThan(before + captureFrames);
+  });
+
+  it('clickFrames are not shifted by the context-frame offset (the status timeline) when the worklet runs late', () => {
+    const { p, port } = makeProcessor();
+    const contextStart = 5_000_000; // the AudioContext had run ~104 s before the engine's first block
+    send(port, { t: 'calibrate', reqId: 8 });
+    loopback(p, captureFrames + 2 * BLOCK, 1234, 0.5, contextStart);
+    const ev = calibrationEvents(port)[0]!;
+    expect(ev.clickFrames).toEqual(calibrationClickFrames(SR)); // capture-relative, as without an offset
+    expect(computeLatency(ev.capture, ev.clickFrames, SR)).toBe(1234);
+    expect(port.events('status').at(-1)!.status.frame).toBeGreaterThan(contextStart); // the offset is in effect
   });
 
   it('mutes the normal output while it runs (no loops or monitoring under the clicks), then restores it', () => {

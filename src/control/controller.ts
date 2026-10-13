@@ -22,6 +22,7 @@ import type { EngineCommand, EngineEvent, EngineStatus, TrackAudio } from '../sh
 import { QuotaError } from '../storage/db';
 import { FileTooLarge, defaultMaxDecodedBytes } from '../storage/memoryFile';
 import type { BackupContents, MemoryContents } from '../storage/memoryFile';
+import { SLOT_COUNT } from '../storage/memoryStore';
 import type { MemoryStore } from '../storage/memoryStore';
 import type { Recovery } from '../storage/recovery';
 import type { SystemStore } from '../storage/systemStore';
@@ -51,7 +52,7 @@ export interface LcdHost {
 
 /** The storage the controller uses: the parts of the Task 12 stores it calls (the real stores satisfy this). */
 export interface Stores {
-  memories: Pick<MemoryStore, 'load' | 'save' | 'clear' | 'hasAudio'>;
+  memories: Pick<MemoryStore, 'load' | 'save' | 'clear' | 'hasAudio' | 'list'>;
   system: Pick<SystemStore, 'load' | 'save'>;
   recovery: Pick<Recovery, 'checkpoint' | 'discard' | 'markCleanShutdown'>;
 }
@@ -69,8 +70,6 @@ export interface ControllerOptions {
 /** What FACTORY RESET returns to the factory state (Owner's Manual p. 24). */
 export type FactoryResetTarget = (typeof FACTORY_RESET_TARGETS)[number];
 
-/** The memory slots, 01-99. */
-const SLOTS = 99;
 
 /** How long a popup message stays up by default. */
 // INFERRED: the manual gives no time; the plan's NO INPUT case uses 2 s.
@@ -329,6 +328,18 @@ export class Controller {
     return 'ok';
   }
 
+  /**
+   * The names of all 99 memories for the WRITE / CLEAR screen: index 0 is memory 1, blank for an empty slot (and for a
+   * memory saved without a name). Reads the slot list only; no memory or audio is loaded and the session is untouched.
+   */
+  async memoryNames(): Promise<string[]> {
+    const names: string[] = Array.from({ length: SLOT_COUNT }, () => '');
+    for (const e of await this.stores.memories.list()) {
+      if (!e.empty && e.slot >= 1 && e.slot <= SLOT_COUNT) names[e.slot - 1] = e.name;
+    }
+    return names;
+  }
+
   /** CLEAR: empties memory `slot`. Clearing the current memory also empties the session (INFERRED). */
   async clear(slot: number): Promise<void> {
     await this.stores.memories.clear(slot);
@@ -420,7 +431,7 @@ export class Controller {
   async factoryReset(target: FactoryResetTarget): Promise<void> {
     if (target !== 'SYSTEM') {
       try {
-        for (let slot = 1; slot <= SLOTS; slot++) await this.stores.memories.clear(slot);
+        for (let slot = 1; slot <= SLOT_COUNT; slot++) await this.stores.memories.clear(slot);
       } finally {
         await this.selectMemory(this.session.slot);
       }
@@ -460,7 +471,7 @@ export class Controller {
   async backupAll(maxDecodedBytes: number = defaultMaxDecodedBytes()): Promise<BackupContents> {
     const memories: (MemoryContents | null)[] = [];
     let bytes = 0;
-    for (let slot = 1; slot <= SLOTS; slot++) {
+    for (let slot = 1; slot <= SLOT_COUNT; slot++) {
       const rec = await this.stores.memories.load(slot);
       if (rec) {
         for (const t of rec.tracks) if (t) bytes += t.L.length * 8;
@@ -483,7 +494,7 @@ export class Controller {
     let result: 'ok' | 'MEMORY FULL' = 'ok';
     try {
       try {
-        for (let slot = 1; slot <= SLOTS; slot++) {
+        for (let slot = 1; slot <= SLOT_COUNT; slot++) {
           const m = backup.memories[slot - 1];
           if (m) await this.stores.memories.save(slot, m.settings, m.tracks);
           else await this.stores.memories.clear(slot);

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Framebuffer } from '../../src/lcd/framebuffer';
 import { FONT_LARGE, FONT_MEDIUM, FONT_SMALL, glyphOf } from '../../src/lcd/fonts';
+import type { Font } from '../../src/lcd/fonts';
 import { bar, fillRect, hline, rect, text, textWidth, vline } from '../../src/lcd/draw';
 import { ICON_NAMES, icon, iconSize } from '../../src/lcd/icons';
 import { LCD_H, LCD_W } from '../../src/shared/constants';
@@ -180,10 +181,19 @@ describe('fonts', () => {
     expect(glyphOf(FONT_LARGE, ' ')).toBeDefined();
   });
 
-  it('glyphOf falls back to upper case, then to nothing', () => {
-    expect(glyphOf(FONT_MEDIUM, 'a')).toBe(glyphOf(FONT_MEDIUM, 'A'));
+  it('glyphOf has no case fallback: a character is drawn as itself or not at all', () => {
+    // the medium font has lower case of its own (ruling R43), so a name shows as it was typed
+    expect(glyphOf(FONT_MEDIUM, 'a')).toBeDefined();
+    expect(glyphOf(FONT_MEDIUM, 'a')).not.toBe(glyphOf(FONT_MEDIUM, 'A'));
+    expect(glyphOf(FONT_SMALL, 'a')).not.toBe(glyphOf(FONT_SMALL, 'A'));
+    // a font without the character does not borrow its other case (the large font has digits only)
     expect(glyphOf(FONT_LARGE, 'x')).toBeUndefined();
+    expect(glyphOf(FONT_LARGE, 'X')).toBeUndefined();
     expect(glyphOf(FONT_SMALL, 'é')).toBeUndefined();
+    // and a font with capitals only draws no "a" for an "A"
+    const capsOnly: Font = { name: 'caps', height: 7, gap: 1, glyphs: new Map([['A', glyphOf(FONT_SMALL, 'A')!]]) };
+    expect(glyphOf(capsOnly, 'A')).toBeDefined();
+    expect(glyphOf(capsOnly, 'a')).toBeUndefined();
   });
 });
 
@@ -274,14 +284,17 @@ describe('text', () => {
     expect(fb.get(13, 2)).toBe(1);
   });
 
-  it('medium and large fonts draw their glyphs and accept lower case where defined', () => {
+  it('the medium font draws lower case differently from upper case, and both 11 rows tall at most', () => {
     const a = new Framebuffer();
     const b = new Framebuffer();
     text(a, 0, 0, 'play', FONT_MEDIUM);
     text(b, 0, 0, 'PLAY', FONT_MEDIUM);
-    expect(a.toAscii()).toBe(b.toAscii());
-    expect(bounds(a)![3]).toBe(10); // 11 rows tall
+    expect(a.toAscii()).not.toBe(b.toAscii());
+    expect(bounds(a)![3]).toBe(10); // 11 rows tall (the descenders of p and y end on the last row)
+    expect(bounds(b)![3]).toBe(10);
+  });
 
+  it('the large font draws digits', () => {
     const c = new Framebuffer();
     const adv = text(c, 0, 0, '01', FONT_LARGE);
     expect(adv).toBe(14 + FONT_LARGE.gap + 14);

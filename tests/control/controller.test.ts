@@ -310,6 +310,54 @@ describe('memories', () => {
   });
 });
 
+describe('memoryNames', () => {
+  it('lists the names of all 99 memories by slot (index = slot - 1), blank for empty slots', async () => {
+    const { c, stores } = setup();
+    for (const [slot, name] of [[1, 'Memory01'], [7, 'Hi-Hat 9'], [99, 'LAST']] as const) {
+      const mem = defaultMemory();
+      mem.name = name;
+      stores.memories.slots.set(slot, { settings: mem, tracks: [take(slot), null, null, null, null] });
+    }
+    const names = await c.memoryNames();
+    expect(names).toHaveLength(99);
+    expect(names[0]).toBe('Memory01');
+    expect(names[6]).toBe('Hi-Hat 9');
+    expect(names[98]).toBe('LAST');
+    expect(names[1]).toBe('');
+    expect(names.filter((n) => n !== '')).toHaveLength(3);
+  });
+
+  it('a saved memory without a name is blank too, and an empty store gives 99 blanks', async () => {
+    const { c, stores } = setup();
+    expect(await c.memoryNames()).toEqual(Array(99).fill(''));
+    stores.memories.slots.set(4, { settings: defaultMemory(), tracks: [null, null, null, null, null] });
+    expect((await c.memoryNames())[3]).toBe('');
+  });
+
+  it('reads the slot list only: no memory is loaded, and the session is untouched', async () => {
+    const { c, engine, stores } = setup();
+    const mem = defaultMemory();
+    mem.name = 'OTHER';
+    stores.memories.slots.set(5, { settings: mem, tracks: [take(1), null, null, null, null] });
+    c.setParam('name', 'MINE');
+    engine.reset();
+    await c.memoryNames();
+    expect(stores.memories.lists).toBe(1);
+    expect(stores.memories.loads).toBe(0);
+    expect(c.session.memory.name).toBe('MINE');
+    expect(c.session.slot).toBe(1);
+    expect(engine.sent).toEqual([]);
+  });
+
+  it('rejects when the store does, so a caller can show nothing instead of crashing', async () => {
+    const { c, stores } = setup();
+    stores.memories.list = async () => {
+      throw new Error('db gone');
+    };
+    await expect(c.memoryNames()).rejects.toThrow('db gone');
+  });
+});
+
 describe('recovery checkpoint', () => {
   it('checkpoints 2 s after the last rec/dub pass ends (audioDirty), debounced', async () => {
     const { c, engine, stores } = setup();

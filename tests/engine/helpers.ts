@@ -6,7 +6,8 @@ import { FakePort } from '../../src/engine/fakePort';
 import { defaultMemory } from '../../src/schema/memory';
 import { defaultSystem } from '../../src/schema/system';
 import type { MemorySettings, SystemSettings } from '../../src/schema/types';
-import type { EngineCommand, TrackAudio } from '../../src/shared/protocol';
+import { ExportAssembler } from '../../src/engine/assemble';
+import type { EngineCommand, EngineEvent, TrackAudio } from '../../src/shared/protocol';
 
 export const SR = 48000;
 export const BLOCK = 128;
@@ -37,9 +38,16 @@ export type Input = number | ((frame: number) => number) | null;
 /**
  * Runs `frames` frames through the processor in 128-frame blocks, as an AudioWorklet would. `input` is the mono mic: a
  * constant, a function of the frame within this run, or null for no input channel at all (no mic connected).
- * Returns the stereo output.
+ * `contextFrame`, when given, is the AudioContext frame of the first block (the worklet's `currentFrame`); the blocks
+ * after it follow on. Returns the stereo output.
  */
-export function run(p: SageProcessor, frames: number, input: Input = 0, block = BLOCK): { L: Float32Array; R: Float32Array } {
+export function run(
+  p: SageProcessor,
+  frames: number,
+  input: Input = 0,
+  block = BLOCK,
+  contextFrame?: number,
+): { L: Float32Array; R: Float32Array } {
   const L = new Float32Array(frames);
   const R = new Float32Array(frames);
   let done = 0;
@@ -55,7 +63,7 @@ export function run(p: SageProcessor, frames: number, input: Input = 0, block = 
       for (let k = 0; k < n; k++) mic[k] = typeof input === 'number' ? input : input(done + k);
       inputs = [[mic]];
     }
-    expect(p.process(inputs, [[outL, outR]])).toBe(true);
+    expect(p.process(inputs, [[outL, outR]], contextFrame === undefined ? undefined : contextFrame + done)).toBe(true);
     L.set(outL, done);
     R.set(outR, done);
     done += n;
@@ -63,13 +71,32 @@ export function run(p: SageProcessor, frames: number, input: Input = 0, block = 
   return { L, R };
 }
 
+/** The export `reqId` reassembled from the parts the processor posted so far, as EngineHost does; null if unfinished. */
+export function assembled(port: FakePort, reqId: number): (TrackAudio | null)[] | null {
+  const asm = new ExportAssembler();
+  for (const { data } of port.posted) {
+    const e = data as EngineEvent;
+    if (e.t !== 'tracksStart' && e.t !== 'tracksPart' && e.t !== 'tracksEnd') continue;
+    const done = asm.take(e);
+    if (done !== null && done.reqId === reqId) return done.tracks;
+  }
+  return null;
+}
+
+/** Runs blocks of silence until the processor has streamed all of export `reqId`, and returns it reassembled. */
+export function awaitTracks(p: SageProcessor, port: FakePort, reqId: number, maxBlocks = 10000): (TrackAudio | null)[] {
+  for (let i = 0; i < maxBlocks; i++) {
+    const tracks = assembled(port, reqId);
+    if (tracks !== null) return tracks;
+    run(p, BLOCK);
+  }
+  throw new Error(`no tracks reply for request ${reqId}`);
+}
+
 /** Asks the processor for its tracks and returns the reply. */
 export function exportTracks(p: SageProcessor, port: FakePort, reqId = 1): (TrackAudio | null)[] {
   send(port, { t: 'exportTracks', reqId });
-  run(p, BLOCK);
-  const reply = port.events('tracks').find((e) => e.reqId === reqId);
-  if (!reply) throw new Error(`no tracks reply for request ${reqId}`);
-  return reply.tracks;
+  return awaitTracks(p, port, reqId);
 }
 
 export function maxAbs(buf: Float32Array, from = 0, to = buf.length): number {

@@ -16,10 +16,15 @@ export const TOUCH_MEMORY_BUDGET = 384 * 1024 * 1024;
 export const DESKTOP_MEMORY_BUDGET = 1024 * 1024 * 1024;
 
 /**
- * The looper's memory budget for this device: TOUCH_MEMORY_BUDGET when `navigator.maxTouchPoints > 1`, else
- * DESKTOP_MEMORY_BUDGET. Touch is told by the touch points, never the user agent (an iPad reports a Mac one); the same
- * rule as `isTouchDevice` in storage/share.ts, restated here so the engine does not depend on the storage layer.
+ * A touch device (an iPad): `navigator.maxTouchPoints > 1`. Told by the touch points, never the user agent (an iPad
+ * reports a Mac one); the same rule as `isTouchDevice` in storage/share.ts, restated so the engine does not depend on
+ * the storage layer.
  */
+export function isTouch(nav: { maxTouchPoints?: number } | undefined): boolean {
+  return (nav?.maxTouchPoints ?? 0) > 1;
+}
+
+/** The looper's memory budget for this device: TOUCH_MEMORY_BUDGET on a touch device, else DESKTOP_MEMORY_BUDGET. */
 export function memoryBudgetBytes(nav: { maxTouchPoints?: number } | undefined = globalThis.navigator): number {
-  return (nav?.maxTouchPoints ?? 0) > 1 ? TOUCH_MEMORY_BUDGET : DESKTOP_MEMORY_BUDGET;
+  return isTouch(nav) ? TOUCH_MEMORY_BUDGET : DESKTOP_MEMORY_BUDGET;
 }

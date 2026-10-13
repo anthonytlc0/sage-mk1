@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { AudioTake } from '../../src/core/chunks';
 import { EngineHost, eventFrame } from '../../src/engine/host';
 import { DESKTOP_MEMORY_BUDGET, PROCESSOR_NAME, TOUCH_MEMORY_BUDGET, memoryBudgetBytes } from '../../src/engine/config';
 import type { EngineLike } from '../../src/control/controller';
 import { defaultSystem } from '../../src/schema/system';
-import type { EngineEvent } from '../../src/shared/protocol';
+import type { EngineEvent, TrackAudio } from '../../src/shared/protocol';
 import { freeSettings, run } from './helpers';
 import { FakeContext, FakeDoc, FakeNav, sentCommands, settle, startHost } from './hostFakes';
 import type { Rig } from './hostFakes';
@@ -189,6 +190,98 @@ describe('EngineHost.send', () => {
   });
 });
 
+/** Distinct stereo audio. */
+function audioOf(frames: number, seed: number): TrackAudio {
+  const L = new Float32Array(frames);
+  const R = new Float32Array(frames);
+  for (let i = 0; i < frames; i++) {
+    L[i] = Math.sin(i * 0.001 * seed);
+    R[i] = Math.cos(i * 0.002 * seed);
+  }
+  return { L, R, sampleRate: 48000, recordedTempo: 90 + seed, measures: null };
+}
+
+function trackReplies(rig: Rig): Extract<EngineEvent, { t: 'tracks' }>[] {
+  return rig.events.filter((e): e is Extract<EngineEvent, { t: 'tracks' }> => e.t === 'tracks');
+}
+
+describe('EngineHost export reassembly (ruling R47)', () => {
+  it('reassembles a streamed export into one tracks event, sample-exact; handlers never see the parts', async () => {
+    const rig = await startHost();
+    const a = audioOf(120000, 1);
+    const b = audioOf(30000, 2);
+    rig.host.send({ t: 'loadTrack', track: 1, audio: a });
+    rig.host.send({ t: 'loadTrack', track: 3, audio: b });
+    rig.host.send({ t: 'exportTracks', reqId: 4 });
+    for (let i = 0; i < 5 && trackReplies(rig).length === 0; i++) run(rig.processor, 128);
+    const replies = trackReplies(rig);
+    expect(replies).toHaveLength(1);
+    const { reqId, tracks } = replies[0]!;
+    expect(reqId).toBe(4);
+    expect(tracks.map((t) => (t === null ? null : t.L.length))).toEqual([null, 120000, null, 30000, null]);
+    expect(tracks[1]!.L).toEqual(a.L);
+    expect(tracks[1]!.R).toEqual(a.R);
+    expect(tracks[3]!.L).toEqual(b.L);
+    expect(tracks[1]!.recordedTempo).toBe(91);
+    expect(rig.events.some((e) => e.t === 'tracksStart' || e.t === 'tracksPart' || e.t === 'tracksEnd')).toBe(false);
+  });
+
+  it('keeps interleaved requests in order, each with its own audio', async () => {
+    const rig = await startHost();
+    const a = audioOf(60000, 3);
+    rig.host.send({ t: 'loadTrack', track: 0, audio: a });
+    rig.host.send({ t: 'exportTracks', reqId: 1 });
+    run(rig.processor, 128); // request 1 is streaming
+    rig.host.send({ t: 'clear', track: 0 });
+    rig.host.send({ t: 'exportTracks', reqId: 2 });
+    for (let i = 0; i < 6; i++) run(rig.processor, 128);
+    const replies = trackReplies(rig);
+    expect(replies.map((r) => r.reqId)).toEqual([1, 2]);
+    expect(replies[0]!.tracks[0]!.L).toEqual(a.L);
+    expect(replies[1]!.tracks[0]).toBeNull();
+  });
+});
+
+describe('EngineHost export failures', () => {
+  it('an export the processor abandons (tracksAbort) frees the host arrays and delivers nothing', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const real = AudioTake.prototype.read;
+    let reads = 0;
+    // Loaded tracks are stopped, so the export's are the only reads: the second one fails.
+    const spy = vi.spyOn(AudioTake.prototype, 'read').mockImplementation(function (this: AudioTake, ...args: Parameters<AudioTake['read']>) {
+      if (++reads === 2) throw new Error('read failed');
+      real.apply(this, args);
+    });
+    try {
+      const rig = await startHost();
+      rig.host.send({ t: 'loadTrack', track: 0, audio: audioOf(120000, 1) });
+      rig.host.send({ t: 'exportTracks', reqId: 1 });
+      run(rig.processor, 128);
+      expect(rig.host.exportsInFlight).toBe(1);
+      run(rig.processor, 128); // the second part fails
+      expect(rig.procPort.events('tracksAbort').map((e) => e.reqId)).toEqual([1]);
+      expect(rig.host.exportsInFlight).toBe(0);
+      for (let i = 0; i < 4; i++) run(rig.processor, 128);
+      expect(trackReplies(rig)).toHaveLength(0);
+      expect(rig.events.filter((e) => e.t === 'message').map((e) => (e as { text: string }).text)).toEqual(['ENGINE ERROR']);
+    } finally {
+      spy.mockRestore();
+      errors.mockRestore();
+    }
+  });
+
+  it('stop() in the middle of an export clears the reassembly state', async () => {
+    const rig = await startHost();
+    rig.host.send({ t: 'loadTrack', track: 2, audio: audioOf(150000, 2) });
+    rig.host.send({ t: 'exportTracks', reqId: 1 });
+    run(rig.processor, 128);
+    expect(rig.host.exportsInFlight).toBe(1);
+    await rig.host.stop();
+    expect(rig.host.exportsInFlight).toBe(0);
+    expect(trackReplies(rig)).toHaveLength(0);
+  });
+});
+
 describe('EngineHost latency', () => {
   it('estimates outputLatency (or baseLatency) and outputLatency + baseLatency until calibrated, and sends it', async () => {
     const rig = await startHost();
@@ -207,6 +300,18 @@ describe('EngineHost latency', () => {
     ctx.outputLatency = 0.01;
     ctx.setState('running');
     expect(rig.host.latency()).toEqual({ roundTripFrames: 720, outputLatencyFrames: 480 });
+    expect(latencyCommands(rig).at(-1)).toEqual({ roundTripFrames: 720, outputLatencyFrames: 480 });
+  });
+
+  it('re-estimates when the host\'s own resume brings the context back', async () => {
+    const ctx = new FakeContext();
+    ctx.outputLatency = 0;
+    const rig = await startHost({ ctx });
+    ctx.setState('interrupted');
+    ctx.outputLatency = 0.01;
+    rig.doc.set('visible');
+    await settle();
+    expect(ctx.state).toBe('running');
     expect(latencyCommands(rig).at(-1)).toEqual({ roundTripFrames: 720, outputLatencyFrames: 480 });
   });
 
