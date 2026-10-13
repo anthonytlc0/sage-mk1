@@ -1,0 +1,232 @@
+/* The recorder pod: a small separate device on the tabletop, in the panel's matte charcoal. No hardware labels. */
+
+.recorder-pod {
+  /* Task 23 places it for good; for now it sits in the tabletop's bottom-right corner. */
+  position: fixed;
+  right: calc(12px + env(safe-area-inset-right, 0px));
+  bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+  z-index: 20;
+  box-sizing: border-box;
+  width: 300px;
+  max-width: calc(100vw - 24px);
+  padding: 10px;
+  border: 1px solid #3d3e43;
+  border-radius: 14px;
+  background: linear-gradient(#2c2d31, #202124 55%, #1b1c1f);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 6px 18px rgba(0, 0, 0, 0.55);
+  color: #b7bbc1;
+  font-family: 'Avenir Next Condensed', 'DIN Alternate', 'Roboto Condensed', 'Arial Narrow', 'Helvetica Neue', Arial,
+    sans-serif;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.recorder-pod[hidden],
+.recorder-pod [hidden] {
+  display: none;
+}
+
+.rp-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Every button: a dark key, at least 44 px to hit. Not focusable, so the panel keeps Space, Enter and Tab. */
+.rp-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 10px;
+  border: 1px solid #0c0c0e;
+  border-radius: 9px;
+  background: linear-gradient(#3a3b40, #2a2b2f);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    0 1px 2px rgba(0, 0, 0, 0.6);
+  color: #d9dce0;
+  font-size: 14px;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.rp-btn:active {
+  background: linear-gradient(#2a2b2f, #323337);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.7);
+}
+
+.rp-rec {
+  gap: 7px;
+  padding: 0 12px 0 10px;
+}
+
+.rp-led {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #4a1d20;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.7);
+}
+
+.rp-rec.is-on .rp-led {
+  background: #e2252d;
+  box-shadow:
+    0 0 6px 1px rgba(255, 59, 68, 0.85),
+    0 0 14px 3px rgba(226, 37, 45, 0.45);
+}
+
+.rp-rec.is-on {
+  border-color: #5a1a1e;
+}
+
+/* The timer: a recessed dark window. */
+.rp-clock {
+  flex: 1;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 11px 6px;
+  border-radius: 7px;
+  background: #0a0b0c;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.9);
+  color: #7d8187;
+  font-size: 20px;
+  line-height: 20px;
+  letter-spacing: 0.1em;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.rp-clock.is-on {
+  color: #f0f1f3;
+}
+
+.rp-mix {
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.rp-mix.is-busy {
+  color: #8e9298;
+  cursor: progress;
+}
+
+.rp-mix.is-ready {
+  border-color: #6b2125;
+  background: linear-gradient(#5b2326, #3d1a1c);
+  color: #fff;
+}
+
+.rp-mix-discard {
+  min-width: 32px;
+  padding: 0 6px;
+  font-size: 12px;
+}
+
+.rp-note {
+  min-height: 0;
+  padding: 0 2px;
+  color: #e2252d;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.rp-note:not(:empty) {
+  min-height: 12px;
+  margin-top: 8px;
+}
+
+.rp-takes {
+  display: none;
+  margin: 8px 0 0;
+  padding: 0;
+  max-height: 180px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+  list-style: none;
+}
+
+.recorder-pod.has-takes .rp-takes {
+  display: block;
+}
+
+.rp-take {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+  border-top: 1px solid #2d2e32;
+}
+
+.rp-take:first-child {
+  border-top: 0;
+}
+
+.rp-take-meta {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rp-take-time {
+  color: #8e9298;
+  font-size: 11px;
+}
+
+.rp-take-len {
+  color: #e6e8eb;
+  font-size: 15px;
+}
+
+.rp-play {
+  min-width: 44px;
+  padding: 0;
+  font-size: 15px;
+}
+
+.rp-take.is-playing .rp-play {
+  border-color: #6b2125;
+  color: #ff6a70;
+}
+
+/* A take that is not ready yet (an older one): dimmed until a tap has prepared it. */
+.rp-take.is-cold .rp-play,
+.rp-take.is-cold .rp-save {
+  color: #7d8187;
+}
+
+.rp-take.is-preparing .rp-btn {
+  cursor: progress;
+}
+
+.rp-save {
+  min-width: 52px;
+  font-size: 12px;
+}
+
+.rp-del {
+  min-width: 44px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.rp-del.is-armed {
+  border-color: #6b2125;
+  background: linear-gradient(#5b2326, #3d1a1c);
+  color: #fff;
+}
