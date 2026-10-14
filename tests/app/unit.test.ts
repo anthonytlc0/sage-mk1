@@ -11,7 +11,9 @@ import { drawBootScreen } from '../../src/lcd/screens/boot';
 import { RECOVER_PROMPT } from '../../src/lcd/screens/recover';
 import { defaultMemory, defaultSystem } from '../../src/schema/params';
 import type { SystemSettings } from '../../src/schema/types';
-import type { ControlEvent, ButtonId } from '../../src/shared/ids';
+import type { AbsoluteId, ControlEvent, ButtonId } from '../../src/shared/ids';
+import { faderGain } from '../../src/dsp/mixer';
+import { findParam } from '../../src/schema/params';
 import type { EngineCommand, TrackAudio } from '../../src/shared/protocol';
 import { CHECKPOINT_DEBOUNCE_MS } from '../../src/control/controller';
 
@@ -141,6 +143,14 @@ interface RigOptions {
   abortAfterMs?: number;
 }
 
+/** The panel's absolute controls as the view draws them (faders rest at the top, knobs at 12 o'clock). */
+class FakePanel {
+  readonly pos = new Map<AbsoluteId, number>();
+  get(id: AbsoluteId): number {
+    return this.pos.get(id) ?? (id.endsWith('.fader') ? 1 : 0.5);
+  }
+}
+
 async function rig(opts: RigOptions = {}) {
   const log: string[] = [];
   const stores = await openStores(`unit-test-${dbSeq++}`);
@@ -150,6 +160,7 @@ async function rig(opts: RigOptions = {}) {
   const doc = new FakeDoc();
   const wakeLock = new FakeWakeLock();
   const pods: FakePod[] = [];
+  const panel = new FakePanel();
   const started: (SystemSettings | undefined)[] = [];
   const startEngine = vi.fn(
     opts.startEngine ??
@@ -176,6 +187,7 @@ async function rig(opts: RigOptions = {}) {
     win,
     doc,
     wakeLock,
+    panelPosition: (id) => panel.get(id),
     bootMs: opts.bootMs ?? 20,
     ...(opts.storageTimeoutMs !== undefined ? { storageTimeoutMs: opts.storageTimeoutMs } : {}),
     ...(opts.abortAfterMs !== undefined ? { abortAfterMs: opts.abortAfterMs } : {}),
@@ -183,7 +195,7 @@ async function rig(opts: RigOptions = {}) {
   });
   units.push(unit);
   if (!opts.stores) await unit.ready(); // the stored system settings are read ahead of the POWER tap
-  return { unit, stores, engine, win, doc, wakeLock, pods, started, startEngine, requestPersistence, openStores: openFn, log };
+  return { unit, stores, engine, win, doc, wakeLock, pods, panel, started, startEngine, requestPersistence, openStores: openFn, log };
 }
 
 type Rig = Awaited<ReturnType<typeof rig>>;
@@ -600,6 +612,68 @@ describe('SageUnit: POWER off and page hide', () => {
     r.doc.set('hidden');
     r.doc.set('visible');
     expect(r.wakeLock.requests).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------- I3
+
+describe('SageUnit: the panel faders and what is heard agree (I3)', () => {
+  /** A drag on the panel: the view redraws the control, then the unit hears the `set` (pointer.ts emitSet). */
+  const move = (r: Rig, id: AbsoluteId, value: number): void => {
+    r.panel.pos.set(id, value);
+    r.unit.handle({ kind: 'set', id, value, t: performance.now() });
+  };
+  const faderSent = (r: Rig, track: number): number | undefined =>
+    r.engine.commands('fader').filter((c) => c.track === track).at(-1)?.gain;
+
+  it('a fader pulled down, then POWER off and on: the new power-on hears it where the panel shows it', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()) });
+    await powerOn(r);
+    move(r, 'trk2.fader', 0.2);
+    expect(faderSent(r, 1)).toBe(faderGain(0.2));
+    r.unit.tap();
+    await r.unit.settled();
+    r.engine.reset();
+    await powerOn(r); // a new controller: every fader at unity until told
+    expect(faderSent(r, 1)).toBe(faderGain(0.2));
+    expect(r.unit.controller!.faderGain(1)).toBe(faderGain(0.2)); // what LOOP MIX uses too
+    expect(faderSent(r, 0)).toBeUndefined(); // faders at rest need nothing
+  });
+
+  it('a fader moved before POWER is applied when the unit comes on', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()) });
+    move(r, 'trk3.fader', 0);
+    expect(r.engine.sent).toEqual([]); // off: nothing reaches the engine
+    await powerOn(r);
+    expect(faderSent(r, 2)).toBe(faderGain(0));
+    expect(r.unit.controller!.faderGain(2)).toBe(faderGain(0));
+  });
+
+  it('a fader moved while booting is applied too', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()), bootMs: 60 });
+    r.unit.tap();
+    await sleep(20);
+    move(r, 'trk5.fader', 0.5);
+    await r.unit.settled();
+    expect(r.unit.controller!.faderGain(4)).toBe(faderGain(0.5));
+  });
+
+  it('OUTPUT LEVEL turned while off sets MASTER OUT at power-on; untouched, the stored MASTER OUT stands', async () => {
+    const r = await rig({
+      seed: async (s) => {
+        const sys = calibrated();
+        sys.mixer.masterOut = 80; // set in the MIXER menu last time
+        await s.system.save(sys);
+      },
+    });
+    await powerOn(r);
+    expect(r.unit.controller!.session.system.mixer.masterOut).toBe(80); // the knob at rest does not override it
+    r.unit.tap();
+    await r.unit.settled();
+    move(r, 'outputLevel', 0.25);
+    await powerOn(r);
+    const def = findParam('mixer.masterOut')!.def;
+    expect(r.unit.controller!.session.system.mixer.masterOut).toBeCloseTo(def.min! + 0.25 * (def.max! - def.min!), 6);
   });
 });
 

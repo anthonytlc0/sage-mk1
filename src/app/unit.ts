@@ -29,6 +29,8 @@
  * Page hide: only after a POWER off is it a clean shutdown (`markCleanShutdown`). While on, the running flag stays set,
  *   so a crash or a closed app offers RECOVER next time; the controller checkpoints unsaved work on `pagehide` itself,
  *   and the unit has it do the same when the page goes hidden (iPadOS may end a hidden app without a pagehide).
+ * Panel controls: the panel is mounted once per page, the controller is new at every power-on. When the unit comes on
+ *   it takes the faders where the panel shows them (`panelPosition`), and OUTPUT LEVEL if it was turned while off (I3).
  * Wake lock: asked for at power-on (inside the tap), again when the page is visible again and on panel presses while
  *   none is held, and let go at power off.
  * Recorder pod: REC and LOOP MIX are enabled only while the unit is on with its audio running.
@@ -36,6 +38,7 @@
 
 import { Controller } from '../control/controller';
 import type { EngineLike, Stores } from '../control/controller';
+import { faderGain } from '../dsp/mixer';
 import { Framebuffer } from '../lcd/framebuffer';
 import { MenuSystem } from '../lcd/menu';
 import { BOOT_MS, drawBootScreen } from '../lcd/screens/boot';
@@ -43,7 +46,8 @@ import { showBootPrompts } from '../lcd/screens/recover';
 import { Recorder } from '../recorder/recorder';
 import type { SystemSettings } from '../schema/types';
 import { LCD_H, LCD_W } from '../shared/constants';
-import type { ControlEvent } from '../shared/ids';
+import { TRACKS } from '../shared/ids';
+import type { AbsoluteId, ControlEvent } from '../shared/ids';
 import type { PanelState, RingState } from '../shared/panel';
 import { openDb } from '../storage/db';
 import { MemoryStore } from '../storage/memoryStore';
@@ -119,6 +123,12 @@ export interface UnitDeps {
   doc?: VisibilitySource | null;
   /** `navigator.wakeLock`, when there is one. */
   wakeLock?: WakeLockApi;
+  /**
+   * Where the panel shows an absolute control (0..1): the app passes `view.getPhysical`. The panel is mounted once per
+   * page but each power-on makes a new controller with every fader at unity, so the faders are read from here when
+   * the unit comes on (I3).
+   */
+  panelPosition?: (id: AbsoluteId) => number;
   /** The least time the boot screen shows (default BOOT_MS). */
   bootMs?: number;
   /** Default STORAGE_TIMEOUT_MS. */
@@ -214,6 +224,8 @@ export class SageUnit {
   private keptCheckpoint = false;
   /** The engine of this power-on reported a `fault` (ruling R67). Cleared at the next power-on. */
   private faulted = false;
+  /** Faders and OUTPUT LEVEL moved while the unit was not on (the panel redraws them, the controller never heard). */
+  private readonly offMoves = new Map<AbsoluteId, number>();
   private transition: Promise<void> = Promise.resolve();
   private readonly preload: Promise<void>;
   private stores: StoresOpen;
@@ -377,9 +389,15 @@ export class SageUnit {
       });
   }
 
-  /** Panel input: to the controller while on, nowhere otherwise. */
+  /**
+   * Panel input: to the controller while on, nowhere otherwise. A fader or OUTPUT LEVEL moved meanwhile is remembered
+   * and applied when the unit comes on (I3), as a physical control's position is the level at power-on.
+   */
   handle(e: ControlEvent): void {
-    if (this._state !== 'on' || this.live === null) return;
+    if (this._state !== 'on' || this.live === null) {
+      if (e.kind === 'set' && (e.id === 'outputLevel' || e.id.endsWith('.fader'))) this.offMoves.set(e.id, e.value);
+      return;
+    }
     this.live.controller.handle(e);
     if (e.kind === 'press') this.wake.ensure();
   }
@@ -575,11 +593,30 @@ export class SageUnit {
     }
     if (this.live !== live) return;
     this.boot = null;
+    this.syncPanel(controller);
     this.setState('on');
     // A message raised while the boot screen was up has mostly expired under it: NO INPUT is shown again, in full.
     if (this.faulted) controller.showMessage(MSG_ENGINE_STOPPED, Infinity);
     else if (bootMessage !== null) controller.showMessage(bootMessage);
     else if (!engine.micAvailable) controller.showMessage('NO INPUT');
+  }
+
+  /**
+   * The unit comes on: the controller (new at every power-on, every fader at unity) and so the engine take the panel
+   * as it is (I3). Each track fader where the panel shows it; OUTPUT LEVEL only if it was turned while the unit was not
+   * on, because MASTER OUT (or PHONES OUT) is a stored system setting the MIXER menu can change without the knob.
+   */
+  private syncPanel(controller: Controller): void {
+    const t = performance.now();
+    for (const track of TRACKS) {
+      const id = `trk${track + 1}.fader` as AbsoluteId;
+      const pos = this.deps.panelPosition?.(id) ?? this.offMoves.get(id);
+      if (pos === undefined || !Number.isFinite(pos)) continue;
+      if (faderGain(Math.min(1, Math.max(0, pos))) !== controller.faderGain(track)) controller.handle({ kind: 'set', id, value: pos, t });
+    }
+    const out = this.offMoves.get('outputLevel');
+    if (out !== undefined) controller.handle({ kind: 'set', id: 'outputLevel', value: out, t });
+    this.offMoves.clear();
   }
 
   /** Gives up a power-on: everything made so far goes and the engine stops. STORAGE ERROR unless a tap asked for it. */

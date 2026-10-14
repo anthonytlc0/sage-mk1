@@ -77,6 +77,7 @@ export async function bootApp(root: HTMLElement): Promise<void> {
     win,
     doc,
     wakeLock: (win.navigator as Navigator & { wakeLock?: WakeLockApi }).wakeLock,
+    panelPosition: (id) => view.getPhysical(id), // the faders as drawn, applied at each power-on (I3)
   });
 
   const power = mountPowerSwitch(
