@@ -424,3 +424,103 @@ describe('memory accounting (snapshots share chunks)', () => {
     expect(chunks(core)).toBe(3);
   });
 });
+
+/**
+ * Fix round 1, item 1: on a tight budget the gathered writes of a pass at 1.5x still landing after its punch-out need
+ * copy-on-write chunks, and making room drops history. The loop being swapped in must never be what gives way.
+ */
+describe('history swaps on a tight memory budget', () => {
+  const SR48 = 48000;
+  const CB = SR48 * 2 * 4; // one 1 s chunk at 48 kHz
+  const sine = (hz: number, amp: number) => (f: number): number => amp * Math.sin((2 * Math.PI * hz * f) / SR48);
+
+  /**
+   * A 2 s (2-chunk) loop at 48 kHz, XFADE. A whole-pass overdub at rate 1 from 192000, then with `mark` a mark and a
+   * second whole pass from 384000; then at 1.5x from 490000 a pass over positions ~30000..50000 that crosses into
+   * chunk 1, punched out at 516667. `cmd` follows 10 ms later, while chunk 1's part of the pass is still gathered and
+   * the budget is exactly used up (MARK BACK: 7 chunks; REC BACK: 5).
+   */
+  function tightSwap(budgetChunks: number, mark: boolean, cmd: EngineCommand): LooperCore {
+    const core = makeCore({ track: [{ tempoSyncMode: 'XFADE' }] }, { sampleRate: SR48, memoryBudgetBytes: budgetChunks * CB });
+    at(core, 0, recPlay(), sine(440, 0.3));
+    at(core, 96000, recPlay(), sine(440, 0.3));
+    at(core, 192000, recPlay(), sine(550, 0.2));
+    at(core, 288000, recPlay(), sine(550, 0.2));
+    if (mark) {
+      at(core, 290000, markSet(), sine(550, 0.2));
+      at(core, 384000, recPlay(), sine(660, 0.2));
+      at(core, 480000, recPlay(), sine(660, 0.2));
+    }
+    run(core, 490000 - core.frame);
+    // On the tight budgets the 1.5x pass's copy of chunk 0 uses up the last chunk.
+    if (budgetChunks < 64) expect(core.status().memoryBytes).toBe((budgetChunks - 1) * CB);
+    configure(core, { tempo: 180 }); // position 10000, now 1.5x
+    at(core, 503334, recPlay(), sine(770, 0.2));
+    at(core, 516667, recPlay(), sine(770, 0.2));
+    at(core, 516667 + 480, cmd, sine(770, 0.2));
+    return core;
+  }
+
+  function expectSameLoop(core: LooperCore, ref: LooperCore): void {
+    const s = trk(core);
+    expect(s.state).toBe('playing');
+    expect(s.lengthFrames).toBe(96000);
+    const got = core.getTrackAudio(0)!.L;
+    const want = ref.getTrackAudio(0)!.L;
+    let differ = 0;
+    for (let i = 0; i < want.length; i++) if (got[i] !== want[i]) differ++;
+    expect(differ).toBe(0);
+    expect(core.status().memoryBytes).toBeLessThanOrEqual(core.status().memoryBudget);
+  }
+
+  it('MARK BACK: the marked loop survives (REC BACK gives way instead)', () => {
+    const core = tightSwap(7, true, markBack());
+    const ref = tightSwap(64, true, markBack());
+    expectSameLoop(core, ref);
+    expect(trk(core).hasMark).toBe(true);
+    run(core, 48000);
+    run(ref, 48000);
+    core.command(undoRedo()); // the loop it replaced is whole too
+    ref.command(undoRedo());
+    expectSameLoop(core, ref);
+    core.command(recPlay()); // a new pass keeps the loop
+    run(core, 100);
+    expect(trk(core).lengthFrames).toBe(96000);
+  });
+
+  it('REC BACK: the recording survives (and so does REC BACK)', () => {
+    const core = tightSwap(5, false, recBack());
+    const ref = tightSwap(64, false, recBack());
+    expectSameLoop(core, ref);
+    core.command(markBack()); // no mark: REC BACK, still there
+    ref.command(markBack());
+    expectSameLoop(core, ref);
+    run(core, 48000);
+    run(ref, 48000);
+    core.command(undoRedo());
+    ref.command(undoRedo());
+    expectSameLoop(core, ref);
+  });
+
+  it('undo after REC->DUB (undo and REC BACK share a snapshot): the recording survives', () => {
+    function recDub(budgetChunks: number): LooperCore {
+      const core = makeCore(
+        { rec: { recAction: 'REC->DUB' }, track: [{ tempoSyncMode: 'XFADE' }] },
+        { sampleRate: SR48, memoryBudgetBytes: budgetChunks * CB },
+      );
+      at(core, 0, recPlay(), sine(440, 0.3));
+      at(core, 96000, recPlay(), sine(550, 0.2)); // the overdub starts at once, at rate 1
+      run(core, 20000, sine(550, 0.2));
+      configure(core, { tempo: 180 }); // position 20000, now 1.5x: the pass goes on splatted
+      at(core, 136000, recPlay(), sine(550, 0.2)); // punch out at position ~50000, inside chunk 1
+      at(core, 136480, undoRedo(), sine(550, 0.2));
+      return core;
+    }
+    const core = recDub(3);
+    const ref = recDub(64);
+    expectSameLoop(core, ref);
+    core.command(recBack());
+    ref.command(recBack());
+    expectSameLoop(core, ref);
+  });
+});

@@ -237,3 +237,17 @@ describe('ALL START/STOP', () => {
     expect(core.status().tracks.every((t) => t.state === 'empty')).toBe(true);
   });
 });
+
+describe('ALL START/STOP with starts waiting for their line (fix round 1, ruling R61)', () => {
+  it('a second press while the starts wait cancels them, and nothing starts', () => {
+    const core = threeStopped({ play: { allStartTrk: [true, true, true, false, false] } });
+    rhythmOn(core); // lines at 3300, 5300, ...
+    configure(core, { track: [{ loopSyncSw: true, loopSyncMode: 'MEASURE' }, {}, { loopSyncSw: true, loopSyncMode: 'MEASURE' }] });
+    at(core, 4000, allStartStop);
+    for (const i of [0, 1, 2] as const) expect(trk(core, i).pending).toBe('play');
+    at(core, 4500, allStartStop);
+    for (const i of [0, 1, 2] as const) expect(trk(core, i).pending).toBeNull();
+    runTo(core, 6000);
+    for (const i of [0, 1, 2] as const) expect(trk(core, i).state).toBe('stopped');
+  });
+});

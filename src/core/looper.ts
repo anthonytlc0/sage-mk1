@@ -292,8 +292,9 @@ export class LooperCore {
   }
 
   /**
-   * ALL START/STOP at `now` (Owner's Manual p. 4). If any track is recording, playing or overdubbing, every track
-   * stops: a recording or pass ends first, then STOP MODE applies, and armed starts are cancelled. Otherwise the tracks
+   * ALL START/STOP at `now` (Owner's Manual p. 4). If any track is recording, playing or overdubbing, or has a start
+   * or recording armed (ruling R61), every track stops: a recording or pass ends first, then STOP MODE applies, and
+   * armed actions are cancelled. Otherwise the tracks
    * set in ALL START TRK that hold a loop start together: at once, or, when one of them would wait for a line (LOOP
    * SYNC MODE MEASURE or LOOP LENGTH with the grid running), all of them at the latest such line.
    *
@@ -303,7 +304,7 @@ export class LooperCore {
   private allStartStop(now: number): void {
     const tracks = this.tracks;
     for (let i = 0; i < tracks.length; i++) {
-      if (!tracks[i].running) continue;
+      if (!tracks[i].running && !tracks[i].armed) continue;
       for (let j = 0; j < tracks.length; j++) tracks[j].allStop();
       return;
     }

@@ -792,3 +792,69 @@ describe('note d: an overshoot longer than the loop', () => {
     expect(core.getTrackAudio(0)!.L[1000]).toBe(1000 + 11000);
   });
 });
+
+/**
+ * Fix round 1, item 2: a punch-in within 5 ms of a punch-out at a rate other than 1 waits for the splatted punch-out
+ * tail to finish (at most 5 ms), so the earlier pass is whole, in the take and in the new pass's undo, and the gathered
+ * writes of the two passes never share the ring.
+ */
+describe('a re-punch inside the 5 ms punch-out tail at a rate other than 1', () => {
+  const undo: EngineCommand = { t: 'undoRedo', track: 0 };
+  const noop: EngineCommand = { t: 'markClear', track: 0 }; // splits the block where the other core has a press
+
+  /** Pass 1 at 1.5x from 100000 to 130000; pass 2 pressed at 130000 + `gap`, out at 160000. */
+  function repunch(mode: 'XFADE' | 'PITCH', gap: number): { core: LooperCore; out: Float32Array } {
+    const core = makeCore({ track: [{ tempoSyncMode: mode }] }, { sampleRate: SR48 });
+    const dub = tone(660, SR48, 0.4);
+    at(core, 0, recPlay(), tone(440, SR48, 0.4));
+    at(core, 96000, recPlay(), tone(440, SR48, 0.4));
+    configure(core, { tempo: 180 });
+    at(core, 100000, recPlay(), dub);
+    at(core, 130000, recPlay(), dub);
+    const parts = [at(core, 130100, gap === 100 ? recPlay() : noop, dub).tracks[0]];
+    parts.push(at(core, 130240, gap === 240 ? recPlay() : noop, dub).tracks[0]);
+    parts.push(at(core, 160000, recPlay(), dub).tracks[0]);
+    parts.push(run(core, 20000, dub).tracks[0]);
+    const n = parts.reduce((k, p) => k + p.length, 0);
+    const out = new Float32Array(n);
+    let k = 0;
+    for (const p of parts) {
+      out.set(p, k);
+      k += p.length;
+    }
+    return { core, out };
+  }
+
+  /** Frames where `a` and `b` differ. */
+  function differ(a: Float32Array, b: Float32Array): number {
+    let n = Math.abs(a.length - b.length);
+    for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] !== b[i]) n++;
+    return n;
+  }
+
+  it.each(['XFADE', 'PITCH'] as const)('%s: it starts where the tail ends, as a press there would', (mode) => {
+    const { core, out } = repunch(mode, 100);
+    const ref = repunch(mode, 240);
+    expect(differ(out, ref.out)).toBe(0); // the same output throughout: no step where the tail was cut
+    expect(differ(core.getTrackAudio(0)!.L, ref.core.getTrackAudio(0)!.L)).toBe(0);
+    core.command(undo);
+    ref.core.command(undo);
+    expect(differ(core.getTrackAudio(0)!.L, ref.core.getTrackAudio(0)!.L)).toBe(0); // the earlier pass, whole
+  });
+
+  it('shows the waiting punch-in as pending, and a second press cancels it', () => {
+    const core = makeCore({ track: [{ tempoSyncMode: 'PITCH' }] }, { sampleRate: SR48 });
+    at(core, 0, recPlay(), tone(440, SR48, 0.4));
+    at(core, 96000, recPlay(), tone(440, SR48, 0.4));
+    configure(core, { tempo: 180 });
+    at(core, 100000, recPlay());
+    at(core, 130000, recPlay());
+    at(core, 130100, recPlay());
+    expect(trk(core).state).toBe('playing');
+    expect(trk(core).pending).toBe('dub');
+    at(core, 130150, recPlay()); // cancelled
+    expect(trk(core).pending).toBeNull();
+    run(core, 1000);
+    expect(trk(core).state).toBe('playing');
+  });
+});

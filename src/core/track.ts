@@ -278,6 +278,11 @@ export class Track implements SyncTrack {
   private readonly recTail: Tail = { pos: 0, left: 0, replace: true, sinks: new Sinks() };
   /** The punch-out still to write after an overdub ended. */
   private readonly dubTail: Tail = { pos: 0, left: 0, replace: false, sinks: new Sinks() };
+  /**
+   * A punch-in pressed while a splatted punch-out tail still runs (within 5 ms of a punch-out at a rate other than
+   * 1): it starts the moment the tail ends (fix round 1). Shown as pending 'dub'; a second press cancels it.
+   */
+  private punchPending = false;
 
   // Undo history (see the file comment) ---------------------------------------------------------------------------
   private undoSnap: Snap | null = null;
@@ -498,6 +503,17 @@ export class Track implements SyncTrack {
           return;
         }
         if (this.cfg.reverse) return; // REVERSE: no overdub
+        if (this.punchPending) {
+          this.punchPending = false; // a second press before the waiting punch-in started: cancelled
+          return;
+        }
+        if (this.wTail > 0 && !this.exact) {
+          // INFERRED (fix round 1): the earlier pass's splatted punch-out tail finishes first (at most 5 ms), so that
+          // pass is whole, in the take and in the new pass's undo. Cutting it left a step in the layer, and the two
+          // passes cannot share the gathering ring without the undo picking up the new one.
+          this.punchPending = true;
+          return;
+        }
         this.beginPass(false);
         return;
     }
@@ -508,6 +524,7 @@ export class Track implements SyncTrack {
    * an armed action instead, leaving the track as it was.
    */
   stop(): void {
+    this.punchPending = false;
     if (this.arm.action !== null) {
       this.arm.action = null;
       return;
@@ -571,6 +588,7 @@ export class Track implements SyncTrack {
    */
   interrupt(): void {
     this.arm.action = null; // an armed action would fire on a stale line when audio resumes
+    this.punchPending = false;
     if (this._state === 'recording') this.forceFinish();
     else if (this._state === 'overdubbing') this.endPass(true);
   }
@@ -589,7 +607,7 @@ export class Track implements SyncTrack {
     if (back !== null) {
       this.undoSnap = null;
       this.swapIn(back, 'redo');
-      this.drop(back);
+      this.drop(back); // (still REC BACK after REC->DUB: kept)
     } else if (fwd !== null) {
       this.redoSnap = null;
       this.swapIn(fwd, 'undo');
@@ -624,8 +642,7 @@ export class Track implements SyncTrack {
   private goBack(target: Snap): void {
     if (this._state === 'recording') return;
     if (this._state === 'overdubbing') this.endPass(true);
-    this.swapIn(target, 'undo');
-    this.setSlot('redo', null);
+    if (this.swapIn(target, 'undo')) this.setSlot('redo', null);
   }
 
   /**
@@ -642,10 +659,21 @@ export class Track implements SyncTrack {
 
   /**
    * Make `s` the loop. The loop it replaces is kept in the `keep` slot (moved there: its take, not a copy, so writes
-   * still in flight to it keep landing in it); `s` stays in whatever slots hold it, since the loop becomes a snapshot
-   * of it. A playing track crossfades from the old loop to the new one over 5 ms where its playhead is.
+   * still in flight to it keep landing in it, which is why nothing needs flushing first); `s` stays in whatever slots
+   * hold it, since the loop becomes a snapshot of it. A playing track crossfades from the old loop to the new one over
+   * 5 ms where its playhead is.
+   *
+   * The new loop's snapshot is taken before anything here can allocate (fix round 1): a copy-on-write copy can make
+   * the pool reclaim history, `s` is history, and once released it has no audio left to take. Nothing then allocates
+   * until `s` is safe (the swap itself needs no memory). A source already released is refused (MEMORY FULL), so a
+   * 0-length loop is never installed. Returns whether the swap happened.
    */
-  private swapIn(s: Snap, keep: 'undo' | 'redo'): void {
+  private swapIn(s: Snap, keep: 'undo' | 'redo'): boolean {
+    if (s.take !== null && s.take.length === 0) {
+      this.host.post('MEMORY FULL');
+      return false;
+    }
+    const incoming = s.take === null ? null : this.shareTake(s.take);
     const sounding = this.sounding;
     const dir = this.direction();
     const wasEmpty = this._state === 'empty';
@@ -656,15 +684,14 @@ export class Track implements SyncTrack {
       loopSeq: this._loopSeq,
     };
     this.recShare = null;
-    this.flushPendingWrites(); // what can land now lands before the loop is moved (the rest follows it)
+    this.punchPending = false;
     if (sounding) this.startRelease(dir); // the old loop's next 5 ms, fading out
-    if (s.take === null) {
+    if (incoming === null) {
       if (!wasEmpty) {
         this._take = new AudioTake(this.host.pool);
         this.becomeEmpty();
       }
     } else {
-      const incoming = this.shareTake(s.take);
       if (wasEmpty) this._take.release(); // an empty take holds nothing
       this._take = incoming;
       this._recordedTempo = s.recordedTempo;
@@ -683,6 +710,7 @@ export class Track implements SyncTrack {
     }
     this.setSlot(keep, out);
     this.host.audioChanged();
+    return true;
   }
 
   /**
@@ -1258,9 +1286,14 @@ export class Track implements SyncTrack {
 
   // ALL START/STOP and PLAY MODE SINGLE (driven by the core) --------------------------------------------------------
 
-  /** Recording, playing or overdubbing: what makes ALL START/STOP stop rather than start. */
+  /** Recording, playing or overdubbing. */
   get running(): boolean {
     return this._state === 'recording' || this.sounding;
+  }
+
+  /** An action is armed (a start or recording waiting for its line or a SINGLE change). */
+  get armed(): boolean {
+    return this.arm.action !== null;
   }
 
   /** ALL START: start at `at`, now or armed until then (an armed start is replaced). Only a stopped track starts. */
@@ -1533,6 +1566,7 @@ export class Track implements SyncTrack {
 
   /** Stop. A splatted punch-out tail carries on writing (and its gathered writes land) without the playhead. */
   private toStopped(): void {
+    this.punchPending = false;
     this._state = 'stopped';
     this.stopping = null;
     this.playhead = 0;
@@ -1555,6 +1589,7 @@ export class Track implements SyncTrack {
     this.dubTail.sinks.reset(null);
     this.wSinks.reset(null);
     this.recShare = null;
+    this.punchPending = false;
     // A released take refuses appends, so it must be replaced, never kept.
     this._take.release();
     this._take = new AudioTake(this.host.pool);
@@ -1905,6 +1940,11 @@ export class Track implements SyncTrack {
       this.replayNext = false; // a replayed frame lasts one step of one frame
       if (sounding) this.advance(m, dir, rate);
       a += m;
+      if (this.punchPending && this.wTail === 0) {
+        // The punch-out tail has just ended: the waiting punch-in starts here, as a press on this frame would.
+        this.punchPending = false;
+        if (this._state === 'playing' && this.stopping === null) this.beginPass(false);
+      }
     }
   }
 
@@ -1968,6 +2008,7 @@ export class Track implements SyncTrack {
       m = Math.min(m, left);
       if (this.stopping === 'FADE') m = Math.min(m, Math.max(1, this.env.remaining));
     }
+    if (this.punchPending && this.wTail > 0) m = Math.min(m, this.wTail); // a waiting punch-in starts on its frame
     return m;
   }
 
@@ -2303,6 +2344,7 @@ export class Track implements SyncTrack {
       // on a track that cannot overdub ends in playback, so it shows 'play').
       pending:
         (this.arm.action === 'start' ? 'play' : this.arm.action) ??
+        (this.punchPending ? 'dub' : null) ??
         (this._state !== 'recording' ? null : this.recEnd === 'dub' && !this.canDub() ? 'play' : this.recEnd),
       stopping: this.stopping !== null,
       autoRecWaiting: false,
@@ -2349,6 +2391,15 @@ export class Track implements SyncTrack {
    * yet (a pass that ended under ~129 ms ago at a rate other than 1, binding note 2) are baked into the snapshot only,
    * as they stand, and still land in the take in their own time. What a tail has not yet received (its last few ms of
    * input) is not in it. The caller releases it.
+   *
+   * Side effects (fix round 1, item 5):
+   *  - During a pass at a rate other than 1 the bake writes frames whose gathering is not finished (the pass is still
+   *    adding to them): the copy holds the pass as far as it has got, partial averages at its leading edge included.
+   *    The live take is not touched by the bake.
+   *  - The bake writes into the snapshot, so its chunks are copied (copy-on-write; at most the 1-2 chunks the gathered
+   *    span covers). At the memory budget that can make the pool reclaim undo history: a save or export made when
+   *    memory is full can drop undo, redo, the mark or REC BACK (never the loop itself). If even that leaves no room,
+   *    the copy just lacks those frames.
    */
   exportSnapshot(): AudioTake | null {
     if (this._state === 'empty' || this._state === 'recording') return null;
