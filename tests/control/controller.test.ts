@@ -508,6 +508,68 @@ describe('recovery checkpoint', () => {
   });
 });
 
+describe('an unanswered RECOVER? prompt (ruling R68)', () => {
+  it('writes no checkpoint while pending: not after a punch-out, not on pagehide, not when asked', async () => {
+    const { c, engine, events, stores } = setup();
+    c.setRecoveryPending(true);
+    expect(c.recoveryPending).toBe(true);
+    engine.exportReply = [take(5), null, null, null, null];
+    engine.emit({ t: 'status', status: makeStatus({ audioDirty: true }) }); // a punch-out: new work
+    await vi.advanceTimersByTimeAsync(CHECKPOINT_DEBOUNCE_MS * 2);
+    events.dispatchEvent(new Event('pagehide'));
+    await c.checkpointNow();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stores.recovery.checkpoints).toHaveLength(0);
+    expect(engine.commands('exportTracks')).toHaveLength(0);
+  });
+
+  it('keeps the crash checkpoint while pending: no discard on a memory change or WRITE, no clean shutdown at POWER off', async () => {
+    const { c, stores } = setup();
+    c.setRecoveryPending(true);
+    c.setParam('setup.contrast', 3);
+    await c.selectMemory(2);
+    await c.write(2);
+    expect(await c.powerOff()).toBe(false);
+    expect(stores.recovery.discards).toBe(0);
+    expect(stores.recovery.cleanShutdowns).toBe(0);
+    expect(stores.system.saves).toBe(1); // the system settings are still saved
+  });
+
+  it('powerOff({ keepCheckpoint }) (the engine stopped, ruling R67) marks no clean shutdown either', async () => {
+    const { c, stores } = setup();
+    expect(await c.powerOff({ keepCheckpoint: true })).toBe(false);
+    expect(stores.recovery.cleanShutdowns).toBe(0);
+    const other = setup();
+    expect(await other.c.powerOff()).toBe(true);
+    expect(other.stores.recovery.cleanShutdowns).toBe(1);
+  });
+
+  it('once answered, the work made meanwhile is checkpointed again', async () => {
+    const { c, engine, stores } = setup();
+    c.setRecoveryPending(true);
+    engine.exportReply = [take(6), null, null, null, null];
+    engine.emit({ t: 'status', status: makeStatus({ audioDirty: true }) });
+    await vi.advanceTimersByTimeAsync(CHECKPOINT_DEBOUNCE_MS);
+    c.setRecoveryPending(false); // EXIT: the crash checkpoint is discarded
+    await vi.advanceTimersByTimeAsync(CHECKPOINT_DEBOUNCE_MS);
+    expect(stores.recovery.checkpoints).toHaveLength(1);
+    expect(stores.recovery.checkpoints[0]!.tracks[0]!.L[0]).toBe(6);
+  });
+
+  it('a restored checkpoint is not written back unchanged; the next change is checkpointed', async () => {
+    const { c, engine, stores } = setup();
+    c.setRecoveryPending(true);
+    c.restoreRecovery({ slot: 3, settings: defaultMemory(), tracks: [take(7), null, null, null, null] });
+    c.setRecoveryPending(false);
+    await vi.advanceTimersByTimeAsync(CHECKPOINT_DEBOUNCE_MS * 2);
+    await c.checkpointNow();
+    expect(engine.commands('exportTracks')).toHaveLength(0); // storage already holds exactly this work
+    c.setParam('name', 'MORE');
+    await c.checkpointNow();
+    expect(stores.recovery.checkpoints.map((k) => k.settings.name)).toEqual(['MORE']);
+  });
+});
+
 describe('messages', () => {
   it('showMessage sets the popup text for its time; engine messages are shown too', () => {
     const { c, engine } = setup();

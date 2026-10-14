@@ -17,7 +17,8 @@
  *   opened afresh at the next power-on.
  * POWER off (a tap while on): the running take is completed (`recorder.stop()`) before anything is torn down, the
  *   system settings are saved and a clean shutdown is marked (`Controller.powerOff`, which also drops the recovery
- *   checkpoint, ruling R16), then the pod, controller and menu go and the engine stops. The system settings as they
+ *   checkpoint, ruling R16), then the pod, controller and menu go and the engine stops. While RECOVER? is unanswered
+ *   (ruling R68) no clean shutdown is marked, then or at a later pagehide, so the next power-on offers it again. The system settings as they
  *   are then are kept for the next power-on in this page (MIC PROCESS for the mic, CONTRAST for the boot screen).
  * Audio lost (the engine's `needsResume`, ruling R58): the running take is halted at once, and the shell shows TAP
  *   POWER TO RESUME. A POWER tap retries (`resume({ retryMic: true })`); once a retry has failed, or has run for
@@ -199,6 +200,11 @@ export class SageUnit {
   private system: SystemSettings | undefined;
   /** The last power-off came from the POWER control (and the unit has not been switched on since). */
   private switchedOff = false;
+  /**
+   * That power-off kept the recovery checkpoint instead of marking a clean shutdown (RECOVER? unanswered, ruling R68;
+   * the engine stopped, R67): a later pagehide must not mark one either.
+   */
+  private keptCheckpoint = false;
   private transition: Promise<void> = Promise.resolve();
   private readonly preload: Promise<void>;
   private stores: StoresOpen;
@@ -412,6 +418,7 @@ export class SageUnit {
   private powerOn(): void {
     this._error = null;
     this.switchedOff = false;
+    this.keptCheckpoint = false;
     this.resume = 'idle';
     // A database that failed to open, or that the last power-on gave up on, is opened afresh (there is no reload in a
     // Home Screen app).
@@ -572,10 +579,15 @@ export class SageUnit {
 
   private async powerOff(live: Live): Promise<void> {
     this.switchedOff = true;
+    // RECOVER? unanswered (R68): the crashed session's checkpoint stays for the next power-on.
+    const keep = live.controller.recoveryPending;
+    this.keptCheckpoint = keep;
     this.setState('stopping');
     this.wake.release();
-    // Marks POWER off at once (no checkpoint after this), then saves and marks the clean shutdown.
-    const saved = live.controller.powerOff().catch((e: unknown) => console.error('saving at power off failed', e));
+    // Marks POWER off at once (no checkpoint after this), then saves and marks the clean shutdown (unless kept).
+    const saved = live.controller
+      .powerOff({ keepCheckpoint: keep })
+      .catch((e: unknown) => console.error('saving at power off failed', e));
     if (live.recorder.state !== 'idle') {
       await live.recorder.stop().catch((e: unknown) => console.error('ending the take at power off failed', e));
     }
@@ -621,7 +633,7 @@ export class SageUnit {
 
   private readonly onPageHide = (): void => {
     // Only a POWER off is a clean shutdown. Otherwise the running flag stays, so a crash offers RECOVER next time.
-    if (!this.switchedOff) return;
+    if (!this.switchedOff || this.keptCheckpoint) return;
     this.stores.p
       .then((s) => s.recovery.markCleanShutdown())
       .catch((e: unknown) => console.error('marking the clean shutdown failed', e));

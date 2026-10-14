@@ -730,5 +730,47 @@ describe('RECOVER?', () => {
     r.c.setParam('setup.latency', 1000);
     await showBootPrompts(r.menu, r.c, fakeRecovery(false));
     expect(r.menu.depth).toBe(1);
+    expect(r.c.recoveryPending).toBe(false);
+  });
+
+  it('R68: the controller knows RECOVER? is pending from when it shows until ENTER has restored the checkpoint', async () => {
+    const r = menuRig();
+    const rec = fakeRecovery();
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    const real = rec.take.getMockImplementation()!;
+    rec.take.mockImplementation(async () => {
+      await gate; // the checkpoint's audio is still being read
+      return real();
+    });
+    await showBootPrompts(r.menu, r.c, rec);
+    expect(r.c.recoveryPending).toBe(true);
+    push(r, 'enter');
+    await flush();
+    expect(r.c.recoveryPending).toBe(true); // a checkpoint now could replace the one being read
+    release();
+    await flush();
+    expect(r.c.session.memory.name).toBe('UNSAVED');
+    expect(r.c.recoveryPending).toBe(false);
+  });
+
+  it('R68: EXIT clears the pending state; so does a restore that fails', async () => {
+    const r = menuRig();
+    const rec = fakeRecovery();
+    await showBootPrompts(r.menu, r.c, rec);
+    push(r, 'exit');
+    expect(r.c.recoveryPending).toBe(false);
+    expect(rec.discard).toHaveBeenCalledTimes(1);
+
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const broken = fakeRecovery();
+    broken.take.mockRejectedValue(new Error('unreadable'));
+    await showBootPrompts(r.menu, r.c, broken);
+    expect(r.c.recoveryPending).toBe(true);
+    push(r, 'enter');
+    await flush();
+    expect(r.c.recoveryPending).toBe(false);
+    expect(r.c.message).toBe('DATA READ ERR');
+    err.mockRestore();
   });
 });

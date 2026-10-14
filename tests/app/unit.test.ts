@@ -12,7 +12,8 @@ import { RECOVER_PROMPT } from '../../src/lcd/screens/recover';
 import { defaultMemory, defaultSystem } from '../../src/schema/params';
 import type { SystemSettings } from '../../src/schema/types';
 import type { ControlEvent, ButtonId } from '../../src/shared/ids';
-import type { EngineCommand } from '../../src/shared/protocol';
+import type { EngineCommand, TrackAudio } from '../../src/shared/protocol';
+import { CHECKPOINT_DEBOUNCE_MS } from '../../src/control/controller';
 
 // ---------------------------------------------------------------------------------------------------------- fakes
 
@@ -599,6 +600,68 @@ describe('SageUnit: POWER off and page hide', () => {
     r.doc.set('hidden');
     r.doc.set('visible');
     expect(r.wakeLock.requests).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------- R68
+
+describe('SageUnit: an unanswered RECOVER? (ruling R68)', () => {
+  const audio = (v: number): TrackAudio => ({ L: new Float32Array(64).fill(v), R: new Float32Array(64).fill(-v), sampleRate: 48000, recordedTempo: 120, measures: 1 });
+  /** The last session crashed with unsaved work: TRACK 1 panned to R25, a loop of 0.25s. */
+  const crashed = async (s: ShellStores): Promise<void> => {
+    await s.system.save(calibrated());
+    const m = defaultMemory();
+    m.track[0]!.pan = 25;
+    await s.recovery.markRunning();
+    await s.recovery.checkpoint(1, m, [audio(0.25), null, null, null, null]);
+  };
+  const loadedTrack1 = (r: Rig): TrackAudio | null => r.engine.commands('loadTrack').filter((c) => c.track === 0).at(-1)!.audio;
+
+  it('looping with the prompt up writes no checkpoint; ENTER then restores the crashed session', async () => {
+    const r = await rig({ seed: crashed });
+    await powerOn(r);
+    expect(r.unit.menu!.top.title).toBe('RECOVER');
+    // The performer starts looping without reading the LCD: the track buttons do not go through it.
+    r.engine.exportReply = [audio(0.75), null, null, null, null];
+    press(r, 'trk1.rec');
+    expect(r.engine.commands('recPlay')).toHaveLength(1);
+    r.engine.emit({ t: 'status', status: makeStatus({ audioDirty: true }) }); // the punch-out
+    await sleep(CHECKPOINT_DEBOUNCE_MS + 300);
+    expect((await r.stores.recovery.take())!.tracks[0]!.L[0]).toBe(0.25); // still the crashed session's
+    press(r, 'enter');
+    for (let i = 0; i < 50 && r.unit.controller!.message !== null; i++) await sleep(10);
+    expect(r.unit.controller!.session.memory.track[0]!.pan).toBe(25);
+    expect(loadedTrack1(r)!.L[0]).toBe(0.25);
+    expect(r.unit.controller!.recoveryPending).toBe(false);
+  });
+
+  it('POWER off with the prompt unanswered keeps the checkpoint: the next power-on offers RECOVER? again', async () => {
+    const r = await rig({ seed: crashed });
+    await powerOn(r);
+    expect(r.unit.menu!.top.title).toBe('RECOVER');
+    const clean = vi.spyOn(r.stores.recovery, 'markCleanShutdown');
+    r.unit.tap();
+    await r.unit.settled();
+    expect(r.unit.state).toBe('off');
+    r.win.dispatchEvent(new Event('pagehide')); // after a POWER off a pagehide normally marks clean again
+    await sleep(10);
+    expect(clean).not.toHaveBeenCalled();
+    expect(await r.stores.recovery.needsRecovery()).toBe(true);
+    await powerOn(r);
+    expect(r.unit.menu!.top.title).toBe('RECOVER');
+    press(r, 'enter');
+    for (let i = 0; i < 50 && r.unit.controller!.message !== null; i++) await sleep(10);
+    expect(loadedTrack1(r)!.L[0]).toBe(0.25);
+  });
+
+  it('once answered (EXIT), POWER off is a clean shutdown again', async () => {
+    const r = await rig({ seed: crashed });
+    await powerOn(r);
+    press(r, 'exit');
+    r.unit.tap();
+    await r.unit.settled();
+    await sleep(10);
+    expect(await r.stores.recovery.needsRecovery()).toBe(false);
   });
 });
 
