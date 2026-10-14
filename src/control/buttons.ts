@@ -6,7 +6,8 @@
  *  - trkN.stop: `stop`, and `clear` once held CLEAR_HOLD_MS; in undo mode MARK BACK.
  *  - trkN.track / trkN.fx: the PANEL PLAY function of that button (MENU > CTL FUNC), in undo mode the PANEL UNDO one.
  *  - allStartStop, rhythmStartStop: their commands. undoRedo toggles undo mode.
- *  - tapTempo: tap tempo, and TEMPO REVERT (the memory's saved tempo) once held TAP_REVERT_MS.
+ *  - tapTempo: tap tempo, and TEMPO REVERT (the memory's saved tempo) once held TAP_REVERT_MS. Neither changes the
+ *    tempo while a track records or overdubs (`Controller.setParam` refuses it, as the hardware does; ledger 273).
  *  - exit / enter / in.edit / tr.edit act on release, so they can form chords: EXIT + ENTER = WRITE screen, EDIT + A-D =
  *    edit that effect. When the partner goes down while one is held the chord fires and neither single action runs.
  *    EDIT held EDIT_HOLD_MS = bank select.

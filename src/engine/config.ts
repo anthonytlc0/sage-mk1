@@ -24,6 +24,18 @@ export function isTouch(nav: { maxTouchPoints?: number } | undefined): boolean {
   return (nav?.maxTouchPoints ?? 0) > 1;
 }
 
+/**
+ * Seconds of audio an export streams per render block on a touch device (ledger 298). The desktop streams 1 s (384 KB
+ * of fresh arrays per 2.7 ms quantum at 48 kHz); the iPad runs a checkpoint export after every punch-out, so it takes
+ * a quarter of that per block: 96 KB. A full 384 MiB memory then streams in about 11 s, inside EXPORT_TIMEOUT_MS.
+ */
+export const TOUCH_EXPORT_SECONDS_PER_BLOCK = 0.25;
+
+/** Seconds of audio per export part for this device: TOUCH_EXPORT_SECONDS_PER_BLOCK on a touch device, else 1. */
+export function exportSecondsPerBlock(nav: { maxTouchPoints?: number } | undefined = globalThis.navigator): number {
+  return isTouch(nav) ? TOUCH_EXPORT_SECONDS_PER_BLOCK : 1;
+}
+
 /** The looper's memory budget for this device: TOUCH_MEMORY_BUDGET on a touch device, else DESKTOP_MEMORY_BUDGET. */
 export function memoryBudgetBytes(nav: { maxTouchPoints?: number } | undefined = globalThis.navigator): number {
   return isTouch(nav) ? TOUCH_MEMORY_BUDGET : DESKTOP_MEMORY_BUDGET;

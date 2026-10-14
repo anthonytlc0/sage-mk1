@@ -7,7 +7,9 @@ import {
   MSG_PREPARING, MSG_READY, MSG_RESTORE_CONFIRM, storageScreen,
 } from '../../src/lcd/screens/storage';
 import type { StorageDeps } from '../../src/lcd/screens/storage';
-import { CALIBRATE_PROMPT, MSG_CALIB_FAILED, MSG_MEASURING, MSG_REMOVE_HEADPHONES, latencyScreen, showCalibratePrompt } from '../../src/lcd/screens/latency';
+import { CALIBRATE_PROMPT, MSG_CALIB_FAILED, MSG_MEASURING, MSG_MIC_PROCESS_HINT, MSG_REMOVE_HEADPHONES, latencyScreen, showCalibratePrompt } from '../../src/lcd/screens/latency';
+import { textWidth } from '../../src/lcd/draw';
+import { FONT_SMALL } from '../../src/lcd/fonts';
 import { RECOVER_PROMPT, recoverScreen, showBootPrompts } from '../../src/lcd/screens/recover';
 import { FACTORY_RESET_TARGETS, SYSTEM_PARAMS, concreteIds, defaultMemory, defaultSystem } from '../../src/schema/params';
 import { drawTitleBar } from '../../src/lcd/screens/common';
@@ -603,6 +605,36 @@ describe('LATENCY calibration', () => {
     expect((r.menu.top as ReturnType<typeof latencyScreen>).lines[0]).toBe(MSG_REMOVE_HEADPHONES);
   });
 
+  it('ledger 304: a failure with MIC PROCESS on adds a hint to turn it off (echo cancellation eats the clicks)', async () => {
+    const r = menuRig();
+    r.c.setParam('setup.micProcess', true);
+    r.menu.push(latencyScreen());
+    const screen = r.menu.top as ReturnType<typeof latencyScreen>;
+    frame(r.c); // rendered before: no hint yet
+    expect(screen.lines).not.toContain(MSG_MIC_PROCESS_HINT);
+    push(r, 'enter');
+    r.engine.emit({ t: 'calibration', reqId: r.engine.last('calibrate')!.reqId, capture: capture(null), clickFrames: clicks });
+    await flush();
+    expect(r.c.message).toBe(MSG_CALIB_FAILED);
+    frame(r.c);
+    expect(screen.lines).toEqual([MSG_REMOVE_HEADPHONES, 'ENTER: START', 'NOW AUTO', MSG_MIC_PROCESS_HINT]);
+    expect(textWidth(MSG_MIC_PROCESS_HINT, FONT_SMALL)).toBeLessThanOrEqual(128);
+    r.c.setParam('setup.micProcess', false); // turned off: the hint goes
+    frame(r.c);
+    expect(screen.lines).not.toContain(MSG_MIC_PROCESS_HINT);
+  });
+
+  it('ledger 304: with MIC PROCESS off a failure shows no hint', async () => {
+    const r = menuRig();
+    r.menu.push(latencyScreen());
+    const screen = r.menu.top as ReturnType<typeof latencyScreen>;
+    push(r, 'enter');
+    r.engine.emit({ t: 'calibration', reqId: r.engine.last('calibrate')!.reqId, capture: capture(null), clickFrames: clicks });
+    await flush();
+    frame(r.c);
+    expect(screen.lines).not.toContain(MSG_MIC_PROCESS_HINT);
+  });
+
   it('EXIT is ignored while it measures (MEASURING...), so the output is never left muted behind the menu', async () => {
     const r = menuRig();
     r.menu.push(latencyScreen());
@@ -730,5 +762,47 @@ describe('RECOVER?', () => {
     r.c.setParam('setup.latency', 1000);
     await showBootPrompts(r.menu, r.c, fakeRecovery(false));
     expect(r.menu.depth).toBe(1);
+    expect(r.c.recoveryPending).toBe(false);
+  });
+
+  it('R68: the controller knows RECOVER? is pending from when it shows until ENTER has restored the checkpoint', async () => {
+    const r = menuRig();
+    const rec = fakeRecovery();
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    const real = rec.take.getMockImplementation()!;
+    rec.take.mockImplementation(async () => {
+      await gate; // the checkpoint's audio is still being read
+      return real();
+    });
+    await showBootPrompts(r.menu, r.c, rec);
+    expect(r.c.recoveryPending).toBe(true);
+    push(r, 'enter');
+    await flush();
+    expect(r.c.recoveryPending).toBe(true); // a checkpoint now could replace the one being read
+    release();
+    await flush();
+    expect(r.c.session.memory.name).toBe('UNSAVED');
+    expect(r.c.recoveryPending).toBe(false);
+  });
+
+  it('R68: EXIT clears the pending state; so does a restore that fails', async () => {
+    const r = menuRig();
+    const rec = fakeRecovery();
+    await showBootPrompts(r.menu, r.c, rec);
+    push(r, 'exit');
+    expect(r.c.recoveryPending).toBe(false);
+    expect(rec.discard).toHaveBeenCalledTimes(1);
+
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const broken = fakeRecovery();
+    broken.take.mockRejectedValue(new Error('unreadable'));
+    await showBootPrompts(r.menu, r.c, broken);
+    expect(r.c.recoveryPending).toBe(true);
+    push(r, 'enter');
+    await flush();
+    expect(r.c.recoveryPending).toBe(false);
+    expect(r.c.message).toBe('DATA READ ERR');
+    err.mockRestore();
   });
 });

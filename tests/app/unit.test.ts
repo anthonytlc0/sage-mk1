@@ -11,8 +11,11 @@ import { drawBootScreen } from '../../src/lcd/screens/boot';
 import { RECOVER_PROMPT } from '../../src/lcd/screens/recover';
 import { defaultMemory, defaultSystem } from '../../src/schema/params';
 import type { SystemSettings } from '../../src/schema/types';
-import type { ControlEvent, ButtonId } from '../../src/shared/ids';
-import type { EngineCommand } from '../../src/shared/protocol';
+import type { AbsoluteId, ControlEvent, ButtonId } from '../../src/shared/ids';
+import { faderGain } from '../../src/dsp/mixer';
+import { findParam } from '../../src/schema/params';
+import type { EngineCommand, TrackAudio } from '../../src/shared/protocol';
+import { CHECKPOINT_DEBOUNCE_MS } from '../../src/control/controller';
 
 // ---------------------------------------------------------------------------------------------------------- fakes
 
@@ -140,6 +143,14 @@ interface RigOptions {
   abortAfterMs?: number;
 }
 
+/** The panel's absolute controls as the view draws them (faders rest at the top, knobs at 12 o'clock). */
+class FakePanel {
+  readonly pos = new Map<AbsoluteId, number>();
+  get(id: AbsoluteId): number {
+    return this.pos.get(id) ?? (id.endsWith('.fader') ? 1 : 0.5);
+  }
+}
+
 async function rig(opts: RigOptions = {}) {
   const log: string[] = [];
   const stores = await openStores(`unit-test-${dbSeq++}`);
@@ -149,6 +160,7 @@ async function rig(opts: RigOptions = {}) {
   const doc = new FakeDoc();
   const wakeLock = new FakeWakeLock();
   const pods: FakePod[] = [];
+  const panel = new FakePanel();
   const started: (SystemSettings | undefined)[] = [];
   const startEngine = vi.fn(
     opts.startEngine ??
@@ -175,6 +187,7 @@ async function rig(opts: RigOptions = {}) {
     win,
     doc,
     wakeLock,
+    panelPosition: (id) => panel.get(id),
     bootMs: opts.bootMs ?? 20,
     ...(opts.storageTimeoutMs !== undefined ? { storageTimeoutMs: opts.storageTimeoutMs } : {}),
     ...(opts.abortAfterMs !== undefined ? { abortAfterMs: opts.abortAfterMs } : {}),
@@ -182,7 +195,7 @@ async function rig(opts: RigOptions = {}) {
   });
   units.push(unit);
   if (!opts.stores) await unit.ready(); // the stored system settings are read ahead of the POWER tap
-  return { unit, stores, engine, win, doc, wakeLock, pods, started, startEngine, requestPersistence, openStores: openFn, log };
+  return { unit, stores, engine, win, doc, wakeLock, pods, panel, started, startEngine, requestPersistence, openStores: openFn, log };
 }
 
 type Rig = Awaited<ReturnType<typeof rig>>;
@@ -599,6 +612,183 @@ describe('SageUnit: POWER off and page hide', () => {
     r.doc.set('hidden');
     r.doc.set('visible');
     expect(r.wakeLock.requests).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------- I3
+
+describe('SageUnit: the panel faders and what is heard agree (I3)', () => {
+  /** A drag on the panel: the view redraws the control, then the unit hears the `set` (pointer.ts emitSet). */
+  const move = (r: Rig, id: AbsoluteId, value: number): void => {
+    r.panel.pos.set(id, value);
+    r.unit.handle({ kind: 'set', id, value, t: performance.now() });
+  };
+  const faderSent = (r: Rig, track: number): number | undefined =>
+    r.engine.commands('fader').filter((c) => c.track === track).at(-1)?.gain;
+
+  it('a fader pulled down, then POWER off and on: the new power-on hears it where the panel shows it', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()) });
+    await powerOn(r);
+    move(r, 'trk2.fader', 0.2);
+    expect(faderSent(r, 1)).toBe(faderGain(0.2));
+    r.unit.tap();
+    await r.unit.settled();
+    r.engine.reset();
+    await powerOn(r); // a new controller: every fader at unity until told
+    expect(faderSent(r, 1)).toBe(faderGain(0.2));
+    expect(r.unit.controller!.faderGain(1)).toBe(faderGain(0.2)); // what LOOP MIX uses too
+    expect(faderSent(r, 0)).toBeUndefined(); // faders at rest need nothing
+  });
+
+  it('a fader moved before POWER is applied when the unit comes on', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()) });
+    move(r, 'trk3.fader', 0);
+    expect(r.engine.sent).toEqual([]); // off: nothing reaches the engine
+    await powerOn(r);
+    expect(faderSent(r, 2)).toBe(faderGain(0));
+    expect(r.unit.controller!.faderGain(2)).toBe(faderGain(0));
+  });
+
+  it('a fader moved while booting is applied too', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()), bootMs: 60 });
+    r.unit.tap();
+    await sleep(20);
+    move(r, 'trk5.fader', 0.5);
+    await r.unit.settled();
+    expect(r.unit.controller!.faderGain(4)).toBe(faderGain(0.5));
+  });
+
+  it('OUTPUT LEVEL turned while off sets MASTER OUT at power-on; untouched, the stored MASTER OUT stands', async () => {
+    const r = await rig({
+      seed: async (s) => {
+        const sys = calibrated();
+        sys.mixer.masterOut = 80; // set in the MIXER menu last time
+        await s.system.save(sys);
+      },
+    });
+    await powerOn(r);
+    expect(r.unit.controller!.session.system.mixer.masterOut).toBe(80); // the knob at rest does not override it
+    r.unit.tap();
+    await r.unit.settled();
+    move(r, 'outputLevel', 0.25);
+    await powerOn(r);
+    const def = findParam('mixer.masterOut')!.def;
+    expect(r.unit.controller!.session.system.mixer.masterOut).toBeCloseTo(def.min! + 0.25 * (def.max! - def.min!), 6);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------- R67
+
+describe('SageUnit: the engine stopped (ruling R67)', () => {
+  it('a fault shows ENGINE STOPPED (the LCD and the card, with the POWER hint), ends the take and disables the pod', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()) });
+    await powerOn(r);
+    const halt = vi.spyOn(r.unit.recorder!, 'halt');
+    let changes = 0;
+    r.unit.onChange(() => changes++);
+    expect(r.unit.engineStopped).toBe(false);
+    r.engine.emit({ t: 'fault', message: 'mixer broke' });
+    expect(r.unit.engineStopped).toBe(true);
+    expect(r.unit.resumePrompt).toBe('stopped');
+    expect(r.unit.controller!.message).toBe('ENGINE STOPPED');
+    expect(halt).toHaveBeenCalled(); // no statuses will come: stop() would wait for them
+    expect(r.pods[0]!.enabled.at(-1)).toBe(false);
+    expect(changes).toBeGreaterThan(0);
+    r.engine.setNeedsResume(true); // lost audio as well: the stopped engine is what the card says
+    expect(r.unit.resumePrompt).toBe('stopped');
+  });
+
+  it('POWER off after a fault marks no clean shutdown (nor does a later pagehide): the next power-on offers RECOVER?', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()) });
+    await powerOn(r);
+    r.unit.controller!.setParam('track.*.pan', 25, 0); // unsaved work
+    await r.unit.controller!.checkpointNow(); // as the 2 s timer or a hide would have
+    r.engine.emit({ t: 'fault', message: 'mixer broke' });
+    const clean = vi.spyOn(r.stores.recovery, 'markCleanShutdown');
+    r.unit.tap(); // the hint: switch POWER off...
+    await r.unit.settled();
+    expect(r.unit.state).toBe('off');
+    r.win.dispatchEvent(new Event('pagehide'));
+    await sleep(10);
+    expect(clean).not.toHaveBeenCalled();
+    expect(await r.stores.recovery.needsRecovery()).toBe(true);
+    await powerOn(r); // ...and on again
+    expect(r.unit.engineStopped).toBe(false);
+    expect(r.unit.resumePrompt).toBe('none');
+    expect(r.unit.menu!.top.title).toBe('RECOVER');
+  });
+
+  it('a fault while booting still shows ENGINE STOPPED once on', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()), bootMs: 60 });
+    r.unit.tap();
+    await sleep(30);
+    r.engine.emit({ t: 'fault', message: 'early' });
+    await r.unit.settled();
+    expect(r.unit.state).toBe('on');
+    expect(r.unit.engineStopped).toBe(true);
+    expect(r.unit.controller!.message).toBe('ENGINE STOPPED');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------- R68
+
+describe('SageUnit: an unanswered RECOVER? (ruling R68)', () => {
+  const audio = (v: number): TrackAudio => ({ L: new Float32Array(64).fill(v), R: new Float32Array(64).fill(-v), sampleRate: 48000, recordedTempo: 120, measures: 1 });
+  /** The last session crashed with unsaved work: TRACK 1 panned to R25, a loop of 0.25s. */
+  const crashed = async (s: ShellStores): Promise<void> => {
+    await s.system.save(calibrated());
+    const m = defaultMemory();
+    m.track[0]!.pan = 25;
+    await s.recovery.markRunning();
+    await s.recovery.checkpoint(1, m, [audio(0.25), null, null, null, null]);
+  };
+  const loadedTrack1 = (r: Rig): TrackAudio | null => r.engine.commands('loadTrack').filter((c) => c.track === 0).at(-1)!.audio;
+
+  it('looping with the prompt up writes no checkpoint; ENTER then restores the crashed session', async () => {
+    const r = await rig({ seed: crashed });
+    await powerOn(r);
+    expect(r.unit.menu!.top.title).toBe('RECOVER');
+    // The performer starts looping without reading the LCD: the track buttons do not go through it.
+    r.engine.exportReply = [audio(0.75), null, null, null, null];
+    press(r, 'trk1.rec');
+    expect(r.engine.commands('recPlay')).toHaveLength(1);
+    r.engine.emit({ t: 'status', status: makeStatus({ audioDirty: true }) }); // the punch-out
+    await sleep(CHECKPOINT_DEBOUNCE_MS + 300);
+    expect((await r.stores.recovery.take())!.tracks[0]!.L[0]).toBe(0.25); // still the crashed session's
+    press(r, 'enter');
+    for (let i = 0; i < 50 && r.unit.controller!.message !== null; i++) await sleep(10);
+    expect(r.unit.controller!.session.memory.track[0]!.pan).toBe(25);
+    expect(loadedTrack1(r)!.L[0]).toBe(0.25);
+    expect(r.unit.controller!.recoveryPending).toBe(false);
+  });
+
+  it('POWER off with the prompt unanswered keeps the checkpoint: the next power-on offers RECOVER? again', async () => {
+    const r = await rig({ seed: crashed });
+    await powerOn(r);
+    expect(r.unit.menu!.top.title).toBe('RECOVER');
+    const clean = vi.spyOn(r.stores.recovery, 'markCleanShutdown');
+    r.unit.tap();
+    await r.unit.settled();
+    expect(r.unit.state).toBe('off');
+    r.win.dispatchEvent(new Event('pagehide')); // after a POWER off a pagehide normally marks clean again
+    await sleep(10);
+    expect(clean).not.toHaveBeenCalled();
+    expect(await r.stores.recovery.needsRecovery()).toBe(true);
+    await powerOn(r);
+    expect(r.unit.menu!.top.title).toBe('RECOVER');
+    press(r, 'enter');
+    for (let i = 0; i < 50 && r.unit.controller!.message !== null; i++) await sleep(10);
+    expect(loadedTrack1(r)!.L[0]).toBe(0.25);
+  });
+
+  it('once answered (EXIT), POWER off is a clean shutdown again', async () => {
+    const r = await rig({ seed: crashed });
+    await powerOn(r);
+    press(r, 'exit');
+    r.unit.tap();
+    await r.unit.settled();
+    await sleep(10);
+    expect(await r.stores.recovery.needsRecovery()).toBe(false);
   });
 });
 

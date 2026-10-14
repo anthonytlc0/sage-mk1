@@ -337,8 +337,9 @@ describe('EngineHost interrupts (ruling R37)', () => {
     const proc = (globalThis as unknown as { process: { on(e: string, f: (r: unknown) => void): void; off(e: string, f: (r: unknown) => void): void } }).process;
     proc.on('unhandledRejection', onUnhandled);
     try {
-      rig.host.on((e) => {
-        if (e.t === 'message') throw new Error('a handler failed');
+      // (Event handlers are isolated from each other since M8; a needsResume handler still runs inside the resume.)
+      rig.host.onNeedsResume(() => {
+        throw new Error('a handler failed');
       });
       rig.ctx.setState('interrupted');
       rig.ctx.resumeFails = true;

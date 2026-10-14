@@ -5,6 +5,9 @@
  *   ENTER  restores the checkpoint as the current memory, unsaved (EXECUTING... while its audio loads); WRITE keeps it.
  *   EXIT   discards the checkpoint.
  *
+ * While it is unanswered the controller knows (`recoveryPending`, ruling R68): the track buttons bypass the LCD, so a
+ * performer may loop before reading it, and nothing may replace or drop the crashed session's checkpoint meanwhile.
+ *
  * `showBootPrompts` is what the app shell calls once after power-on: RECOVER? when needed, then the first-run
  * CALIBRATE? offer under it.
  */
@@ -31,8 +34,9 @@ export function recoverScreen(recovery: RecoverySource): Screen {
       void restore(recovery, ctx);
       return 'pop';
     },
-    exit: () => {
+    exit: (ctx) => {
       recovery.discard().catch((e: unknown) => console.error('discarding the recovery checkpoint failed', e));
+      ctx.setRecoveryPending(false); // after the discard is queued: a later checkpoint's transaction runs after it
       return 'pop';
     },
   });
@@ -47,6 +51,8 @@ async function restore(recovery: RecoverySource, ctx: Controller): Promise<void>
     console.error('restoring the recovery checkpoint failed', e);
     ctx.clearMessage();
     ctx.showMessage('DATA READ ERR');
+  } finally {
+    ctx.setRecoveryPending(false); // only now: a checkpoint written while it was read could replace it
   }
 }
 
@@ -67,5 +73,8 @@ export async function showBootPrompts(
   } catch (e) {
     console.error('reading the recovery state failed', e);
   }
-  if (needed) menu.push(recoverScreen(recovery));
+  if (needed) {
+    ctx.setRecoveryPending(true);
+    menu.push(recoverScreen(recovery));
+  }
 }

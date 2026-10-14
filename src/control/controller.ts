@@ -192,6 +192,8 @@ export class Controller {
   private checkpointedSeq = -1;
   /** The checkpoint being written: a second request joins it rather than exporting all the audio again. */
   private checkpointing: Promise<void> | null = null;
+  /** RECOVER? is up and unanswered: the crash checkpoint in storage must survive until it is (ruling R68). */
+  private _recoveryPending = false;
 
   constructor(
     private readonly engine: EngineLike,
@@ -256,6 +258,39 @@ export class Controller {
     return this.buttons.isHeld(id);
   }
 
+  /**
+   * RECOVER? is showing and has not been answered (ruling R68). Meanwhile the checkpoint in storage is the crashed
+   * session's, so nothing may replace or drop it: no checkpoint is written, a memory change or WRITE does not discard
+   * it, and POWER off marks no clean shutdown (the next power-on offers RECOVER? again). The prompt sets it when it
+   * shows and clears it once answered (ENTER: after the restore; EXIT: after the discard).
+   */
+  get recoveryPending(): boolean {
+    return this._recoveryPending;
+  }
+
+  setRecoveryPending(on: boolean): void {
+    if (on === this._recoveryPending) return;
+    this._recoveryPending = on;
+    if (on) {
+      clearTimeout(this.checkpointTimer);
+      this.checkpointTimer = undefined;
+    } else if (this.session.dirty) {
+      this.scheduleCheckpoint(); // work made while it was pending has no checkpoint yet
+    }
+  }
+
+  /**
+   * A track is recording or overdubbing (by the latest status), so the memory tempo cannot change: "You cannot change
+   * the tempo of the memory while recording or overdubbing" (Owner's Manual p. 22, Troubleshooting; ledger 273). The
+   * manual lists no message for it, so a change is just ignored (`setParam('tempo')`).
+   */
+  get isTempoLocked(): boolean {
+    const s = this._status;
+    if (s === null) return false;
+    for (const t of s.tracks) if (t.state === 'recording' || t.state === 'overdubbing') return true;
+    return false;
+  }
+
   /** Track `track`'s fader as a linear gain (what the engine was last sent). */
   faderGain(track: number): number {
     return faderGain(this.buttons.faderPosition(track));
@@ -294,9 +329,12 @@ export class Controller {
    * transport and `memory.tempo` never disagree. A system change is saved to the system store shortly after; a system
    * parameter whose PREFERENCE is MEMORY goes into the memory instead (`memory.prefs`, unsaved until WRITE). A MIC
    * PROCESS change also reopens the mic (the `restartMic` option). A value that does not change sends nothing. Throws
-   * for an unknown id or a bad value or index.
+   * for an unknown id or a bad value or index. The tempo is not changed while `isTempoLocked` (every route to it, TAP
+   * TEMPO, TEMPO REVERT, TEMPO UP / DOWN and the TAP TEMPO screen's knob, comes through here), so memory.tempo and the
+   * transport keep agreeing.
    */
   setParam(id: string, value: unknown, track?: number | string): void {
+    if (id === 'tempo' && this.isTempoLocked) return;
     const { scope, changed } = this.session.set(id, value, track);
     if (!changed) return;
     this.workSeq++;
@@ -425,6 +463,7 @@ export class Controller {
     this.workSeq++;
     this.session.paramsDirty = true;
     if (rec.tracks.some((t) => t !== null)) this.session.audioDirty = true;
+    this.checkpointedSeq = this.workSeq; // the checkpoint in storage holds exactly this work: no need to write it back
   }
 
   /**
@@ -538,7 +577,7 @@ export class Controller {
   async checkpointNow(): Promise<void> {
     clearTimeout(this.checkpointTimer);
     this.checkpointTimer = undefined;
-    if (this.poweredOff || !this.session.dirty) return;
+    if (this.poweredOff || this._recoveryPending || !this.session.dirty) return;
     const running = this.checkpointing;
     if (running) {
       await running;
@@ -580,15 +619,20 @@ export class Controller {
 
   /**
    * The deliberate POWER off (wired by the app shell): saves pending system settings, then marks a clean shutdown,
-   * which also discards the recovery checkpoint (ruling R16). Never called for a mere page hide.
+   * which also discards the recovery checkpoint (ruling R16). Never called for a mere page hide. The checkpoint is kept
+   * instead (no clean shutdown, so the next power-on offers RECOVER?) while RECOVER? is unanswered (ruling R68) or with
+   * `keepCheckpoint` (the engine stopped, ruling R67). Resolves true when a clean shutdown was marked.
    */
-  async powerOff(): Promise<void> {
+  async powerOff(opts: { keepCheckpoint?: boolean } = {}): Promise<boolean> {
     this.poweredOff = true;
     this.checkpointGen++; // a checkpoint waiting for the engine gives up
     clearTimeout(this.checkpointTimer);
     this.checkpointTimer = undefined;
+    const keep = opts.keepCheckpoint === true || this._recoveryPending;
     await this.flushSystemSave();
+    if (keep) return false;
     await this.stores.recovery.markCleanShutdown();
+    return true;
   }
 
   /**
@@ -634,7 +678,11 @@ export class Controller {
     this.loadSession(slot, rec?.settings ?? defaultMemory(), rec?.tracks ?? EMPTY_TRACKS(), discardCheckpoint);
   }
 
-  /** Loads a memory into the session and the engine. `discardCheckpoint`: the unsaved work it held is now gone. */
+  /**
+   * Loads a memory into the session and the engine. `discardCheckpoint`: the unsaved work it held is now gone. The
+   * tracks' arrays are handed to the engine (EngineHost transfers them to the worklet, ledger 263): nothing here may
+   * read their samples afterwards.
+   */
   private loadSession(slot: number, memory: MemorySettings, tracks: (TrackAudio | null)[], discardCheckpoint: boolean): void {
     this.session.load(slot, memory);
     this.workSeq++;
@@ -644,12 +692,16 @@ export class Controller {
     for (const track of TRACKS) this.engine.send({ t: 'loadTrack', track, audio: tracks[track] ?? null });
   }
 
-  /** The checkpoint holds unsaved work; once the memory is saved or reloaded it is stale. */
+  /**
+   * The checkpoint holds unsaved work; once the memory is saved or reloaded it is stale. While RECOVER? is unanswered
+   * the checkpoint in storage is the crashed session's, not this one's, so it stays (ruling R68).
+   */
   private dropCheckpoint(): void {
     this.checkpointGen++;
     this.checkpointedSeq = -1;
     clearTimeout(this.checkpointTimer);
     this.checkpointTimer = undefined;
+    if (this._recoveryPending) return;
     this.stores.recovery.discard().catch((e: unknown) => console.error('recovery discard failed', e));
   }
 
@@ -704,7 +756,7 @@ export class Controller {
   }
 
   private scheduleCheckpoint(): void {
-    if (this.poweredOff) return;
+    if (this.poweredOff || this._recoveryPending) return;
     clearTimeout(this.checkpointTimer);
     this.checkpointTimer = setTimeout(() => {
       this.checkpointTimer = undefined;

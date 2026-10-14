@@ -17,8 +17,12 @@
  *   opened afresh at the next power-on.
  * POWER off (a tap while on): the running take is completed (`recorder.stop()`) before anything is torn down, the
  *   system settings are saved and a clean shutdown is marked (`Controller.powerOff`, which also drops the recovery
- *   checkpoint, ruling R16), then the pod, controller and menu go and the engine stops. The system settings as they
- *   are then are kept for the next power-on in this page (MIC PROCESS for the mic, CONTRAST for the boot screen).
+ *   checkpoint, ruling R16), then the pod, controller and menu go and the engine stops. While RECOVER? is unanswered
+ *   (ruling R68) no clean shutdown is marked, then or at a later pagehide, so the next power-on offers it again. The
+ *   system settings as they are then are kept for the next power-on in this page (MIC PROCESS for the mic, CONTRAST
+ *   for the boot screen).
+ * Engine stopped (a `fault` event, ruling R67): the take is halted, the LCD and the shell show ENGINE STOPPED, and
+ *   POWER switches off without marking a clean shutdown, so switching on again offers RECOVER?.
  * Audio lost (the engine's `needsResume`, ruling R58): the running take is halted at once, and the shell shows TAP
  *   POWER TO RESUME. A POWER tap retries (`resume({ retryMic: true })`); once a retry has failed, or has run for
  *   RESUME_OFF_AFTER_MS without an answer (getUserMedia has no time limit), the prompt says the next POWER tap switches
@@ -26,6 +30,8 @@
  * Page hide: only after a POWER off is it a clean shutdown (`markCleanShutdown`). While on, the running flag stays set,
  *   so a crash or a closed app offers RECOVER next time; the controller checkpoints unsaved work on `pagehide` itself,
  *   and the unit has it do the same when the page goes hidden (iPadOS may end a hidden app without a pagehide).
+ * Panel controls: the panel is mounted once per page, the controller is new at every power-on. When the unit comes on
+ *   it takes the faders where the panel shows them (`panelPosition`), and OUTPUT LEVEL if it was turned while off (I3).
  * Wake lock: asked for at power-on (inside the tap), again when the page is visible again and on panel presses while
  *   none is held, and let go at power off.
  * Recorder pod: REC and LOOP MIX are enabled only while the unit is on with its audio running.
@@ -33,6 +39,7 @@
 
 import { Controller } from '../control/controller';
 import type { EngineLike, Stores } from '../control/controller';
+import { faderGain } from '../dsp/mixer';
 import { Framebuffer } from '../lcd/framebuffer';
 import { MenuSystem } from '../lcd/menu';
 import { BOOT_MS, drawBootScreen } from '../lcd/screens/boot';
@@ -40,7 +47,8 @@ import { showBootPrompts } from '../lcd/screens/recover';
 import { Recorder } from '../recorder/recorder';
 import type { SystemSettings } from '../schema/types';
 import { LCD_H, LCD_W } from '../shared/constants';
-import type { ControlEvent } from '../shared/ids';
+import { TRACKS } from '../shared/ids';
+import type { AbsoluteId, ControlEvent } from '../shared/ids';
 import type { PanelState, RingState } from '../shared/panel';
 import { openDb } from '../storage/db';
 import { MemoryStore } from '../storage/memoryStore';
@@ -54,9 +62,13 @@ export type PowerState = 'off' | 'booting' | 'on' | 'stopping';
 
 /**
  * What the TAP POWER TO RESUME prompt shows: nothing; a resume is wanted; one is under way; one has run for
- * RESUME_OFF_AFTER_MS without an answer, or one failed: either way the next POWER tap switches off.
+ * RESUME_OFF_AFTER_MS without an answer, or one failed: either way the next POWER tap switches off. 'stopped': the
+ * engine stopped working (ruling R67): ENGINE STOPPED, switch POWER off and on.
  */
-export type ResumePrompt = 'none' | 'resume' | 'resuming' | 'slow' | 'off';
+export type ResumePrompt = 'none' | 'resume' | 'resuming' | 'slow' | 'off' | 'stopped';
+
+/** The LCD popup while the engine is stopped (ruling R67). */
+export const MSG_ENGINE_STOPPED = 'ENGINE STOPPED';
 
 /** Each wait on storage during power-on gives up after this long. */
 // INFERRED: IndexedDB answers in milliseconds; a wait this long means it is blocked or broken.
@@ -112,6 +124,12 @@ export interface UnitDeps {
   doc?: VisibilitySource | null;
   /** `navigator.wakeLock`, when there is one. */
   wakeLock?: WakeLockApi;
+  /**
+   * Where the panel shows an absolute control (0..1): the app passes `view.getPhysical`. The panel is mounted once per
+   * page but each power-on makes a new controller with every fader at unity, so the faders are read from here when
+   * the unit comes on (I3).
+   */
+  panelPosition?: (id: AbsoluteId) => number;
   /** The least time the boot screen shows (default BOOT_MS). */
   bootMs?: number;
   /** Default STORAGE_TIMEOUT_MS. */
@@ -148,6 +166,7 @@ interface Live {
   readonly recorder: Recorder;
   pod: PodHandle | null;
   offResume: () => void;
+  offFault: () => void;
 }
 
 /** A power-on under way. */
@@ -199,6 +218,15 @@ export class SageUnit {
   private system: SystemSettings | undefined;
   /** The last power-off came from the POWER control (and the unit has not been switched on since). */
   private switchedOff = false;
+  /**
+   * That power-off kept the recovery checkpoint instead of marking a clean shutdown (RECOVER? unanswered, ruling R68;
+   * the engine stopped, R67): a later pagehide must not mark one either.
+   */
+  private keptCheckpoint = false;
+  /** The engine of this power-on reported a `fault` (ruling R67). Cleared at the next power-on. */
+  private faulted = false;
+  /** Faders and OUTPUT LEVEL moved while the unit was not on (the panel redraws them, the controller never heard). */
+  private readonly offMoves = new Map<AbsoluteId, number>();
   private transition: Promise<void> = Promise.resolve();
   private readonly preload: Promise<void>;
   private stores: StoresOpen;
@@ -243,6 +271,14 @@ export class SageUnit {
     return this._error;
   }
 
+  /**
+   * The engine stopped working while on (a `fault`, ruling R67): the shell shows ENGINE STOPPED and the LCD says so.
+   * POWER switches off without marking a clean shutdown, so the next power-on offers RECOVER?.
+   */
+  get engineStopped(): boolean {
+    return this._state === 'on' && this.live !== null && this.faulted;
+  }
+
   /** Audio was lost while on: the shell shows TAP POWER TO RESUME. */
   get needsResume(): boolean {
     return this._state === 'on' && this.live !== null && this.live.engine.needsResume;
@@ -250,6 +286,7 @@ export class SageUnit {
 
   /** What the TAP POWER TO RESUME prompt shows. */
   get resumePrompt(): ResumePrompt {
+    if (this.engineStopped) return 'stopped';
     if (!this.needsResume) return 'none';
     switch (this.resume) {
       case 'idle': return 'resume';
@@ -310,6 +347,10 @@ export class SageUnit {
     }
     const live = this.live;
     if (this._state !== 'on' || live === null) return;
+    if (this.faulted) {
+      this.transition = this.powerOff(live); // ENGINE STOPPED: off (the checkpoint is kept), then on again
+      return;
+    }
     if (live.engine.needsResume) {
       if (this.resume === 'failed' || this.resume === 'slow') this.transition = this.powerOff(live);
       else this.retryResume();
@@ -324,7 +365,7 @@ export class SageUnit {
    */
   retryResume(): void {
     const live = this.live;
-    if (this._state !== 'on' || live === null || !live.engine.needsResume) return;
+    if (this._state !== 'on' || live === null || !live.engine.needsResume || this.faulted) return;
     if (this.resume === 'resuming' || this.resume === 'slow') return;
     this.resume = 'resuming';
     this.resumeTimer = setTimeout(() => {
@@ -349,9 +390,15 @@ export class SageUnit {
       });
   }
 
-  /** Panel input: to the controller while on, nowhere otherwise. */
+  /**
+   * Panel input: to the controller while on, nowhere otherwise. A fader or OUTPUT LEVEL moved meanwhile is remembered
+   * and applied when the unit comes on (I3), as a physical control's position is the level at power-on.
+   */
   handle(e: ControlEvent): void {
-    if (this._state !== 'on' || this.live === null) return;
+    if (this._state !== 'on' || this.live === null) {
+      if (e.kind === 'set' && (e.id === 'outputLevel' || e.id.endsWith('.fader'))) this.offMoves.set(e.id, e.value);
+      return;
+    }
     this.live.controller.handle(e);
     if (e.kind === 'press') this.wake.ensure();
   }
@@ -412,6 +459,8 @@ export class SageUnit {
   private powerOn(): void {
     this._error = null;
     this.switchedOff = false;
+    this.keptCheckpoint = false;
+    this.faulted = false;
     this.resume = 'idle';
     // A database that failed to open, or that the last power-on gave up on, is opened afresh (there is no reload in a
     // Home Screen app).
@@ -504,9 +553,13 @@ export class SageUnit {
       restartMic: () => engine.restartMic(),
     });
     const recorder = new Recorder(engine, stores.takes, engine.ctx.sampleRate);
-    const live: Live = { engine, stores, controller, menu, recorder, pod: null, offResume: () => undefined };
+    const none = (): void => undefined;
+    const live: Live = { engine, stores, controller, menu, recorder, pod: null, offResume: none, offFault: none };
     this.live = live;
     live.offResume = engine.onNeedsResume((lost) => this.onNeedsResume(live, lost));
+    live.offFault = engine.on((e) => {
+      if (e.t === 'fault') this.onFault(live);
+    });
 
     let bootMessage: string | null = null;
     try {
@@ -542,10 +595,31 @@ export class SageUnit {
     }
     if (this.live !== live) return;
     this.boot = null;
+    this.syncPanel(controller);
     this.setState('on');
     // A message raised while the boot screen was up has mostly expired under it: NO INPUT is shown again, in full.
-    if (bootMessage !== null) controller.showMessage(bootMessage);
+    if (this.faulted) controller.showMessage(MSG_ENGINE_STOPPED, Infinity);
+    else if (bootMessage !== null) controller.showMessage(bootMessage);
     else if (!engine.micAvailable) controller.showMessage('NO INPUT');
+  }
+
+  /**
+   * The unit comes on: the controller (new at every power-on, every fader at unity) and so the engine take the panel
+   * as it is (I3). Each track fader where the panel shows it; OUTPUT LEVEL only if it was turned while the unit was not
+   * on, because MASTER OUT (or PHONES OUT) is a stored system setting the MIXER menu can change without the knob.
+   */
+  private syncPanel(controller: Controller): void {
+    const t = performance.now();
+    for (const track of TRACKS) {
+      const id = `trk${track + 1}.fader` as AbsoluteId;
+      const pos = this.deps.panelPosition?.(id) ?? this.offMoves.get(id);
+      if (pos === undefined || !Number.isFinite(pos)) continue;
+      if (faderGain(Math.min(1, Math.max(0, pos))) === controller.faderGain(track)) continue; // at rest: nothing to say
+      controller.handle({ kind: 'set', id, value: pos, t });
+    }
+    const out = this.offMoves.get('outputLevel');
+    if (out !== undefined) controller.handle({ kind: 'set', id: 'outputLevel', value: out, t });
+    this.offMoves.clear();
   }
 
   /** Gives up a power-on: everything made so far goes and the engine stops. STORAGE ERROR unless a tap asked for it. */
@@ -572,10 +646,15 @@ export class SageUnit {
 
   private async powerOff(live: Live): Promise<void> {
     this.switchedOff = true;
+    // RECOVER? unanswered (R68) or the engine stopped (R67): the checkpoint stays for the next power-on's RECOVER?.
+    const keep = live.controller.recoveryPending || this.faulted;
+    this.keptCheckpoint = keep;
     this.setState('stopping');
     this.wake.release();
-    // Marks POWER off at once (no checkpoint after this), then saves and marks the clean shutdown.
-    const saved = live.controller.powerOff().catch((e: unknown) => console.error('saving at power off failed', e));
+    // Marks POWER off at once (no checkpoint after this), then saves and marks the clean shutdown (unless kept).
+    const saved = live.controller
+      .powerOff({ keepCheckpoint: keep })
+      .catch((e: unknown) => console.error('saving at power off failed', e));
     if (live.recorder.state !== 'idle') {
       await live.recorder.stop().catch((e: unknown) => console.error('ending the take at power off failed', e));
     }
@@ -596,6 +675,7 @@ export class SageUnit {
 
   private teardown(live: Live): void {
     live.offResume();
+    live.offFault();
     live.pod?.dispose();
     live.pod = null;
     live.controller.dispose();
@@ -613,15 +693,29 @@ export class SageUnit {
     this.emit();
   }
 
+  /**
+   * The engine stopped (ruling R67): the take ends now (no status will come for `stop()` to wait on), ENGINE STOPPED
+   * goes up on the LCD and the shell's card, and the work is checkpointed if the engine still answers (the checkpoint
+   * already in storage stays either way: POWER off marks no clean shutdown).
+   */
+  private onFault(live: Live): void {
+    if (this.live !== live || this.faulted) return;
+    this.faulted = true; // (the processor and the host have logged why)
+    live.recorder.halt().catch((e: unknown) => console.error('halting the take failed', e));
+    live.controller.showMessage(MSG_ENGINE_STOPPED, Infinity);
+    void live.controller.checkpointNow();
+    this.emit();
+  }
+
   /** REC and LOOP MIX only while the unit is on with its audio running. */
   private syncPod(): void {
     const live = this.live;
-    live?.pod?.setEnabled(this._state === 'on' && !live.engine.needsResume);
+    live?.pod?.setEnabled(this._state === 'on' && !live.engine.needsResume && !this.faulted);
   }
 
   private readonly onPageHide = (): void => {
     // Only a POWER off is a clean shutdown. Otherwise the running flag stays, so a crash offers RECOVER next time.
-    if (!this.switchedOff) return;
+    if (!this.switchedOff || this.keptCheckpoint) return;
     this.stores.p
       .then((s) => s.recovery.markCleanShutdown())
       .catch((e: unknown) => console.error('marking the clean shutdown failed', e));

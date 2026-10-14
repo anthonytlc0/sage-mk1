@@ -4,7 +4,7 @@ import { FONT_LARGE, FONT_MEDIUM } from '../../src/lcd/fonts';
 import type { Framebuffer } from '../../src/lcd/framebuffer';
 import { TEMPO_SCREEN_MS } from '../../src/lcd/screens/tap';
 import { expectScreen } from './fixtures';
-import { frame, push, rig, turn, turnEv } from './rig';
+import { frame, push, rig, status, turn, turnEv } from './rig';
 import { blank, footer, statusRow } from './spec';
 import type { Rig } from './rig';
 
@@ -69,6 +69,17 @@ describe('TAP TEMPO screen', () => {
     expectScreen(frame(r.c), tempoScreen(119.8, 'tenths').toAscii());
     r.c.handle({ kind: 'release', id: 'knob4', t: 300 });
     expectScreen(frame(r.c), tempoScreen(119.8, 'units').toAscii());
+  });
+
+  it('M3: while a track records or overdubs, knob [4] leaves the tempo (and the screen) as it is', () => {
+    const r = rig();
+    tap(r);
+    status(r, { tempo: 120 }, [{ state: 'overdubbing' }]);
+    r.engine.reset();
+    turn(r, 'knob4', 3);
+    expect(r.c.session.memory.tempo).toBe(120);
+    expect(r.engine.commands('tempo')).toEqual([]);
+    expectScreen(frame(r.c), tempoScreen(120, 'units').toAscii());
   });
 
   it('keeps to 40.0-300.0', () => {

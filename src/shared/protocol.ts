@@ -40,6 +40,10 @@ export type EngineEvent =
   | { t: 'recorderBlock'; L: Float32Array; R: Float32Array }
   | { t: 'calibration'; reqId: number; capture: Float32Array; clickFrames: number[] }
   | { t: 'message'; text: EngineMessage }
+  // The engine stopped working (ruling R67): a render block failed outside the engine's inner guards (posted once by
+  // SageProcessor), or the browser reported the processor dead (`onprocessorerror`, raised by EngineHost). The app shows
+  // ENGINE STOPPED and keeps the recovery checkpoint at the next POWER off.
+  | { t: 'fault'; message: string }
   // Internal between SageProcessor and EngineHost (ruling R47): `exportTracks` is streamed so the audio thread never
   // allocates or copies a whole export in one block. A header with every track's length (the host allocates the full
   // arrays on the main thread), parts of at most the per-block budget (buffers transferred), then the end, or an abort

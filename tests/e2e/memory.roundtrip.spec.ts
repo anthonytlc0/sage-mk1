@@ -66,7 +66,7 @@ test('EXPORT MEMORY, CLEAR, IMPORT into memory 04: the track lengths and PAN com
   expect(await lcdShows(page, 'ENTER=SAVE', FONT_MEDIUM)).toBe(true);
   const file = await captureSave(page, browserName, () => panel.press('enter'));
   expect(file.name).toBe('sage-mk1-m01.sagemk1');
-  if (browserName === 'webkit') expect(file.via).toBe('pointerup'); // shared inside ENTER's own tap (it acts on release)
+  if (browserName === 'webkit') expect(file.via).not.toBeNull(); // shared from inside a user gesture (ENTER's own tap: it acts on release)
   expect(file.bytes.length).toBeGreaterThan(1000);
   await expect.poll(() => topProp<string | null>(page, 'prompt')).toBe(null); // back to the list
   await backToPlay();

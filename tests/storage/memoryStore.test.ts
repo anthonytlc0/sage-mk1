@@ -233,22 +233,32 @@ describe('MemoryStore', () => {
     });
 
     it('is thrown when the browser aborts the transaction with QuotaExceededError', async () => {
-      // Fail the stored operation the way a full disk does: the request errors, the transaction aborts.
-      const realPut = IDBObjectStore.prototype.put;
-      vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (this: IDBObjectStore, ...args) {
-        const raw = (this as unknown as { _rawObjectStore: { storeRecord: () => never } })._rawObjectStore;
-        const original = raw.storeRecord;
-        raw.storeRecord = () => {
-          throw new DOMException('x', 'QuotaExceededError');
-        };
-        try {
-          return realPut.apply(this, args as Parameters<typeof realPut>);
-        } finally {
-          raw.storeRecord = original;
-        }
+      // The store is handed a database whose readwrite transactions the "browser" aborts with QuotaExceededError once
+      // their requests are issued, as a full disk does at commit. Public IndexedDB API only (the FLAKE fix, ledger 241):
+      // a real transaction, really aborted, so the rollback is real too.
+      const quota = new DOMException('x', 'QuotaExceededError');
+      const full = new Proxy(db, {
+        get(target, prop) {
+          if (prop !== 'transaction') {
+            const v: unknown = Reflect.get(target, prop);
+            return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+          }
+          return (stores: string | string[], mode?: IDBTransactionMode) => {
+            const tx = target.transaction(stores, mode);
+            if (mode !== 'readwrite') return tx;
+            queueMicrotask(() => tx.abort());
+            return new Proxy(tx, {
+              get(t, p) {
+                if (p === 'error') return quota; // what the browser reports for a quota abort
+                const v: unknown = Reflect.get(t, p);
+                return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(t) : v;
+              },
+              set: (t, p, v) => Reflect.set(t, p, v),
+            });
+          };
+        },
       });
-      await expect(store.save(3, settings('NEW'), [track(1)])).rejects.toBeInstanceOf(QuotaError);
-      vi.restoreAllMocks();
+      await expect(new MemoryStore(full).save(3, settings('NEW'), [track(1)])).rejects.toBeInstanceOf(QuotaError);
       expect(await store.isEmpty(3)).toBe(true);
       expect(await audioKeys()).toEqual([]);
     });

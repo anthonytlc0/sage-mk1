@@ -14,6 +14,8 @@
  *    or one over the cap) is prepared by the first tap on its SAVE or play and used by the next. Such a Blob is held on
  *    the user's request even when it is over the cap, but only one over-cap Blob at a time, and it is let go after the
  *    save, after the playback, or after a minute unused.
+ *  - A SAVE or SAVE MIX tap ignores further taps until the share sheet answers, or for SAVE_CEILING_MS at most:
+ *    `navigator.share` can stay pending on the iPad (ledger 348).
  *  - The buttons are plain `div`s with pointer handlers, never focusable: Space, Enter and Tab belong to the panel's
  *    keyboard map, and a focused `<button>` would also click on Space.
  *
@@ -40,6 +42,8 @@ export interface RecorderPodOptions {
   cacheBytes?: number;
   /** Saves a file (the share sheet or a download). Default `saveFile`; a test passes a stand-in. */
   save?: (blob: Blob, filename: string) => Promise<SaveResult>;
+  /** How long a SAVE or SAVE MIX may stay unanswered before its button works again. Default SAVE_CEILING_MS. */
+  saveCeilingMs?: number;
 }
 
 export interface RecorderPod {
@@ -62,6 +66,13 @@ const ARM_MS = 3000;
 const TICK_MS = 100;
 /** A Blob over the cache cap, held for a tap that asked for it, is let go after this long unused. */
 const OVERCAP_HOLD_MS = 60_000;
+/**
+ * A SAVE or SAVE MIX in flight blocks further taps on it until `saveFile` answers. `navigator.share` can stay pending
+ * on the iPad (a share sheet dismissed oddly, an extension that never returns), which would lock that button for good,
+ * so after this long the tap is taken as unanswered and the button works again (ledger 348). INFERRED: long enough
+ * for a slow AirDrop or Files save to be answered first.
+ */
+export const SAVE_CEILING_MS = 45_000;
 /** U+FE0E asks for the text form: iOS draws a bare ▶ as an emoji. */
 const PLAY = '▶︎';
 const STOP = '■';
@@ -90,6 +101,26 @@ function button(doc: Document, cls: string, act: string, label: string, text: st
   b.setAttribute('aria-label', label);
   b.dataset.act = act;
   return b;
+}
+
+/**
+ * `result`, or 'timeout' once `ms` have passed without an answer (a later answer is then ignored). The timer is
+ * cleared as soon as the answer comes.
+ */
+export function withCeiling(result: Promise<SaveResult>, ms: number): Promise<SaveResult | 'timeout'> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve('timeout'), ms);
+    result.then(
+      (r) => {
+        clearTimeout(timer);
+        resolve(r);
+      },
+      (e: unknown) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
 }
 
 /** Resolves after the browser has painted what was just changed (or soon anyway, in a tab that does not paint). */
@@ -126,6 +157,7 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
   const doc = root.ownerDocument;
   const cacheBytes = opts.cacheBytes ?? DEFAULT_CACHE_BYTES;
   const save = opts.save ?? saveFile;
+  const ceiling = opts.saveCeilingMs ?? SAVE_CEILING_MS;
 
   // ------------------------------------------------------------------------------------------------------- DOM
   const pod = el(doc, 'div', 'recorder-pod');
@@ -407,11 +439,11 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
     updateRow(r);
     // Synchronous, with nothing awaited before it: the share sheet needs this tap's user activation.
     const result = save(blob, takeFilename(r.info.createdAt));
-    const settle = (res: SaveResult): void => {
+    const settle = (res: SaveResult | 'timeout'): void => {
       r.saving = false;
       if (disposed) return;
       if (res === 'saved') uncache(r.info.id); // the file is out: do not keep the take in memory
-      if (res !== 'cancelled') {
+      if (res !== 'cancelled' && res !== 'timeout') {
         r.note = res === 'saved' ? 'SAVED' : 'FAILED';
         clearTimeout(r.noteTimer);
         r.noteTimer = setTimeout(
@@ -424,7 +456,7 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
       }
       updateRow(r);
     };
-    result.then(settle, () => settle('failed'));
+    withCeiling(result, ceiling).then(settle, () => settle('failed'));
   }
 
   function delTap(r: Row): void {
@@ -487,7 +519,7 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
     mix.saving = true;
     mixBtn.classList.add('is-saving');
     const result = save(blob, mixFilename(at)); // synchronous, as for a take
-    const settle = (res: SaveResult): void => {
+    const settle = (res: SaveResult | 'timeout'): void => {
       mixBtn.classList.remove('is-saving');
       if (disposed) return;
       mix.saving = false;
@@ -496,7 +528,7 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
         syncMix();
       } else if (res === 'failed') setNote('SAVE FAILED');
     };
-    result.then(settle, () => settle('failed'));
+    withCeiling(result, ceiling).then(settle, () => settle('failed')); // 'timeout': SAVE MIX works again, the mix kept
   }
 
   // ------------------------------------------------------------------------------------------------------- taps
