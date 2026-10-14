@@ -12,6 +12,10 @@
  * nothing), so the page holds the WAV once, plus a few megabytes. The render yields to the page's other tasks every
  * YIELD_MS, so the UI stays live and the pod keeps showing PREPARING... On a touch device the cycle is cut so that its
  * WAV stays within TOUCH_MIX_WAV_BYTES (the iPad's tab shares its memory with the audio pool), and `onCut` says where.
+ *
+ * What is heard (ruling R64): the cycle starts at the press. One engine status, read at the press, gives the tracks that
+ * play, the engine's exact tempo and each track's playhead (`mixOffsets`), so every layer keeps its place against the
+ * others as the performer hears it.
  */
 
 import type { Controller } from '../control/controller';
@@ -20,7 +24,7 @@ import { MasterFx } from '../dsp/master';
 import { isTouch } from '../engine/config';
 import type { MemorySettings, SystemSettings } from '../schema/types';
 import { EXPORT_RATE } from '../shared/constants';
-import type { TrackAudio } from '../shared/protocol';
+import type { EngineStatus, TrackAudio } from '../shared/protocol';
 import { wavHeader } from '../storage/wav';
 import { Pcm24Stream } from './encode';
 
@@ -100,19 +104,41 @@ export function mixFromArrays(L: Float32Array, R: Float32Array, cut = false): Mi
   };
 }
 
+/**
+ * Where each playing track is in its loop, from one engine status (ruling R64), for `MixOptions.offsets`: frames into
+ * the loop in play order. `TrackStatus.position` is the playhead's place in the take as a fraction of its length (it
+ * runs 1 -> 0 in REVERSE), so a REVERSE track is `length - 1 - playhead` frames into its backwards loop. A track that
+ * does not play, or that the status does not show, is 0 (its start).
+ */
+export function mixOffsets(
+  status: EngineStatus | null,
+  tracks: (TrackAudio | null)[],
+  playing: boolean[],
+  memory: MemorySettings,
+): number[] {
+  return tracks.map((t, i) => {
+    const s = status?.tracks[i];
+    if (!t || playing[i] !== true || !s || !Number.isFinite(s.position)) return 0;
+    const len = t.L.length;
+    const p = s.position * len;
+    return memory.track[i]?.reverse === true ? len - 1 - p : p;
+  });
+}
+
 const now = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
 /**
  * Renders the playing loops to a WAV Blob. Rejects with `NothingToMixError` when no track with audio is playing.
- * The tracks come from the engine (`exportTracks`); which of them sound is read from the engine status (playing or
- * overdubbing), as is the engine's exact tempo, and the fader positions and the settings from the controller. MASTER FX
- * runs on the mix with a fresh instance configured from the system settings, so a mix does not depend on what was
- * exported before.
+ * The tracks come from the engine (`exportTracks`); which of them sound (playing or overdubbing), the engine's exact
+ * tempo and where each one is come from the engine status at the press (one status, read before the tracks are asked
+ * for), and the fader positions and the settings from the controller. MASTER FX runs on the mix with a fresh instance
+ * configured from the system settings, so a mix does not depend on what was exported before.
  */
 export async function exportLoopMix(controller: LoopMixSource, render: RenderMixFn, opts: LoopMixOptions = {}): Promise<Blob> {
-  const tracks = await controller.requestTracks();
+  // The cycle starts at the press (R64): this one status is what the mix is aligned to.
   const status = controller.status;
+  const tracks = await controller.requestTracks();
   const playing = tracks.map((t, i) => {
     if (!t) return false;
     const state = status?.tracks[i]?.state;
@@ -125,7 +151,8 @@ export async function exportLoopMix(controller: LoopMixSource, render: RenderMix
   const { memory, system } = controller.session;
   const touch = opts.touch ?? isTouch(globalThis.navigator);
   const maxFrames = touch ? touchMixFrames(sr) : Math.round(DESKTOP_MIX_SECONDS * sr);
-  const mix = render(memory, system, tracks, playing, gains, sr, { tempo: status?.tempo, maxFrames });
+  const offsets = mixOffsets(status, tracks, playing, memory);
+  const mix = render(memory, system, tracks, playing, gains, sr, { tempo: status?.tempo, maxFrames, offsets });
   const n = mix.frames;
   if (n === 0) throw new NothingToMixError();
   if (mix.cut) opts.onCut?.(n / sr);
