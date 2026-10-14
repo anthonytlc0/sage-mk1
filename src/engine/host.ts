@@ -206,7 +206,10 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
         channelCount: 1, // the mic, downmixed to mono
         channelCountMode: 'explicit',
         channelInterpretation: 'speakers',
-        processorOptions: { memoryBudgetBytes: memoryBudgetBytes(nav), exportSecondsPerBlock: exportSecondsPerBlock(nav) },
+        processorOptions: {
+          memoryBudgetBytes: memoryBudgetBytes(nav),
+          exportSecondsPerBlock: exportSecondsPerBlock(nav), // smaller parts on a touch device (ledger 298)
+        },
       });
     } catch (e) {
       stopStream(stream);

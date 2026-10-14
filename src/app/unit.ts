@@ -18,8 +18,9 @@
  * POWER off (a tap while on): the running take is completed (`recorder.stop()`) before anything is torn down, the
  *   system settings are saved and a clean shutdown is marked (`Controller.powerOff`, which also drops the recovery
  *   checkpoint, ruling R16), then the pod, controller and menu go and the engine stops. While RECOVER? is unanswered
- *   (ruling R68) no clean shutdown is marked, then or at a later pagehide, so the next power-on offers it again. The system settings as they
- *   are then are kept for the next power-on in this page (MIC PROCESS for the mic, CONTRAST for the boot screen).
+ *   (ruling R68) no clean shutdown is marked, then or at a later pagehide, so the next power-on offers it again. The
+ *   system settings as they are then are kept for the next power-on in this page (MIC PROCESS for the mic, CONTRAST
+ *   for the boot screen).
  * Engine stopped (a `fault` event, ruling R67): the take is halted, the LCD and the shell show ENGINE STOPPED, and
  *   POWER switches off without marking a clean shutdown, so switching on again offers RECOVER?.
  * Audio lost (the engine's `needsResume`, ruling R58): the running take is halted at once, and the shell shows TAP
@@ -552,7 +553,8 @@ export class SageUnit {
       restartMic: () => engine.restartMic(),
     });
     const recorder = new Recorder(engine, stores.takes, engine.ctx.sampleRate);
-    const live: Live = { engine, stores, controller, menu, recorder, pod: null, offResume: () => undefined, offFault: () => undefined };
+    const none = (): void => undefined;
+    const live: Live = { engine, stores, controller, menu, recorder, pod: null, offResume: none, offFault: none };
     this.live = live;
     live.offResume = engine.onNeedsResume((lost) => this.onNeedsResume(live, lost));
     live.offFault = engine.on((e) => {
@@ -612,7 +614,8 @@ export class SageUnit {
       const id = `trk${track + 1}.fader` as AbsoluteId;
       const pos = this.deps.panelPosition?.(id) ?? this.offMoves.get(id);
       if (pos === undefined || !Number.isFinite(pos)) continue;
-      if (faderGain(Math.min(1, Math.max(0, pos))) !== controller.faderGain(track)) controller.handle({ kind: 'set', id, value: pos, t });
+      if (faderGain(Math.min(1, Math.max(0, pos))) === controller.faderGain(track)) continue; // at rest: nothing to say
+      controller.handle({ kind: 'set', id, value: pos, t });
     }
     const out = this.offMoves.get('outputLevel');
     if (out !== undefined) controller.handle({ kind: 'set', id: 'outputLevel', value: out, t });
