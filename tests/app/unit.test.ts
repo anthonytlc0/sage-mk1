@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getLoopMixRenderer } from '../../src/app/renderAdapter';
-import { renderMix } from '../../src/core/render';
+import { mixRenderer } from '../../src/core/render';
 import { SageUnit, openStores } from '../../src/app/unit';
 import type { PodHandle, ShellEngine, ShellStores, UnitDeps } from '../../src/app/unit';
 import type { WakeLockApi, WakeLockSentinelLike } from '../../src/app/wakeLock';
@@ -377,8 +377,8 @@ describe('SageUnit: wiring', () => {
     expect(r.pods[0]!.toggles).toBe(1);
   });
 
-  it('LOOP MIX mixes with renderMix (Task 9; ruling R56 lifted)', () => {
-    expect(getLoopMixRenderer()).toBe(renderMix);
+  it('LOOP MIX mixes with mixRenderer, streamed (Task 9, ruling R63; R56 lifted)', () => {
+    expect(getLoopMixRenderer()).toBe(mixRenderer);
   });
 });
 

@@ -1,8 +1,13 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { makeStatus } from '../../src/control/fakeEngine';
 import { Session } from '../../src/control/session';
-import { NothingToMixError, exportLoopMix } from '../../src/recorder/loopMix';
+import { mixRenderer, renderMix } from '../../src/core/render';
+import type { MixRenderer } from '../../src/core/render';
+import { MasterFx } from '../../src/dsp/master';
+import { NothingToMixError, exportLoopMix, mixCutNote, mixFromArrays, touchMixFrames } from '../../src/recorder/loopMix';
 import type { LoopMixSource, RenderMixFn } from '../../src/recorder/loopMix';
+import { Pcm24Stream } from '../../src/recorder/encode';
+import { wavHeader } from '../../src/storage/wav';
 import type { TrackState } from '../../src/shared/protocol';
 import type { EngineStatus, TrackAudio } from '../../src/shared/protocol';
 import { EXPORT_RATE } from '../../src/shared/constants';
@@ -28,7 +33,7 @@ const fakeRender: RenderMixFn = (_m, _s, tracks, playing, gains) => {
       R[k] += t.R[k % t.R.length]! * gains[i]!;
     }
   });
-  return { L, R };
+  return mixFromArrays(L, R);
 };
 
 function source(tracks: (TrackAudio | null)[], states: TrackState[], opts: { gains?: number[]; sampleRate?: number; status?: EngineStatus | null } = {}): LoopMixSource & { session: Session } {
@@ -78,13 +83,15 @@ describe('exportLoopMix', () => {
     await exportLoopMix(src, render);
 
     expect(render).toHaveBeenCalledTimes(1);
-    const [memory, system, got, playing, gains, sr] = render.mock.calls[0]!;
+    const [memory, system, got, playing, gains, sr, opts] = render.mock.calls[0]!;
     expect(memory).toBe(src.session.memory);
     expect(system).toBe(src.session.system);
     expect(got).toBe(tracks);
     expect(playing).toEqual([true, true, false, false, false]); // playing and overdubbing sound; stopped, recording, empty do not
     expect(gains).toEqual([1, 0.5, 0.25, 0, 1]);
     expect(sr).toBe(SR);
+    // The engine's exact tempo (the memory keeps it to 0.1 BPM only), and the desktop's 10-minute cap.
+    expect(opts).toEqual({ tempo: src.status!.tempo, maxFrames: 10 * 60 * SR });
   });
 
   it('a track the status calls playing but that has no audio is not in the set', async () => {
@@ -110,7 +117,7 @@ describe('exportLoopMix', () => {
 
   it('refuses when the render comes back empty', async () => {
     const src = source([track(100, 0.1), null, null, null, null], ['playing', 'empty', 'empty', 'empty', 'empty']);
-    await expect(exportLoopMix(src, () => ({ L: new Float32Array(0), R: new Float32Array(0) }))).rejects.toBeInstanceOf(NothingToMixError);
+    await expect(exportLoopMix(src, () => mixFromArrays(new Float32Array(0), new Float32Array(0)))).rejects.toBeInstanceOf(NothingToMixError);
   });
 
   it('does not resample when the context already runs at 44.1 kHz', async () => {
@@ -130,7 +137,7 @@ describe('exportLoopMix', () => {
       const L = new Float32Array(SR);
       const R = new Float32Array(SR);
       L[0] = R[0] = 0.5;
-      return { L, R };
+      return mixFromArrays(L, R);
     };
     const playingOne = (): LoopMixSource & { session: Session } =>
       source([track(4800, 0.1), null, null, null, null], ['playing', 'empty', 'empty', 'empty', 'empty']);
@@ -165,5 +172,105 @@ describe('exportLoopMix', () => {
       const b = await bytesOf(await exportLoopMix(src, impulse));
       expect(sameBytes(a, b)).toBe(true);
     });
+  });
+});
+
+describe('exportLoopMix: streamed (ruling R63)', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  /** Two synced-looking loops of 4 s and 6 s at 48 kHz: a 12 s cycle. */
+  function long(): LoopMixSource & { session: Session } {
+    const a = track(4 * SR, 0.25);
+    const b = track(6 * SR, 0.125);
+    for (let k = 0; k < a.L.length; k++) a.L[k] = 0.25 * Math.sin(k / 50);
+    return source([a, b, null, null, null], ['playing', 'playing', 'empty', 'empty', 'empty']);
+  }
+
+  it('the WAV is the renderMix cycle through MASTER FX and the converter, byte for byte', async () => {
+    const src = long();
+    src.session.system.master.reverb = 30;
+    const blob = await exportLoopMix(src, mixRenderer);
+    // The reference: the whole cycle at once, as LOOP MIX did before it streamed.
+    const { memory, system } = src.session;
+    const tracks = await src.requestTracks();
+    const ref = renderMix(memory, system, tracks, [true, true, false, false, false], [1, 1, 1, 1, 1], SR, src.status!.tempo);
+    expect(ref.L.length).toBe(12 * SR);
+    const fx = new MasterFx(SR);
+    fx.configure(system);
+    const stream = new Pcm24Stream(SR);
+    const parts: Uint8Array[] = [];
+    for (let at = 0; at < ref.L.length; at += 4096) {
+      const n = Math.min(4096, ref.L.length - at);
+      const l = ref.L.subarray(at, at + n);
+      const r = ref.R.subarray(at, at + n);
+      fx.process(l, r, n);
+      parts.push(stream.push(l, r));
+    }
+    parts.push(stream.flush());
+    const want = await bytesOf(new Blob([wavHeader(stream.frames * 6, EXPORT_RATE, 2, 'pcm24'), ...parts] as Uint8Array<ArrayBuffer>[]));
+    expect(sameBytes(await bytesOf(blob), want)).toBe(true);
+  });
+
+  it('never allocates a cycle-sized float buffer', async () => {
+    const src = long();
+    const sizes: number[] = [];
+    const Real = Float32Array;
+    vi.stubGlobal('Float32Array', new Proxy(Real, {
+      construct(target, args: unknown[]) {
+        sizes.push(typeof args[0] === 'number' ? args[0] : (args[0] as { length?: number } | undefined)?.length ?? 0);
+        return Reflect.construct(target, args) as object;
+      },
+    }));
+    const blob = await exportLoopMix(src, mixRenderer);
+    vi.unstubAllGlobals();
+    expect(blob.size).toBe(44 + 12 * EXPORT_RATE * 6);
+    // The cycle is 12 x 48000 frames; nothing near that is ever allocated (the loops themselves are read in place; the
+    // largest buffers are the offline engine's fixed rings).
+    expect(Math.max(...sizes)).toBeLessThan((12 * SR) / 4);
+  });
+
+  it('keeps the page live: it yields to other tasks while it renders', async () => {
+    const src = source([track(SR, 0.1), null, null, null, null], ['playing', 'empty', 'empty', 'empty', 'empty']);
+    const frames = 40 * 4096;
+    const slow: RenderMixFn = () => ({
+      frames,
+      cut: false,
+      render(L: Float32Array, R: Float32Array, n: number) {
+        const until = performance.now() + 2;
+        while (performance.now() < until) {
+          // a render that takes its time
+        }
+        L.fill(0.1, 0, n);
+        R.fill(0.1, 0, n);
+      },
+    });
+    const order: string[] = [];
+    setTimeout(() => order.push('timer'), 0);
+    await exportLoopMix(src, slow);
+    order.push('done');
+    expect(order).toEqual(['timer', 'done']);
+  });
+
+  it('on a touch device the cycle is capped so its WAV stays within 100 MB, and a cut mix says where it was cut', async () => {
+    const frames = touchMixFrames(SR);
+    const bytes = 44 + 6 * Math.ceil((frames * EXPORT_RATE) / SR);
+    expect(bytes).toBeLessThanOrEqual(100_000_000);
+    expect(bytes).toBeGreaterThan(99_990_000);
+
+    const src = source([track(SR, 0.1), null, null, null, null], ['playing', 'empty', 'empty', 'empty', 'empty']);
+    const seen: number[] = [];
+    const cutAt: number[] = [];
+    const render: RenderMixFn = (_m, _s, _t, _p, _g, _sr, opts) => {
+      seen.push(opts?.maxFrames ?? -1);
+      const r: MixRenderer = mixFromArrays(new Float32Array(SR).fill(0.1), new Float32Array(SR).fill(0.1));
+      return { ...r, cut: true, render: r.render.bind(r) };
+    };
+    await exportLoopMix(src, render, { touch: true, onCut: (s) => cutAt.push(s) });
+    expect(seen).toEqual([frames]);
+    expect(cutAt).toEqual([1]);
+    await exportLoopMix(src, render, { touch: false });
+    expect(seen[1]).toBe(10 * 60 * SR);
+    expect(mixCutNote(377.9)).toBe('MIX CUT AT 6:17');
+    expect(mixCutNote(65)).toBe('MIX CUT AT 1:05');
   });
 });

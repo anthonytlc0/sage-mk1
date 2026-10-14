@@ -17,7 +17,7 @@ interface OpenOptions {
   cache?: number;
   /** Replace saveFile with a stand-in the spec answers by hand (`__rec.saves`, `__rec.releaseSave`). */
   fakeSave?: boolean;
-  /** No mixer behind LOOP MIX (`render: null`), as in the app until Task 9's renderMix exists (ruling R56). */
+  /** No mixer behind LOOP MIX (`render: null`): it says NOT READY (ruling R56). */
   noRender?: boolean;
 }
 
@@ -348,12 +348,29 @@ test.describe('recorder pod: memory and saving', () => {
   });
 });
 
-test.describe('recorder pod: LOOP MIX in the app (renderMix, Task 9)', () => {
-  test('after recording a track, LOOP MIX prepares the mix and offers SAVE MIX', async ({ page, browserName }) => {
+test.describe('recorder pod: no mixer', () => {
+  test('LOOP MIX says NOT READY, asks the engine for nothing and stays LOOP MIX (ruling R56)', async ({ page }) => {
     const errors: string[] = [];
     page.on('pageerror', (e) => errors.push(e.message));
     page.on('console', (m) => {
       if (m.type() === 'error') errors.push(m.text());
+    });
+    await open(page, { noRender: true });
+    await mix(page).click();
+    await expect(page.locator('.rp-note')).toHaveText('NOT READY');
+    await expect(mix(page)).toHaveText('LOOP MIX');
+    expect(await page.evaluate(() => window.__rec.engine.sent.filter((s) => s.cmd.t === 'exportTracks').length)).toBe(0);
+    expect(errors).toEqual([]);
+  });
+});
+
+test.describe('recorder pod: LOOP MIX in the app (mixRenderer, Task 9)', () => {
+  test('after recording a track, LOOP MIX prepares the mix and offers SAVE MIX', async ({ page, browserName }) => {
+    // Uncaught errors, and the pod's own report of a failed mix; other console output of the app is not this test's.
+    const errors: string[] = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    page.on('console', (m) => {
+      if (m.type() === 'error' && m.text().startsWith('loop mix failed')) errors.push(m.text());
     });
     await page.addInitScript(fakeMic);
     await openApp(page);
