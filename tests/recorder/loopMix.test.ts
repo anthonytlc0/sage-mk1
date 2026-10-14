@@ -227,6 +227,35 @@ describe('exportLoopMix', () => {
   });
 });
 
+describe('exportLoopMix: a cut mix (PROMOTED 2)', () => {
+  /** A constant 0.5 mix of `n` frames at 44.1 kHz (so nothing is resampled), cut or not. */
+  const flat = (n: number, cut: boolean): RenderMixFn => () => {
+    const r = mixFromArrays(new Float32Array(n).fill(0.5), new Float32Array(n).fill(0.5));
+    return { frames: r.frames, cut, render: r.render.bind(r) };
+  };
+  const src = () => source([track(44100, 0.1, 44100), null, null, null, null], ['playing', 'empty', 'empty', 'empty', 'empty'], { sampleRate: 44100 });
+  const XF44 = Math.round((5 * 44100) / 1000); // 5 ms
+
+  it('fades out over its last 5 ms, so it ends on silence rather than mid-waveform', async () => {
+    const n = 3 * 4096 + 100; // the fade spans the last two 4096-frame render steps
+    const wav = await decoded(await exportLoopMix(src(), flat(n, true), { touch: true }));
+    const L = wav.chs[0]!;
+    expect(L.length).toBe(n);
+    expect(L[n - XF44 - 1]).toBeCloseTo(0.5, 5);
+    expect(Math.abs(L[n - 1]!)).toBeLessThan(1e-6);
+    for (let k = n - XF44; k < n; k++) {
+      expect(L[k]!).toBeCloseTo((0.5 * (n - 1 - k)) / XF44, 5);
+      expect(wav.chs[1]![k]!).toBeCloseTo(L[k]!, 6);
+    }
+  });
+
+  it('a whole cycle is not faded: it loops seamlessly as it is', async () => {
+    const n = 5000;
+    const wav = await decoded(await exportLoopMix(src(), flat(n, false), { touch: false }));
+    expect(wav.chs[0]![n - 1]).toBeCloseTo(0.5, 5);
+  });
+});
+
 describe('exportLoopMix: streamed (ruling R63)', () => {
   afterEach(() => vi.unstubAllGlobals());
 

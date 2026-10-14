@@ -12,6 +12,8 @@
  * nothing), so the page holds the WAV once, plus a few megabytes. The render yields to the page's other tasks every
  * YIELD_MS, so the UI stays live and the pod keeps showing PREPARING... On a touch device the cycle is cut so that its
  * WAV stays within TOUCH_MIX_WAV_BYTES (the iPad's tab shares its memory with the audio pool), and `onCut` says where.
+ * A cut mix fades out over its last 5 ms, after MASTER FX, so it ends on silence rather than mid-waveform (PROMOTED 2);
+ * a whole cycle is left as it is, since it loops seamlessly.
  *
  * What is heard (ruling R64): the cycle starts at the press. One engine status, read at the press, gives the tracks that
  * play, the engine's exact tempo and each track's playhead (`mixOffsets`), so every layer keeps its place against the
@@ -23,7 +25,7 @@ import type { MixOptions, MixRenderer } from '../core/render';
 import { MasterFx } from '../dsp/master';
 import { isTouch } from '../engine/config';
 import type { MemorySettings, SystemSettings } from '../schema/types';
-import { EXPORT_RATE } from '../shared/constants';
+import { EXPORT_RATE, XFADE_MS } from '../shared/constants';
 import type { EngineStatus, TrackAudio } from '../shared/protocol';
 import { wavHeader } from '../storage/wav';
 import { Pcm24Stream } from './encode';
@@ -156,6 +158,9 @@ export async function exportLoopMix(controller: LoopMixSource, render: RenderMix
   const n = mix.frames;
   if (n === 0) throw new NothingToMixError();
   if (mix.cut) opts.onCut?.(n / sr);
+  // A cut mix fades out over its last 5 ms (to 0 on its last frame); a whole cycle is not faded.
+  const xf = Math.min(n, Math.max(1, Math.round((XFADE_MS * sr) / 1000)));
+  const fadeFrom = mix.cut ? n - xf : n;
 
   const fx = new MasterFx(sr);
   fx.configure(system);
@@ -170,6 +175,11 @@ export async function exportLoopMix(controller: LoopMixSource, render: RenderMix
     const len = Math.min(STEP, n - at);
     mix.render(L, R, len);
     fx.process(L, R, len);
+    for (let j = Math.max(0, fadeFrom - at); j < len; j++) {
+      const g = (n - 1 - (at + j)) / xf;
+      L[j] *= g;
+      R[j] *= g;
+    }
     const bytes = len === STEP ? stream.push(L, R) : stream.push(L.subarray(0, len), R.subarray(0, len));
     parts.push(bytes);
     waiting += bytes.length;
