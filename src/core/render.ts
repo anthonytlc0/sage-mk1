@@ -52,14 +52,17 @@ const BLOCK = 1024;
 /** The offline core's pool budget: it holds no audio of its own (the tracks are views), so this is only a backstop. */
 const OFFLINE_BUDGET = 64 * 1024 * 1024;
 
-/** A loop of `frames` frames at `rate` plays on the exact path: the rate is 1 to within half a frame per pass (`Track.isUnity`). */
+/**
+ * A loop of `frames` frames at `rate` plays on the exact path: its length on the timeline (`frames / rate`) is within half
+ * a frame of `frames` (`Track.isUnity`).
+ */
 function exactPath(frames: number, rate: number): boolean {
-  return Math.abs(rate - 1) * frames <= 0.5 + 1e-9;
+  return Math.abs(frames / rate - frames) <= 0.5 + 1e-9;
 }
 
 /**
- * A loop of `frames` frames played at `rate` (already clamped), in timeline frames: `frames` itself when the rate is 1
- * to within half a frame per pass (the exact path, as `Track.isUnity` decides), else `frames / rate` rounded.
+ * A loop of `frames` frames played at `rate` (already clamped), in timeline frames: `frames` itself on the exact path
+ * (`exactPath`, as `Track.isUnity` decides), else `frames / rate` rounded.
  */
 export function lengthAfterRate(frames: number, rate: number): number {
   if (exactPath(frames, rate)) return frames;

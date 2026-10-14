@@ -1743,7 +1743,10 @@ export class Track implements SyncTrack {
    * speed change never is. Such a loop plays on the exact path, its drift corrected at the seam.
    */
   private isUnity(rate: number): boolean {
-    return Math.abs(rate - 1) * this._take.length <= 0.5 + 1e-9;
+    // `length / rate` is the length on the timeline. (Not `|rate - 1| x length`, which is a hair over half a frame for a
+    // grid loop whose ideal length is a whole number and a half, rounded up: that sent it through the stretcher.)
+    const len = this._take.length;
+    return Math.abs(len / rate - len) <= 0.5 + 1e-9;
   }
 
   /**
