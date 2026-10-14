@@ -337,6 +337,25 @@ export class AudioTake {
   }
 
   /**
+   * A take that reads `L`/`R` in place instead of copying them into the pool: for an offline render (renderMix), where
+   * the arrays outlive the take and the loop is only played. Its chunks are views of the arrays with an extra holder
+   * the pool never sees, so they are never recycled or counted against the budget, and a write would copy them first
+   * (copy-on-write), leaving the arrays as they were.
+   */
+  static view(pool: ChunkPool, L: Float32Array, R: Float32Array): AudioTake {
+    if (L.length !== R.length) {
+      throw new RangeError(`view needs equal channel lengths, got ${L.length} and ${R.length}`);
+    }
+    const take = new AudioTake(pool);
+    const cf = pool.chunkFrames;
+    for (let at = 0; at < L.length; at += cf) {
+      take.chunks.push({ L: L.subarray(at, at + cf), R: R.subarray(at, at + cf), refs: 2 });
+    }
+    take.len = L.length;
+    return take;
+  }
+
+  /**
    * Chunk `ci` made safe to write: itself when this take is its only holder, otherwise a fresh copy that replaces it
    * here (the old one loses a ref). Null when the pool has no chunk for the copy, or when the pool's reclaim released
    * this take while making room.
