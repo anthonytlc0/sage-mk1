@@ -22,6 +22,7 @@ The looper, the mixer and the DSP are written from scratch with standard, docume
 | Package | Version | License | Use |
 | --- | --- | --- | --- |
 | [fflate](https://github.com/101arrowz/fflate) | 0.8.3 | MIT | Zip packing and unpacking for `.sagemk1` memory files |
+| [Workbox](https://github.com/GoogleChrome/workbox) (`workbox-core`, `workbox-precaching`, `workbox-routing`, `workbox-strategies`) | 7.4.x | MIT | The runtime of the service worker that caches the app for offline use |
 
 fflate is the only entry under `dependencies` in `package.json`, and it has no dependencies of its own. It is bundled into the production JavaScript. Its license text, as it appears in `node_modules/fflate/LICENSE`:
 
@@ -49,9 +50,33 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+Workbox is not in `dependencies`. It arrives with vite-plugin-pwa, which writes the service worker (`sw.js`) and a copy of the Workbox runtime (`workbox-*.js`) into `dist/`, so both are served with the app. Workbox's license text, as it appears in `node_modules/workbox-core/LICENSE`:
+
+```
+Copyright 2018 Google LLC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
 ## Development tooling
 
-These are in `devDependencies`. They build and test the app and are not part of it, with one exception: the service worker that vite-plugin-pwa generates is built on Workbox, so a Workbox runtime file (`workbox-*.js`, MIT, Copyright 2018 Google LLC) is written into `dist/` next to it.
+These are in `devDependencies`. They build and test the app and are not part of it, with one exception: the Workbox runtime that vite-plugin-pwa copies into `dist/` (listed above).
 
 | Package | Version | License | Use |
 | --- | --- | --- | --- |
@@ -60,7 +85,7 @@ These are in `devDependencies`. They build and test the app and are not part of 
 | [Playwright](https://playwright.dev) (`@playwright/test`) | 1.64.0 | Apache-2.0 | Browser tests (Chromium and WebKit) |
 | [TypeScript](https://www.typescriptlang.org) | 7.0.2 | Apache-2.0 | Language and typecheck |
 | [vite-plugin-pwa](https://github.com/vite-pwa/vite-plugin-pwa) | 2.0.0 | MIT | Web app manifest and service worker |
-| [Workbox](https://github.com/GoogleChrome/workbox) (`workbox-build` and friends) | 7.4.1 | MIT | Service worker runtime, pulled in by vite-plugin-pwa |
+| [Workbox](https://github.com/GoogleChrome/workbox) (`workbox-build` and friends) | 7.4.1 | MIT | Generates the service worker (`workbox-build`); its runtime ships, see above |
 | [fake-indexeddb](https://github.com/dumbmatter/fakeIndexedDB) | 6.2.5 | Apache-2.0 | IndexedDB in the Node unit tests |
 
 Versions are the ones in `package-lock.json` when this file was written. Those packages have dependencies of their own, all installed from npm under their own licenses (`package-lock.json` lists each one). They are used at build and test time only and none of them is shipped, but a few are not MIT, BSD or Apache: lightningcss (MPL-2.0, used by Vite for CSS), caniuse-lite (CC-BY-4.0, browser support data) and some packages under BlueOak-1.0.0 (file-matching helpers).
@@ -69,9 +94,10 @@ The GitHub Actions workflows use `actions/checkout`, `actions/setup-node`, `acti
 
 ## Fonts, icons and other assets
 
-There are no font files, image files, audio samples or other binary assets in the source tree, apart from two Playwright screenshots of the app's own panel in `tests/e2e/panel.spec.ts-snapshots/`.
+There are no font files, audio samples or other binary assets in the source tree, apart from the app icons and three Playwright screenshots of the app's own panel (two in `tests/e2e/panel.spec.ts-snapshots/`, one in `tests/e2e/screens/`).
 
 - **LCD fonts.** The three LCD fonts in `src/lcd/fonts.ts` (small 5x7, medium 7x11, large 14x24 digits) are hand-made bitmaps, drawn glyph by glyph as text in the source. They are original pixel designs.
 - **LCD icons.** The track, lock, note and other icons in `src/lcd/icons.ts` are original one-bit drawings.
 - **Panel.** The panel is drawn as SVG by code (`src/ui/panelView.ts`). The panel text uses the system fonts of the device it runs on (a font stack in `src/ui/panel.css`); no web fonts are loaded.
 - **Sound.** Every sound the app makes by itself, such as the latency-calibration clicks and the GUIDE click, is synthesized in code. No recorded samples are used.
+- **App icons.** `public/icons/icon.svg` is original artwork: a ring of LED segments around a dark button. `icon-192.png`, `icon-512.png` and `apple-touch-icon.png` were rendered from it with Playwright's Chromium. No Roland artwork is used.
