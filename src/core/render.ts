@@ -118,7 +118,8 @@ const NOTHING: MixRenderer = {
  *
  * The engine renders in BLOCK-frame blocks whatever the caller asks for, so any chunking gives the same samples. It
  * runs XF frames (the 5 ms start ramp) before the first: the cycle begins there, in steady state, and so loops without
- * a dip at its seam (fix round 1). A 1SHOT loses its first 5 ms with it.
+ * a dip at its seam (fix round 1). A 1SHOT starts after that, on the cycle's first frame, with the live 5 ms ramp-in
+ * (PROMOTED 1: through the pre-roll it lost its ramp and started with a step).
  */
 export function mixRenderer(
   memory: MemorySettings,
@@ -155,7 +156,9 @@ export function mixRenderer(
   // Exactly the tempo asked for: setSettings keeps a transport tempo within 0.05 BPM of the memory's (R31).
   core.command({ t: 'tempo', bpm: tempo });
   for (const i of idx) core.setTrackAudio(TRACKS[i], tracks[i]);
-  for (const i of idx) core.command({ t: 'recPlay', track: TRACKS[i] });
+  // The loops start before the pre-roll (below), so the cycle begins past their start ramp. A 1SHOT starts after it,
+  // on the cycle's first frame, with the live ramp: through the pre-roll it would start with a step (PROMOTED 1).
+  for (const i of idx) if (!mem.track[i].oneShot) core.command({ t: 'recPlay', track: TRACKS[i] });
 
   const mixer = new Mixer(sr);
   mixer.configure(system);
@@ -172,6 +175,7 @@ export function mixRenderer(
   const mixOut: [Float32Array, Float32Array] = [bufL, bufR];
   // The start ramp, before the cycle's first frame.
   core.process(silence, silence, silence, silence, out, xfadeFrames(sr));
+  for (const i of idx) if (mem.track[i].oneShot) core.command({ t: 'recPlay', track: TRACKS[i] });
 
   let done = 0; // frames of the mix rendered into the block buffers
   let have = 0; // frames in them

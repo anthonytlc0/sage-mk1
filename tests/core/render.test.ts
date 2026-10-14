@@ -164,7 +164,17 @@ describe('renderMix: one full cycle', () => {
     }));
     expect(once.L.length).toBe(3000);
     expect(once.L[500]).toBeCloseTo(0.5, 6);
-    expect(once.L.subarray(1000).every((v) => v === 0)).toBe(true); // once, from XF frames before the cycle
+    expect(once.L[999]).toBeCloseTo(0.5, 6);
+    // Once, from the cycle's first frame; its end ramps out over 5 ms, as live.
+    expect(once.L.subarray(1000 + XF).every((v) => v === 0)).toBe(true);
+  });
+
+  it('a 1SHOT starts with the live 5 ms ramp from silence, not a step (PROMOTED 1)', () => {
+    const once = mix([audio(1000, () => 0.5), audio(3000, () => 0.25)], track((s) => {
+      s.oneShot = true;
+    }));
+    for (let f = 0; f < XF; f++) expect(once.L[f]).toBeCloseTo(0.25 + (0.5 * f) / XF, 6);
+    expect(once.L[XF]).toBeCloseTo(0.75, 6);
   });
 });
 
