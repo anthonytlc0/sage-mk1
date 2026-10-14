@@ -87,6 +87,8 @@ import type { LoopSync, SyncTrack } from './sync';
 import { readInterpolated } from './resampleRead';
 import { SPLAT_MAX_WIDTH, SpliceWriter, SplatWriter } from './resampleWrite';
 import { XfadeStretcher } from './timestretch';
+import { History, Sinks } from './history';
+import type { Snap, SnapSlot } from './history';
 import { TEMPO_MAX, TEMPO_MIN } from '../shared/constants';
 import type { FadeTime, MeasureSetting, MemorySettings, TrackSettings } from '../schema/types';
 import type { TrackIndex } from '../shared/ids';
@@ -134,56 +136,6 @@ type EndAction = 'play' | 'dub' | 'stop';
  * another's loop end), which a tempo change does not move.
  */
 export type ArmUnit = 'measure' | 'loop' | 'fixed';
-/** The four history snapshots a track keeps. */
-export type SnapSlot = 'undo' | 'redo' | 'mark' | 'recBack';
-
-/** Most takes an in-flight write can land in: the current take and the four history snapshots, with one to spare. */
-const SINKS = 6;
-
-/**
- * The takes an in-flight write (a seam or punch-out tail, or a pass's gathered writes) lands in: the take it started
- * in and the snapshots taken of it since. Fixed size; a free slot is null. Writes skip a take the pool has released.
- */
-class Sinks {
-  readonly takes: (AudioTake | null)[] = new Array<AudioTake | null>(SINKS).fill(null);
-
-  has(t: AudioTake): boolean {
-    for (let i = 0; i < SINKS; i++) if (this.takes[i] === t) return true;
-    return false;
-  }
-
-  add(t: AudioTake): void {
-    if (this.has(t)) return;
-    for (let i = 0; i < SINKS; i++) {
-      if (this.takes[i] === null) {
-        this.takes[i] = t;
-        return;
-      }
-    }
-  }
-
-  remove(t: AudioTake): void {
-    for (let i = 0; i < SINKS; i++) if (this.takes[i] === t) this.takes[i] = null;
-  }
-
-  /** Only `t` (or nothing). */
-  reset(t: AudioTake | null): void {
-    this.takes.fill(null);
-    this.takes[0] = t;
-  }
-}
-
-/**
- * A saved state of the loop: its audio (null: the track was empty) and what goes with it. A slot's take is never the
- * current take, and two slots hold the same take only by holding the same `Snap`.
- */
-interface Snap {
-  take: AudioTake | null;
-  recordedTempo: number;
-  measures: number | null;
-  loopSeq: number;
-}
-
 /**
  * Input still being written after a pass ended: `left` frames from take position `pos`, at a gain falling from 1 to
  * 1/xfade (`punchOutGain`). A `replace` tail crossfades the take's audio back in as the input fades out.
@@ -285,10 +237,8 @@ export class Track implements SyncTrack {
   private punchPending = false;
 
   // Undo history (see the file comment) ---------------------------------------------------------------------------
-  private undoSnap: Snap | null = null;
-  private redoSnap: Snap | null = null;
-  private markSnap: Snap | null = null;
-  private recBackSnap: Snap | null = null;
+  /** The four snapshots (history.ts); a take released from them leaves the in-flight lists first (`forget`). */
+  private readonly history = new History((take) => this.forget(take));
   /** Where the gathered (splatted) writes land: the take their stream started in, and snapshots taken of it since. */
   private readonly wSinks = new Sinks();
   /**
@@ -600,18 +550,17 @@ export class Track implements SyncTrack {
   /** UNDO/REDO: swap the loop with undo (it becomes redo), or with redo when there is no undo (it becomes undo). */
   undoRedo(): void {
     if (this._state === 'recording') return;
-    const back = this.undoSnap;
-    const fwd = this.redoSnap;
-    if (back === null && fwd === null) return;
+    const h = this.history;
+    if (h.undo === null && h.redo === null) return;
     if (this._state === 'overdubbing') this.endPass(true);
-    if (back !== null) {
-      this.undoSnap = null;
+    if (h.undo !== null) {
+      const back = h.detach('undo')!;
       this.swapIn(back, 'redo');
-      this.drop(back); // (still REC BACK after REC->DUB: kept)
-    } else if (fwd !== null) {
-      this.redoSnap = null;
+      h.drop(back); // (still REC BACK after REC->DUB: kept)
+    } else {
+      const fwd = h.detach('redo')!;
       this.swapIn(fwd, 'undo');
-      this.drop(fwd);
+      h.drop(fwd);
     }
   }
 
@@ -619,30 +568,31 @@ export class Track implements SyncTrack {
   markSet(): void {
     if (!this.hasLoop) return;
     if (this._state === 'overdubbing') this.endPass(true);
-    this.setSlot('mark', this.snapCurrent());
+    this.history.set('mark', this.snapCurrent());
   }
 
   /** MARK CLEAR. */
   markClear(): void {
-    this.setSlot('mark', null);
+    this.history.set('mark', null);
   }
 
   /** MARK BACK: the marked loop, or with no mark the loop as its recording left it (REC BACK). */
   markBack(): void {
-    const target = this.markSnap ?? this.recBackSnap;
+    const target = this.history.mark ?? this.history.recBack;
     if (target !== null) this.goBack(target);
   }
 
   /** REC BACK: the loop as its recording left it. */
   recBack(): void {
-    if (this.recBackSnap !== null) this.goBack(this.recBackSnap);
+    const target = this.history.recBack;
+    if (target !== null) this.goBack(target);
   }
 
   /** MARK BACK / REC BACK to `target`: the loop it replaces becomes undo, and redo goes. */
   private goBack(target: Snap): void {
     if (this._state === 'recording') return;
     if (this._state === 'overdubbing') this.endPass(true);
-    if (this.swapIn(target, 'undo')) this.setSlot('redo', null);
+    if (this.swapIn(target, 'undo')) this.history.set('redo', null);
   }
 
   /**
@@ -650,11 +600,7 @@ export class Track implements SyncTrack {
    * audio, and with `onlyIfFreeing` only when it is the sole holder of at least one chunk. Returns whether it did.
    */
   dropHistory(which: SnapSlot, onlyIfFreeing: boolean): boolean {
-    const s = this.slot(which);
-    if (s === null || s.take === null) return false;
-    if (onlyIfFreeing && !s.take.ownsChunks()) return false;
-    this.setSlot(which, null);
-    return true;
+    return this.history.reclaim(which, onlyIfFreeing);
   }
 
   /**
@@ -708,7 +654,7 @@ export class Track implements SyncTrack {
         this.rampIn();
       }
     }
-    this.setSlot(keep, out);
+    this.history.set(keep, out);
     this.host.audioChanged();
     return true;
   }
@@ -762,56 +708,12 @@ export class Track implements SyncTrack {
     return t;
   }
 
-  private slot(which: SnapSlot): Snap | null {
-    switch (which) {
-      case 'undo':
-        return this.undoSnap;
-      case 'redo':
-        return this.redoSnap;
-      case 'mark':
-        return this.markSnap;
-      case 'recBack':
-        return this.recBackSnap;
-    }
-  }
-
-  /** Put `s` in the `which` slot, letting go of what was there. */
-  private setSlot(which: SnapSlot, s: Snap | null): void {
-    const old = this.slot(which);
-    switch (which) {
-      case 'undo':
-        this.undoSnap = s;
-        break;
-      case 'redo':
-        this.redoSnap = s;
-        break;
-      case 'mark':
-        this.markSnap = s;
-        break;
-      case 'recBack':
-        this.recBackSnap = s;
-        break;
-    }
-    if (old !== null && old !== s) this.drop(old);
-  }
-
-  /** Release `s`'s take, unless a slot still holds `s`. */
-  private drop(s: Snap): void {
-    const t = s.take;
-    if (t === null || s === this.undoSnap || s === this.redoSnap || s === this.markSnap || s === this.recBackSnap) return;
-    this.recTail.sinks.remove(t);
-    this.dubTail.sinks.remove(t);
-    this.wSinks.remove(t);
-    if (this.recShare === t) this.recShare = null;
-    t.release();
-  }
-
-  /** Let go of all four snapshots (the loop they belong to is gone). */
-  private clearHistory(): void {
-    this.setSlot('undo', null);
-    this.setSlot('redo', null);
-    this.setSlot('mark', null);
-    this.setSlot('recBack', null);
+  /** `take` is being released from the history: it leaves every in-flight write's list. */
+  private forget(take: AudioTake): void {
+    this.recTail.sinks.remove(take);
+    this.dubTail.sinks.remove(take);
+    this.wSinks.remove(take);
+    if (this.recShare === take) this.recShare = null;
   }
 
   /**
@@ -862,7 +764,7 @@ export class Track implements SyncTrack {
   }
 
   private beginRecording(frame: number): void {
-    this.clearHistory(); // what an undone loop left (redo, REC BACK, the mark) goes with it
+    this.history.clear(); // what an undone loop left (redo, REC BACK, the mark) goes with it
     this._state = 'recording'; // the take is always fresh and empty here
     this.recStart = frame;
     this.recEnd = null;
@@ -991,10 +893,10 @@ export class Track implements SyncTrack {
     if (over > 0) postTake.truncate(T);
     if (this.recTail.left > 0) this.recTail.sinks.add(postTake);
     const post: Snap = { take: postTake, recordedTempo: this._recordedTempo, measures, loopSeq: this._loopSeq };
-    this.setSlot('recBack', post);
-    this.setSlot('undo', { take: null, recordedTempo: this._recordedTempo, measures: null, loopSeq: 0 });
-    this.setSlot('redo', null);
-    this.setSlot('mark', null);
+    this.history.set('recBack', post);
+    this.history.set('undo', { take: null, recordedTempo: this._recordedTempo, measures: null, loopSeq: 0 });
+    this.history.set('redo', null);
+    this.history.set('mark', null);
     // Without a pass, the two hold the same audio once the crossfade is done: REC BACK then shares the take's chunks.
     this.recShare = !dub && this.recTail.left > 0 ? postTake : null;
     this.host.audioChanged();
@@ -1463,8 +1365,8 @@ export class Track implements SyncTrack {
       this.settleWriter();
       before = this.snapCurrent();
     }
-    this.setSlot('undo', before);
-    this.setSlot('redo', null);
+    this.history.set('undo', before);
+    this.history.set('redo', null);
     this.recShare = null;
     this._state = 'overdubbing';
     this.passMode = this.cfg.dubMode;
@@ -1584,7 +1486,7 @@ export class Track implements SyncTrack {
    * which plays from its own copy.
    */
   private reset(): void {
-    this.clearHistory();
+    this.history.clear();
     this.recTail.sinks.reset(null);
     this.dubTail.sinks.reset(null);
     this.wSinks.reset(null);
@@ -2353,9 +2255,9 @@ export class Track implements SyncTrack {
       lengthFrames: len, // grows while recording
       measures: this._measures, // null for free loops
       peak,
-      canUndo: this.undoSnap !== null,
-      canRedo: this.redoSnap !== null,
-      hasMark: this.markSnap !== null,
+      canUndo: this.history.undo !== null,
+      canRedo: this.history.redo !== null,
+      hasMark: this.history.mark !== null,
       speed: this.currentSpeed(),
     };
   }
