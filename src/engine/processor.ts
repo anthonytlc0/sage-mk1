@@ -484,13 +484,14 @@ export class SageProcessor {
     try {
       const meta: (TrackExportMeta | null)[] = [];
       for (const tr of this.core.tracks) {
-        // As Track.audio(): no loop while the track is empty or its first recording still runs.
-        if (tr.state === 'empty' || tr.state === 'recording') {
+        // What Track.audio() copies: no loop while the track is empty or its first recording still runs, and the
+        // gathered writes of a pass that has just ended are in it (binding note 2).
+        const take = tr.exportSnapshot();
+        if (take === null) {
           takes.push(null);
           meta.push(null);
           continue;
         }
-        const take = tr.take.snapshot();
         takes.push(take);
         meta.push({ frames: take.length, sampleRate: this.sr, recordedTempo: tr.recordedTempo, measures: tr.measures });
       }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { at, dc, makeCore, recPlay, run, SR, trk } from './harness';
+import { at, dc, makeCore, recPlay, run, SR, trk, XF } from './harness';
 
 const CHUNK_BYTES = SR * 2 * 4; // one 1 s stereo float chunk
 
@@ -63,5 +63,60 @@ describe('MEMORY FULL', () => {
     expect(core.takeMessages()).toEqual(['MEMORY FULL']);
     expect(trk(core).state).toBe('empty');
     expect(core.status().memoryBytes).toBe(0);
+  });
+});
+
+/**
+ * Undo history (undo, redo, the mark, REC BACK) holds copy-on-write chunks. When the budget runs out it gives way to
+ * new audio before anything else does: redo first, then the mark, REC BACK and undo, so MEMORY FULL is only raised
+ * once there is no history left to give back (INFERRED: the history is a convenience; the performance is not).
+ */
+describe('MEMORY FULL with undo history', () => {
+  it('a recording takes the chunks an undo held, without MEMORY FULL', () => {
+    const core = makeCore({}, { memoryBudgetBytes: 4 * CHUNK_BYTES });
+    at(core, 0, recPlay(0), dc(0.5));
+    at(core, 2000, recPlay(0), dc(0.5)); // 2 chunks
+    run(core, 2000, dc(0.5));
+    at(core, 4000, recPlay(0), dc(0.25));
+    at(core, 6000, recPlay(0), dc(0.25)); // a whole pass: the loop before it (undo, REC BACK) keeps 2 more chunks
+    run(core, 100, dc(0.25));
+    expect(core.status().memoryBytes).toBe(4 * CHUNK_BYTES);
+    expect(trk(core).canUndo).toBe(true);
+    at(core, 7000, recPlay(1), dc(0.1));
+    at(core, 8500, recPlay(1), dc(0.1)); // 1500 frames: 2 chunks, only to be had from the history
+    run(core, 100, dc(0.1));
+    expect(core.takeMessages()).toEqual([]);
+    expect(trk(core, 1).lengthFrames).toBe(1500);
+    expect(trk(core).canUndo).toBe(false);
+    core.command({ t: 'recBack', track: 0 }); // REC BACK went too
+    expect(core.getTrackAudio(0)!.L[100]).toBe(0.75);
+    expect(core.status().memoryBytes).toBe(4 * CHUNK_BYTES);
+  });
+
+  it('an overdub with no room for its undo copy drops the undo and carries on', () => {
+    const core = makeCore({}, { memoryBudgetBytes: 2 * CHUNK_BYTES });
+    at(core, 0, recPlay(), dc(0.5));
+    at(core, 2000, recPlay(), dc(0.5)); // the whole budget
+    run(core, 2000, dc(0.5));
+    at(core, 4000, recPlay(), dc(0.25));
+    at(core, 6000, recPlay(), dc(0.25));
+    run(core, 100, dc(0.25));
+    expect(core.takeMessages()).toEqual([]);
+    expect(trk(core).canUndo).toBe(false);
+    expect(core.getTrackAudio(0)!.L.every((v) => v === 0.75)).toBe(true);
+    expect(core.status().memoryBytes).toBe(2 * CHUNK_BYTES);
+  });
+
+  it('a recording ended by MEMORY FULL keeps its seam crossfade (REC BACK gives way to it)', () => {
+    const core = makeCore({}, { memoryBudgetBytes: 3 * CHUNK_BYTES });
+    const input = (f: number): number => (f < 3000 ? 0.5 : 0.1);
+    at(core, 0, recPlay(), input);
+    run(core, 4000, input); // full at 3000; frames 3000.. crossfade into the loop start
+    expect(core.takeMessages()).toEqual(['MEMORY FULL']);
+    const a = core.getTrackAudio(0)!.L;
+    expect(a[0]).toBeCloseTo(0.1, 6);
+    expect(a[2]).toBeCloseTo(0.5 * 0.4 + 0.1 * 0.6, 6);
+    expect(a[XF]).toBe(0.5);
+    expect(core.status().memoryBytes).toBe(3 * CHUNK_BYTES);
   });
 });

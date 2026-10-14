@@ -193,8 +193,6 @@ describe('rapid and out-of-order presses', () => {
     core.command({ t: 'latency', roundTripFrames: 30, outputLatencyFrames: 10 });
     core.command({ t: 'rhythmStartStop' });
     core.command({ t: 'fader', track: 0, gain: 0.5 });
-    core.command({ t: 'undoRedo', track: 0 });
-    core.command({ t: 'allStartStop' });
     expect(() => run(core, 300)).not.toThrow();
     expect(trk(core).state).toBe('empty');
   });

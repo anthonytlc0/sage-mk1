@@ -161,3 +161,95 @@ describe('AudioTake at the memory budget (MEMORY FULL)', () => {
     expect(pool.usedBytes()).toBe(2 * CHUNK_BYTES);
   });
 });
+
+/**
+ * Making room (Task 8): the pool asks its `reclaim` hook to give history back before it reports MEMORY FULL, and a
+ * copy-on-write copy is not made at all once the hook has let go of the chunk's other holders.
+ */
+describe('ChunkPool reclaim', () => {
+  it('alloc asks the reclaim hook for room before giving up, and stops when it has none to give', () => {
+    const pool = new ChunkPool(SR, 2 * CHUNK_BYTES);
+    const a = pool.alloc()!;
+    pool.alloc();
+    let held: typeof a | null = a;
+    let asked = 0;
+    pool.reclaim = () => {
+      asked++;
+      if (held === null) return false;
+      pool.release(held);
+      held = null;
+      return true;
+    };
+    expect(pool.alloc()).toBe(a);
+    expect(asked).toBe(1);
+    expect(pool.alloc()).toBeNull();
+    expect(asked).toBe(2);
+    expect(pool.usedBytes()).toBe(2 * CHUNK_BYTES);
+  });
+
+  it('a write needing a copy goes ahead without one once the hook releases the snapshot that shared the chunk', () => {
+    const pool = new ChunkPool(SR, 2 * CHUNK_BYTES);
+    const t = new AudioTake(pool);
+    expect(t.append(ramp(2000), ramp(2000), 2000)).toBe(true);
+    let snap: AudioTake | null = t.snapshot();
+    let asked = 0;
+    pool.reclaim = () => {
+      asked++;
+      if (snap === null) return false;
+      snap.release();
+      snap = null;
+      return true;
+    };
+    expect(t.write(10, filled(5, 100), filled(5, 100), 5, 'add')).toBe(true);
+    expect(asked).toBe(1); // no second request: the chunk was no longer shared
+    expect(t.toArrays().L[10]).toBe(110);
+    expect(pool.usedBytes()).toBe(2 * CHUNK_BYTES);
+  });
+
+  it('a take the hook releases while it is being written writes nothing and keeps no chunk', () => {
+    const pool = new ChunkPool(SR, 2 * CHUNK_BYTES);
+    const t = new AudioTake(pool);
+    expect(t.append(ramp(2000), ramp(2000), 2000)).toBe(true);
+    const victim = t.snapshot();
+    pool.reclaim = () => {
+      if (victim.length === 0) return false;
+      victim.release();
+      return true;
+    };
+    expect(victim.write(10, filled(5, 100), filled(5, 100), 5, 'add')).toBe(false);
+    expect(victim.length).toBe(0);
+    expect(Array.from(t.toArrays().L)).toEqual(Array.from(ramp(2000)));
+    expect(pool.usedBytes()).toBe(2 * CHUNK_BYTES);
+    t.release();
+    expect(pool.usedBytes()).toBe(0);
+  });
+});
+
+describe('AudioTake.shareFrom', () => {
+  it('gives back the copies two takes made of the same audio, so it is counted once again', () => {
+    const pool = new ChunkPool(SR, 4 * CHUNK_BYTES);
+    const t = new AudioTake(pool);
+    expect(t.append(ramp(2000), ramp(2000), 2000)).toBe(true);
+    const s = t.snapshot();
+    expect(t.write(10, filled(5, 100), filled(5, 100), 5, 'add')).toBe(true);
+    expect(s.write(10, filled(5, 100), filled(5, 100), 5, 'add')).toBe(true);
+    expect(pool.usedBytes()).toBe(3 * CHUNK_BYTES); // chunk 0 exists twice
+    s.shareFrom(t);
+    expect(pool.usedBytes()).toBe(2 * CHUNK_BYTES);
+    expect(Array.from(s.toArrays().L)).toEqual(Array.from(t.toArrays().L));
+    expect(t.write(20, filled(1, 1), filled(1, 1), 1, 'replace')).toBe(true); // still copy-on-write
+    expect(s.toArrays().L[20]).toBe(20);
+    s.release();
+    t.release();
+    expect(pool.usedBytes()).toBe(0);
+  });
+
+  it('does nothing between takes of different lengths', () => {
+    const pool = new ChunkPool(SR, 4 * CHUNK_BYTES);
+    const t = AudioTake.fromArrays(pool, ramp(2000), ramp(2000))!;
+    const s = AudioTake.fromArrays(pool, ramp(1500), ramp(1500))!;
+    s.shareFrom(t);
+    expect(s.length).toBe(1500);
+    expect(pool.usedBytes()).toBe(4 * CHUNK_BYTES);
+  });
+});
