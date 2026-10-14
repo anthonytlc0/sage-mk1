@@ -279,6 +279,18 @@ export class Controller {
     }
   }
 
+  /**
+   * A track is recording or overdubbing (by the latest status), so the memory tempo cannot change: "You cannot change
+   * the tempo of the memory while recording or overdubbing" (Owner's Manual p. 22, Troubleshooting; ledger 273). The
+   * manual lists no message for it, so a change is just ignored (`setParam('tempo')`).
+   */
+  get isTempoLocked(): boolean {
+    const s = this._status;
+    if (s === null) return false;
+    for (const t of s.tracks) if (t.state === 'recording' || t.state === 'overdubbing') return true;
+    return false;
+  }
+
   /** Track `track`'s fader as a linear gain (what the engine was last sent). */
   faderGain(track: number): number {
     return faderGain(this.buttons.faderPosition(track));
@@ -317,9 +329,12 @@ export class Controller {
    * transport and `memory.tempo` never disagree. A system change is saved to the system store shortly after; a system
    * parameter whose PREFERENCE is MEMORY goes into the memory instead (`memory.prefs`, unsaved until WRITE). A MIC
    * PROCESS change also reopens the mic (the `restartMic` option). A value that does not change sends nothing. Throws
-   * for an unknown id or a bad value or index.
+   * for an unknown id or a bad value or index. The tempo is not changed while `isTempoLocked` (every route to it, TAP
+   * TEMPO, TEMPO REVERT, TEMPO UP / DOWN and the TAP TEMPO screen's knob, comes through here), so memory.tempo and the
+   * transport keep agreeing.
    */
   setParam(id: string, value: unknown, track?: number | string): void {
+    if (id === 'tempo' && this.isTempoLocked) return;
     const { scope, changed } = this.session.set(id, value, track);
     if (!changed) return;
     this.workSeq++;

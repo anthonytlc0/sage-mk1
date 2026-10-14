@@ -3,7 +3,7 @@ import { CHECKPOINT_DEBOUNCE_MS, EXPORT_TIMEOUT_MS, MESSAGE_MS, SYSTEM_SAVE_DEBO
 import { makeStatus } from '../../src/control/fakeEngine';
 import { defaultMemory, defaultSystem } from '../../src/schema/params';
 import type { EngineCommand } from '../../src/shared/protocol';
-import { setup, take } from './helpers';
+import { press, release, setup, take } from './helpers';
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -91,6 +91,46 @@ describe('setParam and the session', () => {
     expect(c.status!.audioDirty).toBe(false);
   });
 
+});
+
+describe('tempo is locked while a track records or overdubs (M3, ledger 273)', () => {
+  // Owner's Manual p. 22: "You cannot change the tempo of the memory while recording or overdubbing." No message is
+  // listed for it, so the change is just ignored; the tempo popup still opens and shows the tempo that stands.
+  const busy = (state: 'recording' | 'overdubbing' | 'playing') => makeStatus({ tempo: 120 }, [{}, { state }]);
+
+  it.each(['recording', 'overdubbing'] as const)('%s: TAP TEMPO (the H key too), TEMPO REVERT and a tempo edit change nothing', async (state) => {
+    const { c, engine } = setup();
+    c.setParam('tempo', 120);
+    engine.emit({ t: 'status', status: busy(state) });
+    engine.reset();
+    for (const t of [0, 400, 800, 1200]) {
+      press(c, 'tapTempo', t); // KeyH arrives as this same press (ui/input/keyboard.ts)
+      release(c, 'tapTempo', t + 50);
+    }
+    c.setParam('tempo', 90); // knob [4] on the TAP TEMPO screen, TEMPO UP / DOWN
+    press(c, 'tapTempo', 5000);
+    await vi.advanceTimersByTimeAsync(2000); // held: TEMPO REVERT
+    release(c, 'tapTempo', 7000);
+    expect(c.session.memory.tempo).toBe(120);
+    expect(engine.commands('tempo')).toEqual([]);
+    expect(engine.commands('settings')).toEqual([]);
+    expect(c.isTempoLocked).toBe(true);
+  });
+
+  it('playing tracks do not lock it, and it unlocks when the pass ends', () => {
+    const { c, engine } = setup();
+    engine.emit({ t: 'status', status: busy('playing') });
+    expect(c.isTempoLocked).toBe(false);
+    c.setParam('tempo', 100);
+    expect(c.session.memory.tempo).toBe(100);
+    engine.emit({ t: 'status', status: busy('overdubbing') });
+    c.setParam('tempo', 110);
+    expect(c.session.memory.tempo).toBe(100);
+    engine.emit({ t: 'status', status: busy('playing') });
+    c.setParam('tempo', 110);
+    expect(c.session.memory.tempo).toBe(110);
+    expect(engine.last('tempo')).toEqual({ t: 'tempo', bpm: 110 });
+  });
 });
 
 describe('engine-set tempo adoption', () => {
