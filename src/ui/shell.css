@@ -181,9 +181,10 @@ body {
   animation: power-blink 0.5s steps(1, end) infinite;
 }
 
-/* After a failed (or unanswered) resume the next POWER tap switches off: the LED blinks fast. */
+/* After a failed (or unanswered) resume, or with the engine stopped, the next POWER tap switches off: fast blink. */
 .power-switch[data-resume='off'] .power-led,
-.power-switch[data-resume='slow'] .power-led {
+.power-switch[data-resume='slow'] .power-led,
+.power-switch[data-resume='stopped'] .power-led {
   animation: power-blink 0.16s steps(1, end) infinite;
 }
 
@@ -230,7 +231,8 @@ body {
 .power-switch[data-resume='resume'],
 .power-switch[data-resume='resuming'],
 .power-switch[data-resume='slow'],
-.power-switch[data-resume='off'] {
+.power-switch[data-resume='off'],
+.power-switch[data-resume='stopped'] {
   border-color: #6b2125;
   box-shadow:
     0 0 0 2px rgba(255, 42, 31, 0.45),

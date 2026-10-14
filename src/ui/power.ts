@@ -8,7 +8,8 @@
  *  - The prompt covers the panel (so taps on a looper without audio do nothing) but not the shelf: POWER and the
  *    recorder pod stay usable above it. A tap on the prompt itself always retries the resume. Once a retry has failed
  *    (or one has gone unanswered for a while) the prompt says the next POWER tap switches off (ruling R58), and the
- *    POWER LED blinks faster.
+ *    POWER LED blinks faster. When the engine itself has stopped (ruling R67) the prompt says ENGINE STOPPED and asks
+ *    for POWER off and on; a tap on it does nothing.
  */
 
 import type { PowerState, ResumePrompt } from '../app/unit';
@@ -19,6 +20,8 @@ const PROMPT_TEXT: Record<Exclude<ResumePrompt, 'none'>, readonly [string, strin
   resuming: ['AUDIO STOPPED', 'RESUMING...', ''],
   slow: ['NOT RESPONDING', 'TAP POWER TO SWITCH OFF', ''],
   off: ['RESUME FAILED', 'TAP POWER TO SWITCH OFF', 'TAP HERE TO TRY AGAIN'],
+  // Ruling R67: the engine failed. POWER off keeps the unsaved work for RECOVER? at the next power-on.
+  stopped: ['ENGINE STOPPED', 'SWITCH POWER OFF AND ON', 'UNSAVED WORK IS KEPT FOR RECOVER?'],
 };
 
 export interface PowerSwitch {

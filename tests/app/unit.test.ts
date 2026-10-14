@@ -603,6 +603,59 @@ describe('SageUnit: POWER off and page hide', () => {
   });
 });
 
+// ---------------------------------------------------------------------------------------------------------- R67
+
+describe('SageUnit: the engine stopped (ruling R67)', () => {
+  it('a fault shows ENGINE STOPPED (the LCD and the card, with the POWER hint), ends the take and disables the pod', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()) });
+    await powerOn(r);
+    const halt = vi.spyOn(r.unit.recorder!, 'halt');
+    let changes = 0;
+    r.unit.onChange(() => changes++);
+    expect(r.unit.engineStopped).toBe(false);
+    r.engine.emit({ t: 'fault', message: 'mixer broke' });
+    expect(r.unit.engineStopped).toBe(true);
+    expect(r.unit.resumePrompt).toBe('stopped');
+    expect(r.unit.controller!.message).toBe('ENGINE STOPPED');
+    expect(halt).toHaveBeenCalled(); // no statuses will come: stop() would wait for them
+    expect(r.pods[0]!.enabled.at(-1)).toBe(false);
+    expect(changes).toBeGreaterThan(0);
+    r.engine.setNeedsResume(true); // lost audio as well: the stopped engine is what the card says
+    expect(r.unit.resumePrompt).toBe('stopped');
+  });
+
+  it('POWER off after a fault marks no clean shutdown (nor does a later pagehide): the next power-on offers RECOVER?', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()) });
+    await powerOn(r);
+    r.unit.controller!.setParam('track.*.pan', 25, 0); // unsaved work
+    await r.unit.controller!.checkpointNow(); // as the 2 s timer or a hide would have
+    r.engine.emit({ t: 'fault', message: 'mixer broke' });
+    const clean = vi.spyOn(r.stores.recovery, 'markCleanShutdown');
+    r.unit.tap(); // the hint: switch POWER off...
+    await r.unit.settled();
+    expect(r.unit.state).toBe('off');
+    r.win.dispatchEvent(new Event('pagehide'));
+    await sleep(10);
+    expect(clean).not.toHaveBeenCalled();
+    expect(await r.stores.recovery.needsRecovery()).toBe(true);
+    await powerOn(r); // ...and on again
+    expect(r.unit.engineStopped).toBe(false);
+    expect(r.unit.resumePrompt).toBe('none');
+    expect(r.unit.menu!.top.title).toBe('RECOVER');
+  });
+
+  it('a fault while booting still shows ENGINE STOPPED once on', async () => {
+    const r = await rig({ seed: (s) => s.system.save(calibrated()), bootMs: 60 });
+    r.unit.tap();
+    await sleep(30);
+    r.engine.emit({ t: 'fault', message: 'early' });
+    await r.unit.settled();
+    expect(r.unit.state).toBe('on');
+    expect(r.unit.engineStopped).toBe(true);
+    expect(r.unit.controller!.message).toBe('ENGINE STOPPED');
+  });
+});
+
 // ---------------------------------------------------------------------------------------------------------- R68
 
 describe('SageUnit: an unanswered RECOVER? (ruling R68)', () => {
