@@ -1,6 +1,6 @@
 # Sage MK1
 
-Sage MK1 is a software loop station for voice and beatbox looping. It is a browser recreation of the Boss RC-505mkII 5-track tabletop looper, written in TypeScript with Web Audio and no UI framework. It runs full screen on an iPad, added to the Home Screen, and on a desktop browser with the computer keyboard.
+Sage MK1 is a software looper for voice and beatbox. It is a browser recreation of the Boss RC-505mkII 5-track tabletop looper, written in TypeScript with Web Audio and no UI framework. It runs full screen on an iPad, added to the Home Screen, and on a desktop browser with the computer keyboard.
 
 This is an unofficial fan project. It is not made by, affiliated with or endorsed by Roland Corporation or BOSS. The name Sage MK1 is the project's own; the panel artwork, LCD fonts and icons are drawn from scratch, and no Roland content is copied. See [CREDITS.md](CREDITS.md).
 

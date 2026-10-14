@@ -15,7 +15,7 @@ export default defineConfig({
       manifest: {
         name: 'Sage MK1',
         short_name: 'Sage MK1',
-        description: 'A 5-track tabletop loop station for the browser.',
+        description: 'A 5-track looper for voice and beatbox, in the browser.',
         // iPadOS ignores fullscreen and orientation, and falls back to standalone anyway.
         display: 'standalone',
         theme_color: '#0b0b0c',
