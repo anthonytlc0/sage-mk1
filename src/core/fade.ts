@@ -18,18 +18,20 @@ export function fadeTimeFrames(sr: number, bpm: number, beat: Beat, f: FadeTime)
 }
 
 /**
- * Input gain `j` frames after a punch-in: rises linearly from 0 (at the press) to 1 at `xf` frames, then stays 1.
+ * Input gain `j` frames after a punch-in: rises linearly from 0 (at the press) to 1 at `xf` frames, then stays 1. Before
+ * the press (`j` < 0: input still on its way through the latency pipeline from before it) it is 0.
  */
 export function punchInGain(j: number, xf: number): number {
-  return j >= xf ? 1 : j / xf;
+  return j >= xf ? 1 : j <= 0 ? 0 : j / xf;
 }
 
 /**
  * Input gain of a punch-out tail with `left` of its `xf` frames still to write: 1 on the first frame after the press,
- * falling linearly to 1/xf on the last. Paired with `punchInGain` the two sum to 1 across a press.
+ * falling linearly to 1/xf on the last. Paired with `punchInGain` the two sum to 1 across a press. More than `xf` left
+ * (a tail still carrying the input heard before the press, through the latency pipeline) is 1.
  */
 export function punchOutGain(left: number, xf: number): number {
-  return left / xf;
+  return left >= xf ? 1 : left / xf;
 }
 
 /**

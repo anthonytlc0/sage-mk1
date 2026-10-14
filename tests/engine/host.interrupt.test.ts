@@ -386,7 +386,11 @@ describe('EngineHost and SageProcessor timelines', () => {
     const reply = rig.events.find((e): e is Extract<EngineEvent, { t: 'tracks' }> => e.t === 'tracks')!;
     const t = reply.tracks[0]!;
     expect(t.L.length).toBe(4800);
-    expect(t.L[1000]).toBeCloseTo(0.25, 5); // core frame 25000 (the first 5 ms hold the seam crossfade)
+    // Core frame 25000 as heard (the first 5 ms hold the seam crossfade). Its input arrived a round trip later (the
+    // latency pipeline, Task 9): the host's estimate, outputLatency + baseLatency = 1200 frames.
+    const rt = rig.host.latency().roundTripFrames;
+    expect(rt).toBe(1200);
+    expect(t.L[1000]).toBeCloseTo((25000 + rt) / 100000, 5);
     // The last status followed core frame 48000 (60 x 800): on the context's timeline that is base + 48000.
     expect(statuses(rig).at(-1)!.frame).toBe(base + 48000);
   });

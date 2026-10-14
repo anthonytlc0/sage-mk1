@@ -10,11 +10,23 @@
  *
  * ALL START/STOP, the SINGLE change and MEMORY FULL's reclaiming of undo history span tracks, so they live here.
  *
+ * Task 9 adds, each in its own module where it can be:
+ *  - the GUIDE click (guide.ts) on `out.click` while the rhythm is on (RHYTHM START/STOP cycles off -> on -> off; the
+ *    phase 3 rhythm adds standby);
+ *  - each track's input (inputs.ts): its INPUT routing (MIC 1, RHYTHM when RHYTHM OUT is LOOP) and BOUNCE;
+ *  - AUTO REC: the core listens to the mic for each waiting track and starts it on the frame the input reaches SENS;
+ *  - the latency pipeline: a command is applied when it arrives (or at its frame, if that is later) but counts as heard
+ *    at `at` (or, undated, at frame - outputLatencyFrames); the tracks write the input arriving at frame f where the
+ *    timeline was at f - roundTripFrames (track.ts). The rhythm bus and BOUNCE's playback reach the inputs through
+ *    delay rings of the same round trip.
+ *
  * `process` allocates nothing apart from the tracks' 1-second recording chunks. Command and settings handling may
  * allocate a little (a fresh take shell when a track is cleared, the undo history's snapshots), but only once per user
  * action.
  */
 import { ChunkPool } from './chunks';
+import { GuideClick } from './guide';
+import { InputRouter } from './inputs';
 import { Transport } from './transport';
 import { xfadeFrames } from './fade';
 import { LoopSync } from './sync';
@@ -31,9 +43,14 @@ import type { EngineCommand, EngineMessage, EngineStatus, TrackAudio } from '../
 export interface CoreConfig {
   sampleRate: number;
   memoryBudgetBytes: number;
+  /**
+   * Read loaded audio in place instead of copying it into the pool (`AudioTake.view`): for an offline render
+   * (renderMix), whose arrays outlive the core and whose loops only play. Off for the engine.
+   */
+  inPlaceLoads?: boolean;
 }
 
-/** Per-track stereo output (after PLAY LEVEL, PAN and the start/stop fades) and the guide click. */
+/** Per-track stereo output (after PLAY LEVEL, PAN and the start/stop fades) and the GUIDE click (the rhythm bus). */
 export interface CoreOutput {
   tracks: [Float32Array, Float32Array][];
   click: [Float32Array, Float32Array];
@@ -50,6 +67,15 @@ const QUEUE_CAPACITY = 64;
 const MESSAGE_CAPACITY = 8;
 /** The order in which undo history gives way when the memory budget runs out: the least useful first. */
 const RECLAIM_ORDER: readonly SnapSlot[] = ['redo', 'mark', 'recBack', 'undo'];
+/** INFERRED: the longest round trip taken, in seconds (a Bluetooth headset is a few hundred ms). */
+const MAX_LATENCY_SECONDS = 1;
+/** AUTO REC: SENS 1-100 maps to an input peak of SENS / 100 x this (INFERRED: SENS 50 is -12 dBFS, SENS 100 -6 dBFS). */
+const AUTO_REC_FULL_SCALE = 0.5;
+
+/** A latency in whole frames, 0..max: anything not a positive number is 0. */
+function latencyFrames(v: number, max: number): number {
+  return Number.isFinite(v) && v > 0 ? Math.min(max, Math.round(v)) : 0;
+}
 
 export class LooperCore {
   /** The five tracks, in order. Exposed for the engine's later tasks and for tests. */
@@ -60,17 +86,33 @@ export class LooperCore {
   private readonly transport: Transport;
   private readonly sync: LoopSync;
   private memory: MemorySettings;
-  /** Kept for the input routing and the click (Task 9). */
+  /** For the input routing (RHYTHM OUT). */
   private system: SystemSettings;
   private _frame = 0;
-  /** Round-trip and output latency in frames. Stored now; the latency pipeline (Task 9) uses them. */
+  /**
+   * The latency pipeline: the round trip (input arriving at frame f was heard at f - roundTripFrames) and the output
+   * latency (an undated command was heard at frame - outputLatencyFrames), in frames.
+   */
   private roundTripFrames = 0;
   private outputLatencyFrames = 0;
+  private readonly maxLatency: number;
+  /** What the tracks read as `host.lead`: the round trip, or while a command applies, its own (see TrackHost). */
+  private lead = 0;
 
-  /** Commands sorted by frame; equal frames keep arrival order. */
+  /** Commands sorted by frame; equal frames keep arrival order. Each keeps the frame it was heard at. */
   private readonly queueAt = new Float64Array(QUEUE_CAPACITY);
+  private readonly queueHeard = new Float64Array(QUEUE_CAPACITY);
   private readonly queueCmd: (EngineCommand | null)[] = new Array<EngineCommand | null>(QUEUE_CAPACITY).fill(null);
   private queueLength = 0;
+  /** The heard frame of the command `dequeue` just returned. */
+  private dueHeard = 0;
+
+  private readonly click: GuideClick;
+  private readonly router: InputRouter;
+  /** The input the next track renders with (`route`), and which tracks render after the others this span. */
+  private inSelL: Float32Array;
+  private inSelR: Float32Array;
+  private readonly late: Uint8Array;
 
   private readonly messages: EngineMessage[] = new Array<EngineMessage>(MESSAGE_CAPACITY).fill('MEMORY FULL');
   private messageCount = 0;
@@ -81,6 +123,12 @@ export class LooperCore {
     this.pool = new ChunkPool(cfg.sampleRate, cfg.memoryBudgetBytes);
     this.transport = new Transport(cfg.sampleRate);
     this.sync = new LoopSync(this.transport);
+    this.maxLatency = Math.round(MAX_LATENCY_SECONDS * cfg.sampleRate);
+    this.click = new GuideClick(cfg.sampleRate);
+    this.router = new InputRouter(TRACKS.length, this.maxLatency);
+    this.inSelL = this.router.silence;
+    this.inSelR = this.router.silence;
+    this.late = new Uint8Array(TRACKS.length);
     // Guide defaults until the engine hands over the real settings.
     this.memory = defaultMemory();
     this.system = defaultSystem();
@@ -102,6 +150,13 @@ export class LooperCore {
       },
       singleChange: (self, now) => this.singleChange(self, now),
       singleStarted: (self) => this.singleStarted(self),
+      get lag(): number {
+        return core.roundTripFrames;
+      },
+      get lead(): number {
+        return core.lead;
+      },
+      inPlaceLoads: cfg.inPlaceLoads === true,
     };
     this.tracks = TRACKS.map((i) => new Track(i, host));
     this.sync.attach(this.tracks);
@@ -125,9 +180,16 @@ export class LooperCore {
     this.applySettings(memory, system, this._frame);
   }
 
+  /**
+   * The latency pipeline's figures, in frames (whole, 0 up to a second; anything else counts as 0): the round trip
+   * (the engine's calibrated SETUP LATENCY, or its estimate) and the output latency. Recordings and overdubs then
+   * write the input arriving at frame f where the timeline was at f - roundTripFrames (see track.ts), and an undated
+   * command counts as heard at frame - outputLatencyFrames.
+   */
   setLatency(roundTripFrames: number, outputLatencyFrames: number): void {
-    this.roundTripFrames = roundTripFrames;
-    this.outputLatencyFrames = outputLatencyFrames;
+    this.roundTripFrames = latencyFrames(roundTripFrames, this.maxLatency);
+    this.outputLatencyFrames = latencyFrames(outputLatencyFrames, this.maxLatency);
+    this.lead = this.roundTripFrames;
   }
 
   /**
@@ -141,23 +203,29 @@ export class LooperCore {
    * (INFERRED: 64 pending commands never happen at human speed).
    */
   command(cmd: EngineCommand, at?: number | null): void {
-    const f = at === null || at === undefined || !Number.isFinite(at) ? this._frame : Math.round(at);
-    if (this.queueLength === QUEUE_CAPACITY) this.apply(this.dequeue(), this._frame);
+    const dated = at !== null && at !== undefined && Number.isFinite(at);
+    const f = dated ? Math.round(at) : this._frame;
+    // The latency pipeline: when the press was heard, for what it records (`at`, or what was playing out just now).
+    const heard = dated ? f : this._frame - this.outputLatencyFrames;
+    if (this.queueLength === QUEUE_CAPACITY) this.apply(this.dequeue(), this._frame, this.dueHeard);
     let i = this.queueLength;
     while (i > 0 && this.queueAt[i - 1] > f) {
       this.queueAt[i] = this.queueAt[i - 1];
+      this.queueHeard[i] = this.queueHeard[i - 1];
       this.queueCmd[i] = this.queueCmd[i - 1];
       i--;
     }
     this.queueAt[i] = f;
+    this.queueHeard[i] = heard;
     this.queueCmd[i] = cmd;
     this.queueLength++;
     this.applyDue(this._frame);
   }
 
   /**
-   * Render `n` frames. Commands due inside the block are applied at their exact frame, splitting the block there.
-   * `rhythmL`/`rhythmR` (the click, for the RHYTHM input) are unused until input routing arrives (Task 9).
+   * Render `n` frames. Commands due inside the block are applied at their exact frame, splitting the block there, and
+   * so is an AUTO REC trigger. `inL`/`inR` is the mic (the MIC 1 route); `rhythmL`/`rhythmR` an external rhythm for the
+   * RHYTHM route (silent in phase 1: the GUIDE click is the core's own, in `out.click`, and reaches that route too).
    */
   process(
     inL: Float32Array,
@@ -167,30 +235,104 @@ export class LooperCore {
     out: CoreOutput,
     n: number,
   ): void {
-    void rhythmL;
-    void rhythmR;
-    out.click[0].fill(0, 0, n);
-    out.click[1].fill(0, 0, n);
     const tracks = this.tracks;
+    const router = this.router;
+    router.ensure(n, this.roundTripFrames);
     let pos = 0;
     while (pos < n) {
-      this.applyDue(this._frame + pos);
+      const f = this._frame + pos;
+      this.applyDue(f);
       // A SINGLE start due here fires before any track renders this frame (it stops the other SINGLE tracks).
-      for (let i = 0; i < tracks.length; i++) tracks[i].fireSingleStart(this._frame + pos);
+      for (let i = 0; i < tracks.length; i++) tracks[i].fireSingleStart(f);
       let end = n;
       if (this.queueLength > 0) end = Math.min(n, this.queueAt[0] - this._frame);
       for (let i = 0; i < tracks.length; i++) {
         const due = tracks[i].singleArmFrame - this._frame;
         if (due > pos && due < end) end = due;
       }
-      for (let i = 0; i < tracks.length; i++) {
-        const o = out.tracks[i];
-        tracks[i].render(inL, inR, o[0], o[1], pos, end, this._frame);
+      end = this.autoRec(inL, inR, pos, end);
+      // The GUIDE click, and the rhythm bus that RHYTHM-routed tracks record.
+      this.click.render(this.transport, f, end - pos, out.click[0], out.click[1], pos);
+      router.pushRhythm(f, out.click[0], out.click[1], rhythmL, rhythmR, pos, end);
+      // Tracks that record others' playback (BOUNCE) render after the rest, so that playback is there to record.
+      const late = this.late;
+      for (let i = 0; i < tracks.length; i++) late[i] = tracks[i].wantsInput && this.bounces(i) ? 1 : 0;
+      for (let pass = 0; pass < 2; pass++) {
+        for (let i = 0; i < tracks.length; i++) {
+          if (late[i] !== pass) continue;
+          const o = out.tracks[i];
+          this.route(i, inL, inR, pos, end, f);
+          tracks[i].render(this.inSelL, this.inSelR, o[0], o[1], pos, end, this._frame);
+          router.pushTrack(i, f, o[0], o[1], pos, end);
+        }
       }
       pos = end;
     }
     this._frame += n;
     this.applyDue(this._frame); // commands landing exactly on the next block's first frame
+  }
+
+  /**
+   * AUTO REC: a waiting track starts recording on the first frame of `[pos, end)` where the mic reaches its SENS
+   * (either sign, either channel; the mic, not what BOUNCE would add: the guide's "input from the mic or guitar"). A
+   * trigger at `pos` starts it now; a later one ends the span there. Returns the span's end.
+   */
+  private autoRec(inL: Float32Array, inR: Float32Array, pos: number, end: number): number {
+    const tracks = this.tracks;
+    // INFERRED: the guide gives SENS 1-100 and no level; SENS / 100 x 0.5 of full scale.
+    const thr = (this.memory.rec.autoRecSens / 100) * AUTO_REC_FULL_SCALE;
+    for (let i = 0; i < tracks.length; i++) {
+      if (!tracks[i].autoRecWaiting) continue;
+      let k = pos;
+      while (k < end && !(inL[k] >= thr || inL[k] <= -thr || inR[k] >= thr || inR[k] <= -thr)) k++;
+      if (k === end) continue;
+      if (k > pos) {
+        end = k;
+        continue;
+      }
+      // The frame arriving now is the loop's first: no input of it was heard before the start.
+      this.lead = 0;
+      try {
+        tracks[i].autoRecStart(this._frame + pos);
+      } finally {
+        this.lead = this.roundTripFrames;
+      }
+    }
+    return end;
+  }
+
+  /** Track `i` records the playback of other tracks: its BOUNCE IN, or BOUNCE SW. */
+  private bounces(i: number): boolean {
+    return this.memory.track[i]?.bounceIn === true || this.memory.rec.bounceSw === true;
+  }
+
+  /**
+   * Pick track `i`'s input for `[a, b)` (timeline frame `f` at `a`) into `inSelL`/`inSelR`: the mic as it is when the
+   * track routes only MIC 1, silence when it routes nothing, else a mix the router builds (see inputs.ts). A track
+   * that writes nothing in the span gets the mic, unused.
+   */
+  private route(i: number, inL: Float32Array, inR: Float32Array, a: number, b: number, f: number): void {
+    this.inSelL = inL;
+    this.inSelR = inR;
+    const cfg = this.memory.track[i];
+    if (cfg === undefined || !this.tracks[i].wantsInput) return;
+    const mic = cfg.input.MIC1 !== false;
+    const rhythm = cfg.input.RHYTHM === true && this.system.output.routing.rhythmOut === 'LOOP';
+    let sources = 0;
+    if (this.bounces(i)) {
+      const sel = this.memory.rec.bounceTrack;
+      for (let j = 0; j < this.tracks.length; j++) if (j !== i && sel[j] === true) sources |= 1 << j;
+    }
+    if (!rhythm && sources === 0) {
+      if (!mic) {
+        this.inSelL = this.router.silence;
+        this.inSelR = this.router.silence;
+      }
+      return;
+    }
+    this.router.build(i, f, a, b, this.roundTripFrames, mic, inL, inR, rhythm, sources);
+    this.inSelL = this.router.inputL(i);
+    this.inSelR = this.router.inputR(i);
   }
 
   /**
@@ -232,8 +374,22 @@ export class LooperCore {
     this.tracks[i]?.load(a);
   }
 
-  /** Apply `cmd` at timeline frame `now`. */
-  private apply(cmd: EngineCommand, now: number): void {
+  /**
+   * Apply `cmd` at timeline frame `now`. It was heard at `heard` (<= now): the tracks' `lead` is how much of the input
+   * from now on still belongs to before it (the latency pipeline), 0 when it was heard a round trip or more ago.
+   */
+  private apply(cmd: EngineCommand, now: number, heard: number): void {
+    const rt = this.roundTripFrames;
+    const lead = heard + rt - now;
+    this.lead = lead < 0 ? 0 : lead > rt ? rt : lead;
+    try {
+      this.applyCommand(cmd, now);
+    } finally {
+      this.lead = this.roundTripFrames;
+    }
+  }
+
+  private applyCommand(cmd: EngineCommand, now: number): void {
     switch (cmd.t) {
       case 'recPlay':
         this.tracks[cmd.track]?.recPlay(now);
@@ -385,14 +541,19 @@ export class LooperCore {
 
   /** Apply, in order, every queued command dated at or before `frame`. */
   private applyDue(frame: number): void {
-    while (this.queueLength > 0 && this.queueAt[0] <= frame) this.apply(this.dequeue(), frame);
+    while (this.queueLength > 0 && this.queueAt[0] <= frame) {
+      const cmd = this.dequeue();
+      this.apply(cmd, frame, this.dueHeard);
+    }
   }
 
   private dequeue(): EngineCommand {
     const cmd = this.queueCmd[0]!;
+    this.dueHeard = this.queueHeard[0];
     const len = this.queueLength - 1;
     for (let i = 0; i < len; i++) {
       this.queueAt[i] = this.queueAt[i + 1];
+      this.queueHeard[i] = this.queueHeard[i + 1];
       this.queueCmd[i] = this.queueCmd[i + 1];
     }
     this.queueCmd[len] = null;

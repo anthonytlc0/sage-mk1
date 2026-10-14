@@ -45,7 +45,7 @@ export function phraseOffset(frame: number, origin: number, len: number): number
 }
 
 export class LoopSync {
-  /** The rhythm flag (controller ruling R2: on/off only; the click is Task 9). */
+  /** The rhythm flag (controller ruling R2: on/off; the core plays the GUIDE click while it is on, guide.ts). */
   rhythm: 'off' | 'on' = 'off';
 
   private readonly transport: Transport;

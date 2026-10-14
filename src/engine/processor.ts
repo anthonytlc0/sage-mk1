@@ -14,8 +14,8 @@
  *     logged and reported as an `ENGINE ERROR` message, with everything put back on the last good settings, so it
  *     cannot stop the processor (a browser never calls a processor again after it throws);
  *  2. the mic input chain (MIC 1 IN gain and mute, EQ, comp, noise suppressor);
- *  3. the looper core (each track after PLAY LEVEL, PAN and fades; the guide click). Its RHYTHM inputs are silent
- *     until input routing lands (Task 9). If its render throws (a dated command it applies there, which is then out of
+ *  3. the looper core (each track after PLAY LEVEL, PAN and fades; the GUIDE click, which the core also routes to
+ *     RHYTHM-routed tracks itself). Its external rhythm inputs are silent (the phase 3 rhythm). If its render throws (a dated command it applies there, which is then out of
  *     its queue), that block's tracks are silent and the rest of the block renders; the first failure of a run is
  *     logged and ENGINE ERROR is reported at most once a second, with nothing allocated per failed block. The core's
  *     frame counter is private and only a completed render advances it, so a failed block leaves it one block behind;
@@ -43,7 +43,9 @@
  * (a recording's seam crossfade, an overdub's punch-out). After a real interruption the input that follows is audio
  * from after the context came back, and writing it as if it continued the pass would splice unrelated sound into the
  * loop. So for the 5 ms after an interrupt the core records silence and the tails fade to it. Only the core's input is
- * gated: the monitor and recorder buses keep the live mic.
+ * gated: the monitor and recorder buses keep the live mic. With latency the core's writes lag by the round trip, and a
+ * punch-out may still be waiting for up to a round trip of input heard before it: the core's interrupt cuts every such
+ * write back to its 5 ms fade (track.ts `cutPendingWrites`), so this gate still covers all that is written after it.
  */
 
 import type { AudioTake } from '../core/chunks';

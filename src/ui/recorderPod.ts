@@ -23,7 +23,7 @@
 
 import './recorderPod.css';
 import type { Controller } from '../control/controller';
-import { NothingToMixError, exportLoopMix } from '../recorder/loopMix';
+import { NothingToMixError, exportLoopMix, mixCutNote } from '../recorder/loopMix';
 import type { RenderMixFn } from '../recorder/loopMix';
 import { formatClock, mixFilename, takeFilename } from '../recorder/names';
 import type { Recorder, RecorderEvent } from '../recorder/recorder';
@@ -34,7 +34,7 @@ import type { TakeInfo } from '../storage/takes';
 import { TakePlayer } from './takePlayer';
 
 export interface RecorderPodOptions {
-  /** The mixer behind LOOP MIX: Task 9's `renderMix`. Null until it exists: LOOP MIX then says NOT READY (ruling R56). */
+  /** The mixer behind LOOP MIX: Task 9's `mixRenderer` (the app's renderAdapter). Null: LOOP MIX says NOT READY (R56). */
   render: RenderMixFn | null;
   /** Most bytes of take Blobs kept ready for SAVE and play. Default 64 MB (`DEFAULT_CACHE_BYTES`). */
   cacheBytes?: number;
@@ -468,9 +468,11 @@ export function mountRecorderPod(root: HTMLElement, recorder: Recorder, controll
     syncMix();
     try {
       await afterPaint(); // the label shows before the render takes the thread
-      const blob = await exportLoopMix(controller, render);
+      let cut: number | null = null;
+      const blob = await exportLoopMix(controller, render, { onCut: (s) => (cut = s) });
       if (disposed) return;
       mix = { phase: 'ready', blob, at: Date.now(), saving: false };
+      if (cut !== null) setNote(mixCutNote(cut), 6000); // a touch device caps the mix (ruling R63)
     } catch (e) {
       if (!(e instanceof NothingToMixError)) console.error('loop mix failed', e);
       mix = { phase: 'idle', blob: null, at: 0, saving: false };
