@@ -8,7 +8,7 @@
  * iPad is, and keeps what is shared). It comes back through the file picker (`setFiles` on the file chooser).
  */
 import { expect, test } from '@playwright/test';
-import { FONT_LARGE, FONT_SMALL } from '../../src/lcd/fonts';
+import { FONT_LARGE, FONT_MEDIUM, FONT_SMALL } from '../../src/lcd/fonts';
 import type { ButtonId } from '../../src/shared/ids';
 import { lcdShows, menuDepth, openApp, topScreen } from './app';
 import { fakeMic } from './fakeMic';
@@ -61,8 +61,12 @@ test('EXPORT MEMORY, CLEAR, IMPORT into memory 04: the track lengths and PAN com
   expect(await topProp<number>(page, 'selected')).toBe(0); // EXPORT MEMORY
   await panel.press('enter');
   await expect.poll(() => topProp<string | null>(page, 'prompt'), { timeout: 20_000 }).toBe('READY: ENTER=SAVE');
+  // the popup, as the LCD shows it: READY: ENTER=SAVE wrapped onto two lines
+  await expect.poll(() => lcdShows(page, 'READY:', FONT_MEDIUM)).toBe(true);
+  expect(await lcdShows(page, 'ENTER=SAVE', FONT_MEDIUM)).toBe(true);
   const file = await captureSave(page, browserName, () => panel.press('enter'));
   expect(file.name).toBe('sage-mk1-m01.sagemk1');
+  if (browserName === 'webkit') expect(file.via).toBe('pointerup'); // shared inside ENTER's own tap (it acts on release)
   expect(file.bytes.length).toBeGreaterThan(1000);
   await expect.poll(() => topProp<string | null>(page, 'prompt')).toBe(null); // back to the list
   await backToPlay();
@@ -90,7 +94,6 @@ test('EXPORT MEMORY, CLEAR, IMPORT into memory 04: the track lengths and PAN com
   await expect.poll(() => lcdShows(page, '04', FONT_LARGE)).toBe(true);
   await panel.press('enter');
   await expect.poll(() => topProp<number | null>(page, 'importSlot'), { timeout: 20_000 }).toBe(null); // done: the list again
-  expect((await tracks(page)).map((t) => t.state)).toEqual(['empty', 'empty', 'empty', 'empty', 'empty']); // memory 01 untouched
   await backToPlay();
 
   // Memory 04 on the MEMORY knob: the two phrases at their lengths, and PAN L5.
@@ -104,4 +107,12 @@ test('EXPORT MEMORY, CLEAR, IMPORT into memory 04: the track lengths and PAN com
 
   await panel.press('trk1.track'); // the TRACK screen shows it too
   await expect.poll(() => lcdShows(page, 'L5', FONT_SMALL)).toBe(true);
+  await backToPlay();
+
+  // Memory 01, loaded again from storage: still empty, so the import went to 04 only.
+  await panel.turn('knob1', -3);
+  await expect.poll(async () => (await session(page)).slot).toBe(1);
+  await expect.poll(() => lcdShows(page, '01', FONT_LARGE)).toBe(true);
+  await expect.poll(async () => (await tracks(page)).map((t) => [t.state, t.length])).toEqual([['empty', 0], ['empty', 0], ['empty', 0], ['empty', 0], ['empty', 0]]);
+  expect(await session(page)).toMatchObject({ slot: 1, dirty: false, pan: [0, 0, 0, 0, 0] });
 });

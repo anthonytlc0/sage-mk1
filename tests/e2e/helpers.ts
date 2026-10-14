@@ -16,6 +16,7 @@ import type { ButtonId, EncoderId } from '../../src/shared/ids';
 import type { TrackState } from '../../src/shared/protocol';
 import { DETENT_PX } from '../../src/ui/input/gestures';
 import { ledColor, menuDepth, powerState, powerSwitch, pressControl, tap, topScreen } from './app';
+import { fingers } from './touch';
 
 /** Node's Buffer (the specs run in Node; the project has no Node typings). */
 declare const Buffer: {
@@ -85,7 +86,7 @@ export const ledState = (page: Page, id: ButtonId): Promise<{ color: LedColor; b
  */
 export async function expectSteady(page: Page, id: ButtonId, color: LedColor, timeout = 10_000): Promise<void> {
   await expect.poll(() => ledState(page, id), { timeout, intervals: [20] }).toEqual({ color, blink: 'none' });
-  await expect.poll(() => ledColor(page, id), { intervals: [20] }).toBe(color);
+  await expect.poll(() => ledColor(page, id), { timeout, intervals: [20] }).toBe(color);
 }
 
 export const session = (page: Page): Promise<{ slot: number; dirty: boolean; pan: number[] }> =>
@@ -105,32 +106,6 @@ async function centre(page: Page, id: ButtonId | EncoderId): Promise<{ x: number
   const box = await page.locator(`[data-id="${id}"]`).boundingBox();
   if (!box) throw new Error(`${id} is not on screen`);
   return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
-}
-
-/**
- * Synthetic touch: a PointerEvent (pointerType 'touch', its own pointerId) on the element under the finger when it went
- * down, which stands in for the capture a real finger gets (setPointerCapture throws for a synthetic pointerId, which
- * the input layer tolerates). See input.spec.ts.
- */
-function finger(page: Page, type: 'pointerdown' | 'pointermove' | 'pointerup', id: number, x: number, y: number, primary: boolean): Promise<void> {
-  return page.evaluate(
-    ({ type, id, x, y, primary }) => {
-      const w = window as unknown as { __fingers?: Map<number, Element> };
-      const targets = (w.__fingers ??= new Map());
-      const fresh = document.elementFromPoint(x, y) ?? document.body;
-      const target = type === 'pointerdown' ? fresh : (targets.get(id) ?? fresh);
-      if (type === 'pointerdown') targets.set(id, target);
-      if (type === 'pointerup') targets.delete(id);
-      target.dispatchEvent(
-        new PointerEvent(type, {
-          pointerId: id, pointerType: 'touch', isPrimary: primary, clientX: x, clientY: y,
-          button: type === 'pointermove' ? -1 : 0, buttons: type === 'pointerup' ? 0 : 1,
-          width: 20, height: 20, bubbles: true, cancelable: true, composed: true,
-        }),
-      );
-    },
-    { type, id, x, y, primary },
-  );
 }
 
 let nextFinger = 100;
@@ -164,10 +139,13 @@ export class Panel {
       await m.up();
       return;
     }
+    // Down, move and up in one page round trip: a stall between them could pass HOLD_MS and make a push-and-turn.
     const f = nextFinger++;
-    await finger(this.page, 'pointerdown', f, p.x, p.y, true);
-    await finger(this.page, 'pointermove', f, p.x, p.y + dy, true);
-    await finger(this.page, 'pointerup', f, p.x, p.y + dy, true);
+    await fingers(this.page, [
+      { type: 'pointerdown', id: f, x: p.x, y: p.y, primary: true },
+      { type: 'pointermove', id: f, x: p.x, y: p.y + dy, primary: true },
+      { type: 'pointerup', id: f, x: p.x, y: p.y + dy, primary: true },
+    ]);
   }
 
   /** EXIT and ENTER pressed together (Owner's Manual p. 12): two fingers on the iPad, Esc + Enter on the desktop. */
@@ -183,24 +161,30 @@ export class Panel {
     const a = await centre(this.page, 'exit');
     const b = await centre(this.page, 'enter');
     const fa = nextFinger++, fb = nextFinger++;
-    await finger(this.page, 'pointerdown', fa, a.x, a.y, true);
-    await finger(this.page, 'pointerdown', fb, b.x, b.y, false);
-    await finger(this.page, 'pointerup', fb, b.x, b.y, false);
-    await finger(this.page, 'pointerup', fa, a.x, a.y, true);
+    await fingers(this.page, [
+      { type: 'pointerdown', id: fa, x: a.x, y: a.y, primary: true },
+      { type: 'pointerdown', id: fb, x: b.x, y: b.y, primary: false },
+      { type: 'pointerup', id: fb, x: b.x, y: b.y, primary: false },
+      { type: 'pointerup', id: fa, x: a.x, y: a.y, primary: true },
+    ]);
   }
 }
 
 // ------------------------------------------------------------------------------------------------ flows
 
-/** POWER on (a returning page has no CALIBRATE? offer; a fresh one does, and it is dismissed with EXIT). */
+/**
+ * POWER on (a returning page has no CALIBRATE? offer; a fresh one does, and it is dismissed with EXIT). The wait is
+ * generous: the 3 s product bound is power.spec's to check, under its own measurement; here a loaded machine only
+ * has to get there.
+ */
 export async function powerOn(page: Page, browserName: string, dismiss: () => Promise<void>): Promise<void> {
   await tap(page, powerSwitch(page), browserName);
-  await expect.poll(() => powerState(page), { timeout: 5000, intervals: [20] }).toBe('on');
+  await expect.poll(() => powerState(page), { timeout: 20_000, intervals: [20] }).toBe('on');
   if ((await topScreen(page)) === 'LATENCY') {
     await dismiss(); // the first-run CALIBRATE? offer: EXIT
     await expect.poll(() => menuDepth(page)).toBe(1);
   }
-  await expect.poll(async () => (await page.evaluate(() => window.__sage!.unit.controller?.status !== null))).toBe(true);
+  await expect.poll(async () => (await page.evaluate(() => window.__sage!.unit.controller?.status != null))).toBe(true);
 }
 
 /**
@@ -250,10 +234,20 @@ export async function stopTrack(page: Page, k: number, press: () => Promise<void
  * The iPad's share sheet, for `page.addInitScript`: a touch device (maxTouchPoints 5, as an iPad reports) whose
  * `navigator.share` takes the files and keeps their bytes (base64) in `window.__shared`, as if saved to Files. With it
  * `saveFile` takes the same path as on the iPad. Serialised into the page: it must not use anything outside its body.
+ *
+ * Like the real one, it refuses (NotAllowedError, kept in `window.__shareRefused`) a call made without a user
+ * activation, so a `saveFile` moved out of the tap fails the spec. `navigator.userActivation.isActive` alone cannot
+ * show that under Playwright: its own page.evaluate calls grant an activation (about 5 s, in WebKit and Chromium
+ * alike), and the specs poll all the time. So the call must also come from inside the dispatch of a trusted input
+ * event: `window.event` is set only while an event listener runs, never after an await.
  */
 export function fakeShareSheet(): void {
-  const shared: { name: string; type: string; b64: string }[] = [];
-  (window as unknown as { __shared: typeof shared }).__shared = shared;
+  const shared: { name: string; type: string; b64: string; via: string }[] = [];
+  const refused: string[] = [];
+  const w = window as unknown as { __shared: typeof shared; __shareRefused: string[] };
+  w.__shared = shared;
+  w.__shareRefused = refused;
+  const GESTURES = ['pointerdown', 'pointerup', 'touchend', 'mousedown', 'mouseup', 'click', 'keydown', 'keyup'];
   Object.defineProperty(Navigator.prototype, 'maxTouchPoints', { get: () => 5, configurable: true });
   Object.defineProperty(Navigator.prototype, 'canShare', {
     value: (data?: { files?: File[] }) => Array.isArray(data?.files) && data.files.length > 0,
@@ -261,13 +255,22 @@ export function fakeShareSheet(): void {
     writable: true,
   });
   Object.defineProperty(Navigator.prototype, 'share', {
-    value: async (data: { files: File[] }) => {
-      for (const f of data.files) {
-        const bytes = new Uint8Array(await f.arrayBuffer());
-        let s = '';
-        for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-        shared.push({ name: f.name, type: f.type, b64: btoa(s) });
+    value: (data: { files: File[] }): Promise<void> => {
+      const ev = (window as unknown as { event?: Event }).event;
+      const active = navigator.userActivation?.isActive === true;
+      if (!active || ev === undefined || !ev.isTrusted || !GESTURES.includes(ev.type)) {
+        refused.push(`activation ${active}, event ${ev ? `${ev.type} trusted ${ev.isTrusted}` : 'none'}`);
+        return Promise.reject(new DOMException('The request is not allowed by the user agent', 'NotAllowedError'));
       }
+      const via = ev.type;
+      return (async () => {
+        for (const f of data.files) {
+          const bytes = new Uint8Array(await f.arrayBuffer());
+          let s = '';
+          for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+          shared.push({ name: f.name, type: f.type, b64: btoa(s), via });
+        }
+      })();
     },
     configurable: true,
     writable: true,
@@ -277,6 +280,8 @@ export function fakeShareSheet(): void {
 /** A file the app saved: its name and bytes. */
 export interface SavedFile {
   name: string;
+  /** The input event `navigator.share` was called in (the iPad path), or null for a download. */
+  via: string | null;
   /** A Node Buffer (what `setInputFiles` takes). */
   bytes: Uint8Array;
 }
@@ -293,12 +298,18 @@ async function downloadBytes(download: Download): Promise<Uint8Array> {
  */
 export async function captureSave(page: Page, browserName: string, save: () => Promise<void>): Promise<SavedFile> {
   if (browserName === 'webkit') {
-    const before = await page.evaluate(() => (window as unknown as { __shared: unknown[] }).__shared.length);
+    type Sheet = { __shared: { name: string; b64: string; via: string }[]; __shareRefused: string[] };
+    const count = () => page.evaluate(() => {
+      const w = window as unknown as Sheet;
+      return { shared: w.__shared.length, refused: [...w.__shareRefused] };
+    });
+    const before = await count();
     await save();
-    await expect.poll(() => page.evaluate(() => (window as unknown as { __shared: unknown[] }).__shared.length)).toBe(before + 1);
-    const f = await page.evaluate((i) => (window as unknown as { __shared: { name: string; b64: string }[] }).__shared[i]!, before);
-    return { name: f.name, bytes: Buffer.from(f.b64, 'base64') };
+    await expect.poll(async () => { const c = await count(); return c.shared + c.refused.length; }).toBe(before.shared + before.refused.length + 1);
+    expect((await count()).refused, 'navigator.share was called without the tap\'s user activation').toEqual(before.refused);
+    const f = await page.evaluate((i) => (window as unknown as Sheet).__shared[i]!, before.shared);
+    return { name: f.name, via: f.via, bytes: Buffer.from(f.b64, 'base64') };
   }
   const [download] = await Promise.all([page.waitForEvent('download'), save()]);
-  return { name: download.suggestedFilename(), bytes: await downloadBytes(download) };
+  return { name: download.suggestedFilename(), via: null, bytes: await downloadBytes(download) };
 }

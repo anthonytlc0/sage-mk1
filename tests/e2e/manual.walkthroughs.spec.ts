@@ -142,13 +142,18 @@ test('p.10 multiple tracks in ascending order: each records, plays and overdubs 
   const len1 = await recordLoop(page, 0, 1, rec(panel, 0));
   await overdub(page, 0, 0.5, rec(panel, 0));
   const measure = await measureFrames(page);
-  expect(len1 / measure).toBeCloseTo(Math.round(len1 / measure * 4) / 4, 2); // a musical share of a measure
+  // The loop's length set the tempo: it is exactly the measures the engine reports (a 1 s loop is half a measure).
+  const m1 = (await tracks(page))[0]!.measures;
+  expect(m1).not.toBeNull();
+  expect(Math.abs(len1 - m1! * measure)).toBeLessThanOrEqual(1);
 
   for (const k of [1, 2]) {
     const len = await recordLoop(page, k, 1, rec(panel, k));
-    const measures = len / measure;
-    expect(Math.round(measures)).toBeGreaterThanOrEqual(1);
-    expect(Math.abs(len - Math.round(measures) * measure)).toBeLessThanOrEqual(2); // whole measures, to the frame
+    const measures = (await tracks(page))[k]!.measures;
+    expect(measures).not.toBeNull();
+    expect(Number.isInteger(measures)).toBe(true); // whole measures of track 1's grid
+    expect(measures).toBeGreaterThanOrEqual(1);
+    expect(Math.abs(len - measures! * measure)).toBeLessThanOrEqual(1); // to the frame
     await overdub(page, k, 0.5, rec(panel, k));
     // the tracks before it play on
     for (let j = 0; j < k; j++) {

@@ -42,16 +42,39 @@ test('a returning user: POWER lands on the play screen within 3 s; POWER off goe
 
   await page.reload();
   await page.waitForFunction(() => window.__sage !== undefined);
-  const t0 = Date.now();
+  // Timed in the page, from the tap's first input event to the first frame drawn with the unit on and the play screen
+  // up, so Playwright's own waits and round trips are not counted. The Playwright timeout only bounds the wait.
+  await page.evaluate(() => {
+    const boot: BootTiming = { tapAt: null, onAt: null };
+    (window as unknown as { __boot: BootTiming }).__boot = boot;
+    const sw = document.querySelector('.power-switch')!;
+    const first = (e: Event): void => {
+      boot.tapAt ??= e.timeStamp;
+    };
+    for (const type of ['pointerdown', 'touchstart', 'mousedown']) sw.addEventListener(type, first, { capture: true });
+    const frame = (t: number): void => {
+      const unit = window.__sage!.unit;
+      if (boot.tapAt !== null && unit.state === 'on' && unit.menu?.depth === 1) boot.onAt = t;
+      else requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  });
   await tap(page, powerSwitch(page), browserName);
   await expect
-    .poll(async () => (await powerState(page)) === 'on' && (await menuDepth(page)) === 1 && (await lcdShows(page, '120.0', FONT_SMALL)), {
-      timeout: 3000,
-      intervals: [50],
-    })
+    .poll(() => page.evaluate(() => (window as unknown as { __boot: BootTiming }).__boot.onAt !== null), { timeout: 10_000, intervals: [50] })
     .toBe(true);
-  expect(Date.now() - t0).toBeLessThan(3000);
+  const { tapAt, onAt } = await page.evaluate(() => (window as unknown as { __boot: BootTiming }).__boot);
+  test.info().annotations.push({ type: 'boot ms', description: (onAt! - tapAt!).toFixed(0) });
+  expect(onAt! - tapAt!).toBeGreaterThan(0);
+  expect(onAt! - tapAt!).toBeLessThan(3000);
+  await expect.poll(() => lcdShows(page, '120.0', FONT_SMALL)).toBe(true); // the play screen
 });
+
+/** When the tap began (its first input event) and the first frame with the unit on, both on the page's clock (ms). */
+interface BootTiming {
+  tapAt: number | null;
+  onAt: number | null;
+}
 
 test('trk1.rec with the fake mic: red while recording, green once the second press closes the loop', async ({ page, browserName }) => {
   await tap(page, powerSwitch(page), browserName);
