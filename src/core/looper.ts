@@ -378,6 +378,14 @@ export class LooperCore {
   }
 
   /**
+   * Offline renders only (LOOP MIX, ruling R64): start stopped track `i` playing at once from take position `pos` (see
+   * `Track.startAt`). The engine never calls this; a live start is a `recPlay`.
+   */
+  startTrackAt(i: TrackIndex, pos: number): void {
+    this.tracks[i]?.startAt(pos);
+  }
+
+  /**
    * Apply `cmd` at timeline frame `now`. It was heard at `heard` (<= now): the tracks' `lead` is how much of the input
    * from now on still belongs to before it (the latency pipeline), 0 when it was heard a round trip or more ago.
    */

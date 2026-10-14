@@ -2,11 +2,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cycleLength, lengthAfterRate, mixRenderer, renderMix } from '../../src/core/render';
 import { LooperCore } from '../../src/core/looper';
 import { RATE_MAX } from '../../src/core/track';
+import { Mixer } from '../../src/dsp/mixer';
 import { defaultMemory } from '../../src/schema/memory';
 import { defaultSystem } from '../../src/schema/system';
 import type { MemorySettings, SystemSettings, TrackSettings } from '../../src/schema/types';
 import type { TrackAudio } from '../../src/shared/protocol';
-import { XF } from './harness';
+import { makeOutput, run, XF } from './harness';
 
 const SR = 1000;
 const CAP = 10 * 60 * SR;
@@ -58,11 +59,10 @@ describe('renderMix: one full cycle', () => {
     expect(cycleLength([CAP + 5], CAP)).toBe(CAP); // never more than the cap
   });
 
-  it('all playing tracks start together and are summed; the cycle starts 5 ms in, past the start ramp', () => {
+  it('with no offsets, all playing tracks are at their start on the cycle\'s first frame, summed, past the start ramp', () => {
     const { L, R } = mix([audio(2000, (k) => 0.1 + k / 10000), audio(3000, (k) => -k / 20000)]);
     for (let f = 0; f < 6000; f += 101) {
-      const g = f + XF; // the tracks started together XF frames before the cycle's first frame
-      expect(L[f]).toBeCloseTo(0.1 + (g % 2000) / 10000 - (g % 3000) / 20000, 6);
+      expect(L[f]).toBeCloseTo(0.1 + (f % 2000) / 10000 - (f % 3000) / 20000, 6);
       expect(R[f]).toBeCloseTo(L[f], 9);
     }
   });
@@ -70,7 +70,7 @@ describe('renderMix: one full cycle', () => {
   it('its first frames are the steady state, so the cycle loops with no dip at its seam', () => {
     const t = audio(1000, (k) => 0.25 + k / 10000);
     const { L } = mix([t]);
-    for (let f = 0; f < 1000; f++) expect(L[f]).toBeCloseTo(t.L[(f + XF) % 1000], 6);
+    for (let f = 0; f < 1000; f++) expect(L[f]).toBeCloseTo(t.L[f], 6);
   });
 
   it('mixRenderer streams the very samples renderMix returns, whatever the chunk size', () => {
@@ -158,7 +158,8 @@ describe('renderMix: one full cycle', () => {
     const rev = mix([audio(1000, (k) => k / 1000)], track((s) => {
       s.reverse = true;
     }));
-    expect(rev.L[100]).toBeCloseTo((899 - XF) / 1000, 6);
+    expect(rev.L[0]).toBeCloseTo(0.999, 6);
+    expect(rev.L[100]).toBeCloseTo(0.899, 6);
     const once = mix([audio(1000, () => 0.5), audio(3000, () => 0)], track((s) => {
       s.oneShot = true;
     }));
@@ -186,7 +187,7 @@ describe('renderMix: tempo sync, as live', () => {
       m.track[0].tempoSyncMode = 'PITCH';
     });
     expect(r.L.length).toBe(1000);
-    for (let f = 0; f < 1000 - XF; f += 53) expect(r.L[f]).toBeCloseTo((2 * (f + XF)) / 10000, 5);
+    for (let f = 0; f < 1000; f += 53) expect(r.L[f]).toBeCloseTo((2 * f) / 10000, 5);
   });
 
   it('XFADE keeps the pitch where PITCH raises it', () => {
@@ -240,7 +241,21 @@ describe('renderMix: tempo sync, as live', () => {
     });
     const r = renderMix(memory, system, [t, null, null, null, null], [true, false, false, false, false], [1, 1, 1, 1, 1], SR, bpm);
     expect(r.L.length).toBe(T);
-    for (let f = 0; f < T; f += 113) expect(r.L[f]).toBe(t.L[(f + XF) % T]);
+    for (let f = 0; f < T; f += 113) expect(r.L[f]).toBe(t.L[f]);
+  });
+
+  it('plays at the tempo it is given even where loading the loop would snap to its exact one (R65 is for recalls)', () => {
+    // A TAP TEMPO can set the engine to exactly 128.4 while a 128.4453 loop plays stretched: the mix must sound the same.
+    const T = 3737;
+    const t = audio(T, (k) => Math.sin(k / 7) * 0.5, 480000 / T, 2);
+    const { memory, system } = settings((m) => {
+      m.tempo = 128.4;
+    });
+    const r = renderMix(memory, system, [t, null, null, null, null], [true, false, false, false, false], [1, 1, 1, 1, 1], SR, 128.4);
+    expect(r.L.length).toBe(lengthAfterRate(T, 128.4 / (480000 / T)));
+    let same = 0;
+    for (let f = 0; f < T; f++) if (r.L[f] === t.L[f]) same++;
+    expect(same).toBeLessThan(T / 2); // stretched, not the take as it is
   });
 
   it('a loop at 119.97 BPM under a memory tempo of 120.0 plays bit for bit as it does live', () => {
@@ -267,17 +282,170 @@ describe('renderMix: tempo sync, as live', () => {
     live.command({ t: 'tempo', bpm });
     live.setTrackAudio(0, t);
     live.command({ t: 'recPlay', track: 0 });
-    const out = { tracks: [0, 1, 2, 3, 4].map((): [Float32Array, Float32Array] => [new Float32Array(T + XF), new Float32Array(T + XF)]), click: [new Float32Array(T + XF), new Float32Array(T + XF)] as [Float32Array, Float32Array] };
-    const z = new Float32Array(T + XF);
-    live.process(z, z, z, z, out, T + XF);
+    const out = { tracks: [0, 1, 2, 3, 4].map((): [Float32Array, Float32Array] => [new Float32Array(2 * T), new Float32Array(2 * T)]), click: [new Float32Array(2 * T), new Float32Array(2 * T)] as [Float32Array, Float32Array] };
+    const z = new Float32Array(2 * T);
+    live.process(z, z, z, z, out, 2 * T);
     let differ = 0;
-    for (let f = 0; f < T; f++) if (r.L[f] !== out.tracks[0][0][f + XF]) differ++;
+    for (let f = 0; f < T; f++) if (r.L[f] !== out.tracks[0][0][T + f]) differ++; // its second pass, past the ramp
     expect(differ).toBe(0);
     const streamed = mixRenderer(memory, system, tracks, playing, [1, 1, 1, 1, 1], SR, { tempo: bpm });
     const L = new Float32Array(T);
     const R = new Float32Array(T);
     streamed.render(L, R, T);
     expect(L).toEqual(r.L);
+  });
+});
+
+describe('renderMix: from the live playheads (ruling R64)', () => {
+  const BUDGET = 64 * 1024 * 1024;
+
+  /** The next `n` frames of a live core through the engine's Mixer (faders at unity), as the speaker gets them. */
+  function liveMix(core: LooperCore, system: SystemSettings, n: number): { L: Float32Array; R: Float32Array } {
+    const B = 128;
+    const mixer = new Mixer(SR);
+    mixer.configure(system);
+    const out = makeOutput(B);
+    const z = new Float32Array(B);
+    const quiet: [Float32Array, Float32Array] = [z, z];
+    const mixOut: [Float32Array, Float32Array] = [new Float32Array(B), new Float32Array(B)];
+    const L = new Float32Array(n);
+    const R = new Float32Array(n);
+    for (let done = 0; done < n; done += B) {
+      const m = Math.min(B, n - done);
+      core.process(z, z, z, z, out, m);
+      mixer.process(out.tracks, quiet, quiet, mixOut, null, m);
+      L.set(mixOut[0].subarray(0, m), done);
+      R.set(mixOut[1].subarray(0, m), done);
+    }
+    return { L, R };
+  }
+
+  /**
+   * Where each track is in its loop now, from one live status, as LOOP MIX hands it on: the status's `position` is the
+   * playhead's place in the take (running 1 -> 0 in REVERSE), the offset counts frames into the loop in play order.
+   */
+  function offsetsOf(core: LooperCore, tracks: Slot[], memory: MemorySettings): number[] {
+    return core.status().tracks.map((s, i) => {
+      const t = tracks[i];
+      if (!t) return 0;
+      const p = s.position * t.L.length;
+      return memory.track[i].reverse ? t.L.length - 1 - p : p;
+    });
+  }
+
+  function liveCore(memory: MemorySettings, system: SystemSettings, tracks: Slot[]): LooperCore {
+    const core = new LooperCore({ sampleRate: SR, memoryBudgetBytes: BUDGET });
+    core.setSettings(memory, system);
+    tracks.forEach((t, i) => {
+      if (t) core.setTrackAudio(([0, 1, 2, 3, 4] as const)[i], t);
+    });
+    return core;
+  }
+
+  const differing = (a: Float32Array, b: Float32Array): number => {
+    let d = 0;
+    for (let f = 0; f < a.length; f++) if (a[f] !== b[f]) d++;
+    return d;
+  };
+
+  it('a loop handed an offset is that many frames into itself on the cycle\'s first frame (REVERSE: from its end)', () => {
+    const t = audio(1000, (k) => k / 1000);
+    const { memory, system } = settings();
+    const fwd = renderMix(memory, system, [t, null, null, null, null], [true, false, false, false, false], [1, 1, 1, 1, 1], SR, undefined, [250]);
+    for (let f = 0; f < 1000; f += 7) expect(fwd.L[f]).toBeCloseTo(((f + 250) % 1000) / 1000, 6);
+    const rev = settings((m) => {
+      m.track[0].reverse = true;
+    });
+    const back = renderMix(rev.memory, rev.system, [t, null, null, null, null], [true, false, false, false, false], [1, 1, 1, 1, 1], SR, undefined, [250]);
+    for (let f = 0; f < 1000; f += 7) expect(back.L[f]).toBeCloseTo((999 - ((f + 250) % 1000)) / 1000, 6);
+  });
+
+  it('offsets outside the loop wrap into it, and one that is not a number counts as 0', () => {
+    const t = audio(1000, (k) => k / 1000);
+    const { memory, system } = settings();
+    const at = (o: number) =>
+      renderMix(memory, system, [t, null, null, null, null], [true, false, false, false, false], [1, 1, 1, 1, 1], SR, undefined, [o]).L[0];
+    expect(at(1010)).toBeCloseTo(0.01, 6);
+    expect(at(-10)).toBeCloseTo(0.99, 6);
+    expect(at(Number.NaN)).toBeCloseTo(0, 6);
+  });
+
+  it('a stretched loop starts at its offset too (PITCH at 2x reads from there)', () => {
+    const t = audio(2000, (k) => k / 10000, 60);
+    const { memory, system } = settings((m) => {
+      m.track[0].tempoSyncMode = 'PITCH';
+    });
+    const r = renderMix(memory, system, [t, null, null, null, null], [true, false, false, false, false], [1, 1, 1, 1, 1], SR, undefined, [600]);
+    expect(r.L.length).toBe(1000);
+    for (let f = 0; f < 700; f += 37) expect(r.L[f]).toBeCloseTo((600 + 2 * f) / 10000, 4);
+  });
+
+  it('equals the live output from the press onward, sample for sample, over one cycle', () => {
+    const four = audio(8000, (k) => 0.3 * Math.sin(k / 11) + k / 80000);
+    const two = audio(4000, (k) => 0.2 * Math.sin(k / 5) - 0.05);
+    const back = audio(3000, (k) => 0.1 * Math.cos(k / 3) + k / 90000);
+    const { memory, system } = settings((m) => {
+      for (const s of m.track) s.loopSyncSw = false;
+      m.track[0].playLevel = 80;
+      m.track[1].pan = -20;
+      m.track[2].reverse = true;
+    });
+    const tracks: Slot[] = [four, two, back, null, null];
+    const live = liveCore(memory, system, tracks);
+    live.command({ t: 'recPlay', track: 0 });
+    run(live, 2000);
+    live.command({ t: 'recPlay', track: 1 }); // a bar in
+    run(live, 1500);
+    live.command({ t: 'recPlay', track: 2 });
+    run(live, 9321 - 3500);
+    // The press: one status gives every playhead.
+    const offsets = offsetsOf(live, tracks, memory);
+    const playing = [true, true, true, false, false];
+    const r = mixRenderer(memory, system, tracks, playing, [1, 1, 1, 1, 1], SR, { tempo: live.status().tempo, offsets });
+    expect(r.frames).toBe(24000);
+    const L = new Float32Array(r.frames);
+    const R = new Float32Array(r.frames);
+    r.render(L, R, r.frames);
+    const heard = liveMix(live, system, r.frames);
+    expect(differing(L, heard.L)).toBe(0);
+    expect(differing(R, heard.R)).toBe(0);
+  });
+
+  it('a 2-bar layer started at bar 1 of a 4-bar loop keeps its place against it (review I5)', () => {
+    // A marker 100 frames into each loop. Live, the 4-bar loop's falls at 100, 8100, ...; the 2-bar layer's, started at
+    // bar 1 (frame 2000), at 2100, 6100, 10100, ...
+    const four = audio(8000, (k) => (k >= 100 && k < 110 ? 1 : 0));
+    const two = audio(4000, (k) => (k >= 100 && k < 110 ? 0.5 : 0));
+    const { memory, system } = settings((m) => {
+      for (const s of m.track) s.loopSyncSw = false;
+    });
+    const tracks: Slot[] = [four, two, null, null, null];
+    const live = liveCore(memory, system, tracks);
+    live.command({ t: 'recPlay', track: 0 });
+    run(live, 2000);
+    live.command({ t: 'recPlay', track: 1 });
+    run(live, 3000); // LOOP MIX pressed at frame 5000
+    const r = renderMix(memory, system, tracks, [true, true, false, false, false], [1, 1, 1, 1, 1], SR, undefined, offsetsOf(live, tracks, memory));
+    expect(r.L.length).toBe(8000);
+    const marks: number[] = [];
+    for (let f = 0; f < r.L.length; f++) if (r.L[f] !== 0 && (f === 0 || r.L[f - 1] === 0)) marks.push(f);
+    // From the press: the layer's at 6100 and 10100, the loop's at 8100.
+    expect(marks).toEqual([1100, 3100, 5100]);
+    expect(r.L[1100]).toBe(0.5);
+    expect(r.L[3100]).toBe(1);
+  });
+
+  it('a 1SHOT caught mid-way starts there, ramping in from silence, and does not come round again', () => {
+    const shot = audio(1000, () => 0.5);
+    const bed = audio(3000, () => 0);
+    const { memory, system } = settings((m) => {
+      m.track[0].oneShot = true;
+    });
+    const r = renderMix(memory, system, [shot, bed, null, null, null], [true, true, false, false, false], [1, 1, 1, 1, 1], SR, undefined, [600, 0]);
+    expect(r.L.length).toBe(3000);
+    for (let f = 0; f < XF; f++) expect(r.L[f]).toBeCloseTo((0.5 * f) / XF, 6);
+    for (let f = XF; f < 400; f++) expect(r.L[f]).toBeCloseTo(0.5, 6);
+    expect(r.L.subarray(400 + XF).every((v) => v === 0)).toBe(true);
   });
 });
 

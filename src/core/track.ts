@@ -1325,6 +1325,18 @@ export class Track implements SyncTrack {
     else this.startPlayback(this.startPosition());
   }
 
+  /**
+   * Offline renders only (LOOP MIX, ruling R64): start a stopped track playing now from take position `pos`, as a start
+   * from stopped does (START MODE, the 5 ms ramp-in, PLAY MODE SINGLE), with no wait for a line and no LOOP SYNC
+   * alignment. A whole-frame `pos` keeps the exact path. A position outside the take, or not a number, starts at the
+   * loop's start. Live starts go through `recPlay`.
+   */
+  startAt(pos: number): void {
+    if (this._state !== 'stopped') return;
+    const ok = Number.isFinite(pos) && pos >= 0 && pos < this._take.length;
+    this.startPlayback(ok ? pos : this.startPosition());
+  }
+
   // ALL START/STOP and PLAY MODE SINGLE (driven by the core) --------------------------------------------------------
 
   /** Recording, playing or overdubbing. */
