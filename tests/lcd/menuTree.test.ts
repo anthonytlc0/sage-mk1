@@ -7,7 +7,9 @@ import {
   MSG_PREPARING, MSG_READY, MSG_RESTORE_CONFIRM, storageScreen,
 } from '../../src/lcd/screens/storage';
 import type { StorageDeps } from '../../src/lcd/screens/storage';
-import { CALIBRATE_PROMPT, MSG_CALIB_FAILED, MSG_MEASURING, MSG_REMOVE_HEADPHONES, latencyScreen, showCalibratePrompt } from '../../src/lcd/screens/latency';
+import { CALIBRATE_PROMPT, MSG_CALIB_FAILED, MSG_MEASURING, MSG_MIC_PROCESS_HINT, MSG_REMOVE_HEADPHONES, latencyScreen, showCalibratePrompt } from '../../src/lcd/screens/latency';
+import { textWidth } from '../../src/lcd/draw';
+import { FONT_SMALL } from '../../src/lcd/fonts';
 import { RECOVER_PROMPT, recoverScreen, showBootPrompts } from '../../src/lcd/screens/recover';
 import { FACTORY_RESET_TARGETS, SYSTEM_PARAMS, concreteIds, defaultMemory, defaultSystem } from '../../src/schema/params';
 import { drawTitleBar } from '../../src/lcd/screens/common';
@@ -601,6 +603,36 @@ describe('LATENCY calibration', () => {
     expect(r.c.message).toBe(MSG_CALIB_FAILED);
     expect(r.c.session.system.setup.latency).toBe(-1);
     expect((r.menu.top as ReturnType<typeof latencyScreen>).lines[0]).toBe(MSG_REMOVE_HEADPHONES);
+  });
+
+  it('ledger 304: a failure with MIC PROCESS on adds a hint to turn it off (echo cancellation eats the clicks)', async () => {
+    const r = menuRig();
+    r.c.setParam('setup.micProcess', true);
+    r.menu.push(latencyScreen());
+    const screen = r.menu.top as ReturnType<typeof latencyScreen>;
+    frame(r.c); // rendered before: no hint yet
+    expect(screen.lines).not.toContain(MSG_MIC_PROCESS_HINT);
+    push(r, 'enter');
+    r.engine.emit({ t: 'calibration', reqId: r.engine.last('calibrate')!.reqId, capture: capture(null), clickFrames: clicks });
+    await flush();
+    expect(r.c.message).toBe(MSG_CALIB_FAILED);
+    frame(r.c);
+    expect(screen.lines).toEqual([MSG_REMOVE_HEADPHONES, 'ENTER: START', 'NOW AUTO', MSG_MIC_PROCESS_HINT]);
+    expect(textWidth(MSG_MIC_PROCESS_HINT, FONT_SMALL)).toBeLessThanOrEqual(128);
+    r.c.setParam('setup.micProcess', false); // turned off: the hint goes
+    frame(r.c);
+    expect(screen.lines).not.toContain(MSG_MIC_PROCESS_HINT);
+  });
+
+  it('ledger 304: with MIC PROCESS off a failure shows no hint', async () => {
+    const r = menuRig();
+    r.menu.push(latencyScreen());
+    const screen = r.menu.top as ReturnType<typeof latencyScreen>;
+    push(r, 'enter');
+    r.engine.emit({ t: 'calibration', reqId: r.engine.last('calibrate')!.reqId, capture: capture(null), clickFrames: clicks });
+    await flush();
+    frame(r.c);
+    expect(screen.lines).not.toContain(MSG_MIC_PROCESS_HINT);
   });
 
   it('EXIT is ignored while it measures (MEASURING...), so the output is never left muted behind the menu', async () => {

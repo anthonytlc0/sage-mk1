@@ -9,7 +9,8 @@
  * what is heard, and the loops would be taken for clicks). EXIT is ignored while it measures, so the menu is never
  * left while the engine still has the output muted; a measurement that never answers ends with CALIB FAILED after
  * CALIBRATE_TIMEOUT_MS. A result that cannot be trusted (computeLatency null) shows CALIB FAILED and goes back to the
- * start. Storing SETUP LATENCY sends the engine new settings, which EngineHost turns into the `latency` command (with
+ * start; with SETUP MIC PROCESS on, the start then also says TURN MIC PROCESS OFF (echo cancellation removes the clicks
+ * the mic should hear; ledger 304). Storing SETUP LATENCY sends the engine new settings, which EngineHost turns into the `latency` command (with
  * the output latency it measures itself).
  *
  * `showCalibratePrompt` is the first-run offer: at power-on, while the device is uncalibrated and the offer has never
@@ -30,6 +31,11 @@ export const MSG_REMOVE_HEADPHONES = 'REMOVE HEADPHONES';
 export const MSG_CALIB_FAILED = 'CALIB FAILED';
 export const MSG_MEASURING = 'MEASURING...';
 export const CALIBRATE_PROMPT = 'CALIBRATE? ENTER/EXIT';
+/**
+ * The hint under the start lines after a failed calibration while SETUP MIC PROCESS is on (ledger 304): the browser's
+ * echo cancellation removes the clicks the speaker plays, so the mic hears too few of them.
+ */
+export const MSG_MIC_PROCESS_HINT = 'TURN MIC PROCESS OFF';
 
 /** The sample rate assumed before the engine has reported one. */
 const DEFAULT_RATE = 48000;
@@ -48,6 +54,9 @@ class LatencyScreen implements Screen {
   private disposed = false;
   private readyLines: string[] = [MSG_REMOVE_HEADPHONES, 'ENTER: START'];
   private readyFor: unknown = undefined;
+  private readyHint = false;
+  /** The last measurement failed (a hint may help next time). */
+  private failed = false;
 
   /** The lines shown now (for the tests and the render). */
   get lines(): readonly string[] {
@@ -81,9 +90,12 @@ class LatencyScreen implements Screen {
 
   private syncReady(ctx: Controller): void {
     const v = ctx.session.system.setup.latency;
-    if (v === this.readyFor) return;
+    const hint = this.failed && ctx.session.system.setup.micProcess;
+    if (v === this.readyFor && hint === this.readyHint) return;
     this.readyFor = v;
+    this.readyHint = hint;
     this.readyLines = [MSG_REMOVE_HEADPHONES, 'ENTER: START', `NOW ${formatLatency(v)}`];
+    if (hint) this.readyLines.push(MSG_MIC_PROCESS_HINT);
   }
 
   private start(ctx: Controller): void {
@@ -95,6 +107,7 @@ class LatencyScreen implements Screen {
         const frames = computeLatency(capture, clickFrames, sr);
         if (frames === null) return this.fail(ctx);
         ctx.setParam('setup.latency', frames);
+        this.failed = false;
         this.resultLines = ['LATENCY SET', `${frames} FRAMES`, `${((frames / sr) * 1000).toFixed(1)} MS`];
         this.state = 'done';
       },
@@ -108,6 +121,7 @@ class LatencyScreen implements Screen {
 
   private fail(ctx: Controller): void {
     this.state = 'ready';
+    this.failed = true; // with MIC PROCESS on, the start lines get MSG_MIC_PROCESS_HINT
     ctx.showMessage(MSG_CALIB_FAILED);
   }
 }
