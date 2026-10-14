@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SageProcessor } from '../../src/engine/processor';
 import { DESKTOP_MEMORY_BUDGET, PROCESSOR_NAME, RECORDER_BLOCK } from '../../src/engine/config';
 import { MasterFx } from '../../src/dsp/master';
+import { Mixer } from '../../src/dsp/mixer';
 import { defaultMemory } from '../../src/schema/memory';
 import type { TrackAudio } from '../../src/shared/protocol';
 import { AudioTake } from '../../src/core/chunks';
@@ -588,6 +589,55 @@ describe('SageProcessor robustness and CPU', () => {
       });
       run(p, BLOCK, 0.5);
       expect(errors).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('R67: a throw outside the guarded steps (the mixer) gives silence and ONE fault event, and never escapes process()', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const { p, port } = makeProcessor();
+      send(port, freeSettings((_m, s) => {
+        s.output.routing.inputThru = true; // the mic is heard: a healthy block is not silent
+      }));
+      expect(run(p, BLOCK, 0.5).L[BLOCK - 1]).toBeCloseTo(0.5, 4);
+      vi.spyOn(Mixer.prototype, 'process').mockImplementation(() => {
+        throw new Error('mixer broke');
+      });
+      const out = run(p, 3 * SR, 0.5); // run() asserts every process() returned true (a throw would fail it)
+      expect(maxAbs(out.L)).toBe(0);
+      expect(maxAbs(out.R)).toBe(0);
+      const faults = port.events('fault');
+      expect(faults).toHaveLength(1); // no storm: one event for the whole run of failures
+      expect(faults[0]!.message).toContain('mixer broke');
+      expect(errors).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('R67 / ledger 311: a core whose status() throws (postStatus) is caught: that block is silent, one fault event', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const { p, port } = makeProcessor();
+      send(port, freeSettings((_m, s) => {
+        s.output.routing.inputThru = true;
+      }));
+      run(p, 800, 0.5); // one status posted: the next is due 800 frames on
+      port.clear();
+      vi.spyOn(LooperCore.prototype, 'status').mockImplementation(() => {
+        throw new Error('status broke');
+      });
+      const out = run(p, 2 * SR, 0.5);
+      expect(port.events('fault')).toHaveLength(1);
+      expect(port.events('status')).toHaveLength(0);
+      // The block that tried to post the status is silent; the ones between statuses still play the mic.
+      expect(out.L[0]).toBeCloseTo(0.5, 4);
+      let silent = 0;
+      for (let b = 0; b < out.L.length; b += BLOCK) if (maxAbs(out.L, b, b + BLOCK) === 0) silent++;
+      expect(silent).toBeGreaterThan(0);
+      expect(silent).toBeLessThan(out.L.length / BLOCK / 2);
     } finally {
       vi.restoreAllMocks();
     }

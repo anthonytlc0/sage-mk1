@@ -18,6 +18,8 @@
  *    `suspend()` then `resume()` (WebKit bug 276016) if the context is not running, and the mic is opened again if its
  *    track ended or was muted. A context that comes back to `running` by itself (after Siri or a call) gets an ended
  *    mic reopened too.
+ *  - A processor that fails (its `fault` event, or the browser's `onprocessorerror`) is the engine stopped (ruling
+ *    R67): `faulted` turns true and handlers get one `fault` event, for the app to show ENGINE STOPPED.
  *  - When audio cannot be brought back the LCD gets NO INPUT and `needsResume` turns true (`onNeedsResume` tells).
  *    The app shell (SageUnit, app/unit.ts) then shows TAP POWER TO RESUME, and a tap calls `resume({ retryMic: true })`
  *    (after a failed retry the next POWER tap switches off, ruling R58). It turns false again by itself when the
@@ -131,6 +133,8 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
   /** Streamed exports being put back together (ruling R47). */
   private readonly assembler: ExportAssembler;
   private _needsResume = false;
+  /** The engine stopped working (a `fault`, ruling R67); stays true until the host is stopped. */
+  private _faulted = false;
   /** A mic has been open since power-on, so losing it is a loss to recover from. */
   private micExpected = false;
   /** Going hidden interrupts only on a touch device (R37). */
@@ -198,7 +202,10 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
 
     const host = new EngineHost(ctx, node, nav, doc, system, log);
     node.port.onmessage = (ev) => host.receive(ev.data);
-    node.onprocessorerror = (ev) => log('engine: the audio processor failed', ev);
+    node.onprocessorerror = (ev) => {
+      log('engine: the audio processor failed', ev);
+      host.fault('the audio processor failed (onprocessorerror)');
+    };
     node.connect(ctx.destination);
     if (!host.attachMic(stream)) host.dispatch(NO_INPUT);
     ctx.onstatechange = () => host.onStateChange();
@@ -233,6 +240,15 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
   /** Streamed exports being reassembled (diagnostics; their full-length arrays are held until they end). */
   get exportsInFlight(): number {
     return this.assembler.inProgress;
+  }
+
+  /**
+   * The engine has stopped working (ruling R67): its processor reported a failed block (`fault`) or the browser reported
+   * it dead (`onprocessorerror`). Handlers get one `fault` event; the app shows ENGINE STOPPED and keeps the recovery
+   * checkpoint at POWER off. Only a new power-on (a new host) clears it.
+   */
+  get faulted(): boolean {
+    return this._faulted;
   }
 
   /** Audio was lost and could not be brought back: the app shell shows TAP POWER TO RESUME while this is true. */
@@ -460,16 +476,34 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
       if (done !== null) this.dispatch(done);
       return;
     }
+    if (e.t === 'fault') {
+      this.fault(typeof e.message === 'string' ? e.message : 'the audio processor failed');
+      return;
+    }
     this.dispatch(e);
   }
 
+  /** The engine stopped (ruling R67): one `fault` event, however many reports (processor and browser) come in. */
+  private fault(message: string): void {
+    if (this.stopped || this._faulted) return;
+    this._faulted = true;
+    this.dispatch({ t: 'fault', message });
+  }
+
+  /** Hands `e` to every handler. Each runs on its own (M8): one that throws is logged and the rest still get it. */
   private dispatch(e: EngineEvent): void {
     if (this.stopped) return;
     if (this.handlers.size === 0) {
-      if (e.t === 'message') this.undelivered.push(e);
+      if (e.t === 'message' || e.t === 'fault') this.undelivered.push(e);
       return;
     }
-    for (const h of [...this.handlers]) h(e);
+    for (const h of [...this.handlers]) {
+      try {
+        h(e);
+      } catch (err) {
+        this.log(`engine: a ${e.t} event handler failed`, err);
+      }
+    }
   }
 
   private flushUndelivered(): void {

@@ -34,6 +34,10 @@
  *     block as `tracksPart`s in fresh, transferred arrays; then `tracksEnd`. EngineHost reassembles them into `tracks`
  *     on the main thread, so the audio thread never allocates or copies a whole export at once.
  *
+ * The whole block runs inside one guard (ruling R67): a throw that escapes the inner guards above (the input chain, the
+ * mixer, MASTER FX, the calibrator, the output copy, the recorder batching, the status) gives that block silence and
+ * posts one `fault` event for the processor's life (the host shows ENGINE STOPPED); the next block is tried as usual.
+ *
  * Nothing allocates in `process()` (no closures, no array destructuring) except the core's recording chunks, a fresh
  * recorder batch per 4096 frames and the status object 60 times a second (ruling R6), plus what the commands applied
  * in step 1 need, once per user action (the core's own rule), and an export's parts (at most the per-block budget).
@@ -136,6 +140,8 @@ export class SageProcessor {
   private failing = false;
   /** Frames until a render failure may be reported again (ENGINE ERROR at most once a second). */
   private errorCooldown = 0;
+  /** A block failed outside the inner guards and `fault` was posted (once per processor, ruling R67). */
+  private faulted = false;
   /** The tempo in the last status: the fallback for the live tempo if the core cannot report it. */
   private lastTempo: number;
   /** Pulses a status() read outside postStatus took from the core, handed on with the next status. */
@@ -204,6 +210,20 @@ export class SageProcessor {
     const dest = outputs[0];
     const destL = dest?.[0];
     if (dest === undefined || destL === undefined || destL.length === 0) return true;
+    // The whole block is guarded (ruling R67): a browser never calls a processor again once it throws, which would
+    // leave a silent, frozen unit. A failure outputs silence for this block and is reported once (`fault`).
+    try {
+      this.render(inputs, dest, destL, contextFrame);
+    } catch (e) {
+      this.blockFailed(e, dest);
+    }
+    return true;
+  }
+
+  // -------------------------------------------------------------------------------------------------------------------
+
+  /** One block, steps 1-9 of the header. Any throw that escapes the inner guards reaches `process`'s guard. */
+  private render(inputs: Float32Array[][], dest: Float32Array[], destL: Float32Array, contextFrame: number | undefined): void {
     const n = destL.length;
     if (n > this.buf.n) this.buf = makeBuffers(n);
     const b = this.buf;
@@ -296,10 +316,24 @@ export class SageProcessor {
         this.post({ t: 'message', text: 'ENGINE ERROR' });
       }
     }
-    return true;
   }
 
-  // -------------------------------------------------------------------------------------------------------------------
+  /**
+   * A block failed outside the inner guards (ruling R67): silence for this block. The first failure is logged and
+   * posted as one `fault` event, for the host to show ENGINE STOPPED; later ones (every block, if the fault persists)
+   * post and allocate nothing. The next block is tried normally.
+   */
+  private blockFailed(e: unknown, dest: Float32Array[]): void {
+    for (let c = 0; c < dest.length; c++) dest[c]!.fill(0);
+    if (this.faulted) return;
+    this.faulted = true;
+    console.error('engine: a render block failed (later failures are not reported)', e);
+    try {
+      this.post({ t: 'fault', message: e instanceof Error ? `${e.name}: ${e.message}` : String(e) });
+    } catch {
+      // the port itself failed: nothing more can be told
+    }
+  }
 
   /**
    * The core's render threw. Drop this block's track output and keep rendering; nothing to restore (settings never sit

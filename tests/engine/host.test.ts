@@ -6,7 +6,9 @@ import type { EngineLike } from '../../src/control/controller';
 import { defaultSystem } from '../../src/schema/system';
 import type { EngineEvent, TrackAudio } from '../../src/shared/protocol';
 import { freeSettings, run } from './helpers';
-import { FakeContext, FakeDoc, FakeNav, sentCommands, settle, startHost } from './hostFakes';
+import { FakeContext, FakeDoc, FakeNav, FakeWorkletNode, sentCommands, settle, startHost } from './hostFakes';
+import { FakePort } from '../../src/engine/fakePort';
+import { Mixer } from '../../src/dsp/mixer';
 import type { Rig } from './hostFakes';
 
 const MiB = 1024 * 1024;
@@ -167,6 +169,19 @@ describe('EngineHost.send', () => {
     run(rig.processor, 1600);
     expect(mine).toHaveLength(n);
     expect(rig.events.length).toBeGreaterThan(n);
+  });
+
+  it('M8: a handler that throws is logged and does not keep the event from the handlers after it', async () => {
+    const rig = await startHost();
+    const after: EngineEvent[] = [];
+    rig.host.on(() => {
+      throw new Error('a buggy listener');
+    });
+    rig.host.on((e) => after.push(e));
+    run(rig.processor, 1600);
+    expect(after.filter((e) => e.t === 'status').length).toBeGreaterThan(0);
+    expect(rig.events.filter((e) => e.t === 'status')).toHaveLength(after.filter((e) => e.t === 'status').length);
+    expect(rig.logs.some(([m]) => m.includes('handler failed'))).toBe(true);
   });
 
   it('settings with a new MIC PROCESS restart the mic with the new echoCancellation', async () => {
@@ -333,6 +348,52 @@ describe('EngineHost latency', () => {
     const rig = await startHost();
     rig.host.send({ t: 'latency', roundTripFrames: 1500, outputLatencyFrames: 700 });
     expect(rig.host.latency()).toEqual({ roundTripFrames: 1500, outputLatencyFrames: 700 });
+  });
+});
+
+describe('EngineHost: the engine stopped (ruling R67)', () => {
+  const faults = (rig: Rig) => rig.events.filter((e): e is Extract<EngineEvent, { t: 'fault' }> => e.t === 'fault');
+
+  it('a processor fault reaches the handlers once, and the host reports the engine faulted', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const rig = await startHost();
+      expect(rig.host.faulted).toBe(false);
+      vi.spyOn(Mixer.prototype, 'process').mockImplementation(() => {
+        throw new Error('mixer broke');
+      });
+      run(rig.processor, 4800);
+      expect(faults(rig)).toHaveLength(1);
+      expect(rig.host.faulted).toBe(true);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('onprocessorerror (the browser has stopped calling the processor) is a fault too, delivered once', async () => {
+    const rig = await startHost();
+    rig.node.onprocessorerror!(new Event('processorerror') as ErrorEvent);
+    rig.node.onprocessorerror!(new Event('processorerror') as ErrorEvent);
+    expect(rig.host.faulted).toBe(true);
+    expect(faults(rig)).toHaveLength(1);
+    expect(rig.logs.some(([m]) => m.includes('processor failed'))).toBe(true);
+  });
+
+  it('a fault before anyone listens is kept for the first subscriber', async () => {
+    let node: FakeWorkletNode | null = null;
+    const host = await EngineHost.start<FakeContext>({
+      workletUrl: 'sage-processor.js',
+      log: () => undefined,
+      nav: new FakeNav(),
+      doc: new FakeDoc(),
+      createContext: () => new FakeContext(),
+      createNode: (_c, options) => (node = new FakeWorkletNode(FakePort.pair()[0], options)),
+    });
+    node!.onprocessorerror!(new Event('processorerror') as ErrorEvent); // dies before the app subscribes
+    const late: EngineEvent[] = [];
+    host.on((e) => late.push(e));
+    await settle();
+    expect(late.filter((e) => e.t === 'fault')).toHaveLength(1);
   });
 });
 
