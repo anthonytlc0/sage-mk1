@@ -663,7 +663,11 @@ export class Controller {
     this.loadSession(slot, rec?.settings ?? defaultMemory(), rec?.tracks ?? EMPTY_TRACKS(), discardCheckpoint);
   }
 
-  /** Loads a memory into the session and the engine. `discardCheckpoint`: the unsaved work it held is now gone. */
+  /**
+   * Loads a memory into the session and the engine. `discardCheckpoint`: the unsaved work it held is now gone. The
+   * tracks' arrays are handed to the engine (EngineHost transfers them to the worklet, ledger 263): nothing here may
+   * read their samples afterwards.
+   */
   private loadSession(slot: number, memory: MemorySettings, tracks: (TrackAudio | null)[], discardCheckpoint: boolean): void {
     this.session.load(slot, memory);
     this.workSeq++;

@@ -33,9 +33,9 @@ import processorUrl from './processor.ts?worker&url';
 import type { EngineLike } from '../control/controller';
 import { defaultSystem } from '../schema/system';
 import type { SystemSettings } from '../schema/types';
-import type { EngineCommand, EngineEvent, TimedCommand } from '../shared/protocol';
+import type { EngineCommand, EngineEvent, TimedCommand, TrackAudio } from '../shared/protocol';
 import { ExportAssembler, isExportEvent } from './assemble';
-import { PROCESSOR_NAME, isTouch, memoryBudgetBytes } from './config';
+import { PROCESSOR_NAME, exportSecondsPerBlock, isTouch, memoryBudgetBytes } from './config';
 import type { MessagePortLike } from './processor';
 
 /** How long `suspend()` / `resume()` may take before the resume counts as failed. */
@@ -120,6 +120,15 @@ export interface Latency {
 
 const NO_INPUT: EngineEvent = { t: 'message', text: 'NO INPUT' };
 
+/**
+ * The statuses (60 a second) after the context starts or comes back to `running` at which the latency is read again
+ * (M2): `outputLatency` reads 0 on iOS until audio has played, and a context that was already running at start sends
+ * no statechange. Statuses come only while the worklet renders, so these are moments when audio has played: at once,
+ * after half a second and after two seconds. No later than that, so a wobbling value cannot retime a pass mid-set.
+ */
+const LATENCY_RECHECK_STATUSES: readonly number[] = [1, 30, 120];
+const LAST_LATENCY_RECHECK = LATENCY_RECHECK_STATUSES[LATENCY_RECHECK_STATUSES.length - 1]!;
+
 // ---------------------------------------------------------------------------------------------------------------------
 
 export class EngineHost<C extends HostContext = AudioContext> implements EngineLike {
@@ -152,6 +161,8 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
   private chain: Promise<unknown> = Promise.resolve();
   /** A `restartMic` that is queued and has not started yet. */
   private micRestart: Promise<void> | null = null;
+  /** Statuses seen since the context started or last came back to running; counting stops after the last recheck. */
+  private statusesSinceRunning = 0;
 
   private constructor(
     readonly ctx: C,
@@ -175,6 +186,9 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
   static async start<C extends HostContext = AudioContext>(opts: EngineHostOptions<C> = {}): Promise<EngineHost<C>> {
     // Without createContext, C is the default AudioContext.
     const ctx = opts.createContext ? opts.createContext() : (new AudioContext({ latencyHint: 'interactive' }) as unknown as C);
+    // M6: resume at once, still inside the tap's user activation (iOS unlocks audio only from a gesture); everything
+    // below awaits the mic prompt and the worklet. Harmless when the context already runs; the resume at the end stays.
+    ctx.resume().catch(() => undefined);
     const nav = opts.nav ?? globalThis.navigator;
     const doc = opts.doc === undefined ? (typeof document === 'undefined' ? null : document) : opts.doc;
     const log = opts.log ?? consoleLog;
@@ -192,7 +206,7 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
         channelCount: 1, // the mic, downmixed to mono
         channelCountMode: 'explicit',
         channelInterpretation: 'speakers',
-        processorOptions: { memoryBudgetBytes: memoryBudgetBytes(nav) },
+        processorOptions: { memoryBudgetBytes: memoryBudgetBytes(nav), exportSecondsPerBlock: exportSecondsPerBlock(nav) },
       });
     } catch (e) {
       stopStream(stream);
@@ -218,7 +232,7 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
   /** Sends `cmd` to the engine, dated at the heard frame of `eventTime` (performance.now() ms) when it can be. */
   send(cmd: EngineCommand, eventTime?: number): void {
     if (this.stopped) return;
-    this.post({ cmd, at: this.heardFrame(eventTime) });
+    this.post({ cmd, at: this.heardFrame(eventTime) }, cmd.t === 'loadTrack' ? loadTransfer(cmd.audio) : NO_TRANSFER);
     if (cmd.t === 'settings') this.applySettings(cmd.system);
     else if (cmd.t === 'latency') this.lat = { roundTripFrames: cmd.roundTripFrames, outputLatencyFrames: cmd.outputLatencyFrames };
   }
@@ -345,6 +359,7 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
     const state = this.ctx.state;
     if (state === 'running') {
       this.pushLatency(); // outputLatency reads 0 until the context plays
+      this.statusesSinceRunning = 0; // and again once it has played a little (M2)
       // Back by itself (after Siri or a call, or a resume that outlasted its timeout): check the mic, clear
       // needsResume. Our own resume() checks the mic itself.
       if (!this.resuming) this.serial(() => this.recheck()).catch((e: unknown) => this.log('engine: mic check failed', e));
@@ -463,8 +478,8 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
     this.micAvailable = false;
   }
 
-  private post(tc: TimedCommand): void {
-    this.node.port.postMessage(tc, []);
+  private post(tc: TimedCommand, transfer: Transferable[] = NO_TRANSFER): void {
+    this.node.port.postMessage(tc, transfer);
   }
 
   private receive(data: unknown): void {
@@ -479,6 +494,9 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
     if (e.t === 'fault') {
       this.fault(typeof e.message === 'string' ? e.message : 'the audio processor failed');
       return;
+    }
+    if (e.t === 'status' && this.statusesSinceRunning < LAST_LATENCY_RECHECK) {
+      if (LATENCY_RECHECK_STATUSES.includes(++this.statusesSinceRunning)) this.pushLatency();
     }
     this.dispatch(e);
   }
@@ -519,6 +537,23 @@ export class EngineHost<C extends HostContext = AudioContext> implements EngineL
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+
+const NO_TRANSFER: Transferable[] = [];
+
+/**
+ * The buffers a `loadTrack` hands to the worklet (ledger 263): transferred, not copied, so a recall does not hold the
+ * memory's audio twice. Each buffer once (L and R may share one); empty or already-detached ones are left out. The
+ * caller must not use the arrays afterwards (the controller sends freshly loaded audio and keeps none of it).
+ */
+function loadTransfer(audio: TrackAudio | null): Transferable[] {
+  if (audio === null) return NO_TRANSFER;
+  const out: ArrayBuffer[] = [];
+  for (const ch of [audio.L, audio.R]) {
+    const buf = ch?.buffer;
+    if (buf instanceof ArrayBuffer && buf.byteLength > 0 && !out.includes(buf)) out.push(buf);
+  }
+  return out;
+}
 
 /**
  * The heard-timeline frame of an input event: where the output was at `eventTime` (performance.now() ms), from the

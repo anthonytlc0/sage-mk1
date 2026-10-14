@@ -77,6 +77,8 @@ export interface MessagePortLike {
 export interface SageProcessorOptions {
   /** The looper's memory budget (see `memoryBudgetBytes` in config.ts). Defaults to the desktop budget. */
   memoryBudgetBytes?: number;
+  /** Seconds of audio an export streams per block (see `exportSecondsPerBlock` in config.ts). Default 1. */
+  exportSecondsPerBlock?: number;
 }
 
 type Stereo = [Float32Array, Float32Array];
@@ -114,7 +116,10 @@ function makeBuffers(n: number): Buffers {
 /** The render quantum every browser uses today. A larger block reallocates the buffers once. */
 const QUANTUM = 128;
 const NO_TRANSFER: Transferable[] = [];
-/** Seconds of audio (all tracks together) an export copies per block. 5 x 30 s loops take 150 blocks (0.4 s). */
+/**
+ * Seconds of audio (all tracks together) an export copies per block, by default. 5 x 30 s loops take 150 blocks
+ * (0.4 s). A touch device asks for less (`exportSecondsPerBlock`, ledger 298).
+ */
 const EXPORT_SECONDS_PER_BLOCK = 1;
 
 /** One `exportTracks` request being streamed out. */
@@ -195,7 +200,9 @@ export class SageProcessor {
     this.good = { memory: defaultMemory(), system: defaultSystem() };
     this.lastTempo = this.good.memory.tempo;
     this.configureDsp(this.good.system);
-    this.exportBudget = Math.max(1, Math.round(sr * EXPORT_SECONDS_PER_BLOCK));
+    const part = opts.exportSecondsPerBlock;
+    const seconds = typeof part === 'number' && part > 0 && Number.isFinite(part) ? part : EXPORT_SECONDS_PER_BLOCK;
+    this.exportBudget = Math.max(1, Math.round(sr * seconds));
     this.statusEvery = Math.max(1, Math.round(sr / STATUS_HZ));
     this.xf = xfadeFrames(sr);
     port.onmessage = (ev) => this.receive(ev.data);

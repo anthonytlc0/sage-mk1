@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SageProcessor } from '../../src/engine/processor';
-import { DESKTOP_MEMORY_BUDGET, PROCESSOR_NAME, RECORDER_BLOCK } from '../../src/engine/config';
+import { DESKTOP_MEMORY_BUDGET, PROCESSOR_NAME, RECORDER_BLOCK, TOUCH_EXPORT_SECONDS_PER_BLOCK } from '../../src/engine/config';
 import { MasterFx } from '../../src/dsp/master';
 import { Mixer } from '../../src/dsp/mixer';
 import { defaultMemory } from '../../src/schema/memory';
@@ -301,6 +301,25 @@ describe('SageProcessor exportTracks (streamed, ruling R47)', () => {
       expect(tracks[i]!.recordedTempo).toBe(src.recordedTempo);
       expect(tracks[i]!.measures).toBe(src.measures);
     }
+  });
+
+  it('ledger 298: with exportSecondsPerBlock (a touch device) the parts are smaller, and still reassemble sample-exact', () => {
+    const { p, port } = makeProcessor({ exportSecondsPerBlock: TOUCH_EXPORT_SECONDS_PER_BLOCK });
+    send(port, freeSettings());
+    const src = noiseAudio(SR, 4);
+    send(port, { t: 'loadTrack', track: 1, audio: src });
+    run(p, BLOCK);
+    send(port, { t: 'exportTracks', reqId: 8 });
+    const budget = Math.round(SR * TOUCH_EXPORT_SECONDS_PER_BLOCK);
+    let blocks = 0;
+    while (assembled(port, 8) === null && blocks < 100) {
+      const before = port.events('tracksPart').length;
+      run(p, BLOCK);
+      blocks++;
+      expect(port.events('tracksPart').slice(before).reduce((n, e) => n + e.L.length, 0)).toBeLessThanOrEqual(budget);
+    }
+    expect(blocks).toBe(Math.ceil(SR / budget)); // 1 s of audio at a quarter second per block
+    expect(assembled(port, 8)![1]!.L).toEqual(src.L);
   });
 
   it('allocates nothing on the audio thread in proportion to the whole export: at most the per-block budget', () => {

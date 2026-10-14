@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { AudioTake } from '../../src/core/chunks';
 import { EngineHost, eventFrame } from '../../src/engine/host';
-import { DESKTOP_MEMORY_BUDGET, PROCESSOR_NAME, TOUCH_MEMORY_BUDGET, memoryBudgetBytes } from '../../src/engine/config';
+import { DESKTOP_MEMORY_BUDGET, PROCESSOR_NAME, TOUCH_EXPORT_SECONDS_PER_BLOCK, TOUCH_MEMORY_BUDGET, memoryBudgetBytes } from '../../src/engine/config';
 import type { EngineLike } from '../../src/control/controller';
 import { defaultSystem } from '../../src/schema/system';
 import type { EngineEvent, TrackAudio } from '../../src/shared/protocol';
-import { freeSettings, run } from './helpers';
+import { SR, freeSettings, run } from './helpers';
 import { FakeContext, FakeDoc, FakeNav, FakeWorkletNode, sentCommands, settle, startHost } from './hostFakes';
 import { FakePort } from '../../src/engine/fakePort';
 import { Mixer } from '../../src/dsp/mixer';
@@ -39,13 +39,15 @@ describe('memoryBudgetBytes (ruling R9)', () => {
     const nav = new FakeNav();
     nav.maxTouchPoints = 5;
     const ipad = await startHost({ nav });
-    expect(ipad.node.options.processorOptions).toEqual({ memoryBudgetBytes: 384 * MiB });
+    // Ledger 298: a touch device also streams exports in smaller parts (the checkpoint runs one after every punch-out).
+    expect(ipad.node.options.processorOptions).toEqual({ memoryBudgetBytes: 384 * MiB, exportSecondsPerBlock: TOUCH_EXPORT_SECONDS_PER_BLOCK });
+    expect(TOUCH_EXPORT_SECONDS_PER_BLOCK).toBeLessThan(1);
     run(ipad.processor, 1600);
     const s = ipad.events.find((e): e is Extract<EngineEvent, { t: 'status' }> => e.t === 'status')!;
     expect(s.status.memoryBudget).toBe(384 * MiB);
 
     const desktop = await startHost();
-    expect(desktop.node.options.processorOptions).toEqual({ memoryBudgetBytes: 1024 * MiB });
+    expect(desktop.node.options.processorOptions).toEqual({ memoryBudgetBytes: 1024 * MiB, exportSecondsPerBlock: 1 });
   });
 });
 
@@ -127,7 +129,55 @@ describe('EngineHost.start', () => {
   });
 });
 
+describe('EngineHost.start: the iOS audio unlock (M6)', () => {
+  it('resumes the context synchronously inside the tap, before the mic is asked for; and again after the worklet loads', async () => {
+    const ctx = new FakeContext();
+    ctx.state = 'suspended'; // what a context made outside a gesture, or by an older WebKit, starts as
+    const nav = new FakeNav();
+    const gum = nav.mediaDevices.getUserMedia;
+    nav.mediaDevices.getUserMedia = (c) => {
+      ctx.calls.push('getUserMedia');
+      return gum(c);
+    };
+    const starting = startHost({ ctx, nav });
+    expect(ctx.calls[0]).toBe('resume'); // before start() has awaited anything: still inside the tap
+    await starting;
+    expect(ctx.calls.indexOf('resume')).toBeLessThan(ctx.calls.indexOf('getUserMedia'));
+    expect(ctx.state).toBe('running');
+  });
+});
+
 describe('EngineHost.send', () => {
+  it('ledger 263: loadTrack transfers its buffers to the worklet instead of copying them', async () => {
+    const rig = await startHost();
+    const audio = audioOf(4800, 3);
+    const L = audio.L.slice();
+    const R = audio.R.slice();
+    rig.host.send({ t: 'loadTrack', track: 2, audio });
+    expect(rig.hostPort.posted.at(-1)!.transfer).toHaveLength(2);
+    expect(audio.L.length).toBe(0); // detached: the main thread no longer holds the audio
+    expect(audio.R.length).toBe(0);
+    rig.host.send({ t: 'exportTracks', reqId: 5 });
+    for (let i = 0; i < 5 && trackReplies(rig).length === 0; i++) run(rig.processor, 128);
+    expect(trackReplies(rig)[0]!.tracks[2]!.L).toEqual(L);
+    expect(trackReplies(rig)[0]!.tracks[2]!.R).toEqual(R);
+  });
+
+  it('ledger 263: channels sharing one buffer transfer it once; empty audio and null transfer nothing', async () => {
+    const rig = await startHost();
+    const buf = new ArrayBuffer(2 * 960 * 4);
+    const shared: TrackAudio = { L: new Float32Array(buf, 0, 960).fill(0.5), R: new Float32Array(buf, 960 * 4, 960).fill(-0.5), sampleRate: 48000, recordedTempo: 120, measures: null };
+    rig.host.send({ t: 'loadTrack', track: 0, audio: shared });
+    expect(rig.hostPort.posted.at(-1)!.transfer).toHaveLength(1);
+    rig.host.send({ t: 'loadTrack', track: 1, audio: null });
+    expect(rig.hostPort.posted.at(-1)!.transfer).toHaveLength(0);
+    rig.host.send({ t: 'loadTrack', track: 1, audio: { ...shared, L: new Float32Array(0), R: new Float32Array(0) } });
+    expect(rig.hostPort.posted.at(-1)!.transfer).toHaveLength(0);
+    rig.host.send({ t: 'exportTracks', reqId: 6 });
+    for (let i = 0; i < 5 && trackReplies(rig).length === 0; i++) run(rig.processor, 128);
+    expect(trackReplies(rig)[0]!.tracks[0]!.R[959]).toBe(-0.5);
+  });
+
   it('posts a TimedCommand with the heard frame of the event time', async () => {
     const rig = await startHost();
     rig.ctx.timestamp = { contextTime: 2, performanceTime: 10000 };
@@ -216,6 +266,11 @@ function audioOf(frames: number, seed: number): TrackAudio {
   return { L, R, sampleRate: 48000, recordedTempo: 90 + seed, measures: null };
 }
 
+/** A copy to hand to loadTrack, which transfers (detaches) what it is given. */
+function copyAudio(a: TrackAudio): TrackAudio {
+  return { ...a, L: a.L.slice(), R: a.R.slice() };
+}
+
 function trackReplies(rig: Rig): Extract<EngineEvent, { t: 'tracks' }>[] {
   return rig.events.filter((e): e is Extract<EngineEvent, { t: 'tracks' }> => e.t === 'tracks');
 }
@@ -223,10 +278,11 @@ function trackReplies(rig: Rig): Extract<EngineEvent, { t: 'tracks' }>[] {
 describe('EngineHost export reassembly (ruling R47)', () => {
   it('reassembles a streamed export into one tracks event, sample-exact; handlers never see the parts', async () => {
     const rig = await startHost();
+    // loadTrack transfers its buffers (ledger 263): send copies, keep the originals to compare with.
     const a = audioOf(120000, 1);
     const b = audioOf(30000, 2);
-    rig.host.send({ t: 'loadTrack', track: 1, audio: a });
-    rig.host.send({ t: 'loadTrack', track: 3, audio: b });
+    rig.host.send({ t: 'loadTrack', track: 1, audio: copyAudio(a) });
+    rig.host.send({ t: 'loadTrack', track: 3, audio: copyAudio(b) });
     rig.host.send({ t: 'exportTracks', reqId: 4 });
     for (let i = 0; i < 5 && trackReplies(rig).length === 0; i++) run(rig.processor, 128);
     const replies = trackReplies(rig);
@@ -244,7 +300,7 @@ describe('EngineHost export reassembly (ruling R47)', () => {
   it('keeps interleaved requests in order, each with its own audio', async () => {
     const rig = await startHost();
     const a = audioOf(60000, 3);
-    rig.host.send({ t: 'loadTrack', track: 0, audio: a });
+    rig.host.send({ t: 'loadTrack', track: 0, audio: copyAudio(a) });
     rig.host.send({ t: 'exportTracks', reqId: 1 });
     run(rig.processor, 128); // request 1 is streaming
     rig.host.send({ t: 'clear', track: 0 });
@@ -303,6 +359,34 @@ describe('EngineHost latency', () => {
     // outputLatency 0.02 s, baseLatency 0.005 s at 48 kHz
     expect(rig.host.latency()).toEqual({ roundTripFrames: 1200, outputLatencyFrames: 960 });
     expect(latencyCommands(rig)).toEqual([{ roundTripFrames: 1200, outputLatencyFrames: 960 }]);
+  });
+
+  it('M2: a context already running at start re-reads outputLatency once audio plays (no statechange will come)', async () => {
+    const ctx = new FakeContext();
+    ctx.outputLatency = 0; // iOS: 0 until audio has played, though the context already says running
+    const rig = await startHost({ ctx });
+    expect(rig.host.latency()).toEqual({ roundTripFrames: 240, outputLatencyFrames: 240 });
+    ctx.outputLatency = 0.01;
+    run(rig.processor, SR); // a second of audio: statuses reach the host
+    expect(rig.host.latency()).toEqual({ roundTripFrames: 720, outputLatencyFrames: 480 });
+    expect(latencyCommands(rig).at(-1)).toEqual({ roundTripFrames: 720, outputLatencyFrames: 480 });
+  });
+
+  it('M2: the re-reads stop after the first seconds of audio (a later wobble does not retime a pass); running again restarts them', async () => {
+    const ctx = new FakeContext();
+    ctx.outputLatency = 0;
+    const rig = await startHost({ ctx });
+    run(rig.processor, 4 * SR);
+    const sent = latencyCommands(rig).length;
+    ctx.outputLatency = 0.012;
+    run(rig.processor, 2 * SR);
+    expect(latencyCommands(rig)).toHaveLength(sent);
+    ctx.setState('interrupted');
+    ctx.outputLatency = 0; // a new route: 0 again until it plays
+    ctx.setState('running');
+    ctx.outputLatency = 0.015;
+    run(rig.processor, SR);
+    expect(latencyCommands(rig).at(-1)).toEqual({ roundTripFrames: 960, outputLatencyFrames: 720 });
   });
 
   it('falls back to baseLatency while outputLatency reads 0, and updates once the context runs', async () => {
