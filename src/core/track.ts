@@ -1734,6 +1734,15 @@ export class Track implements SyncTrack {
     return Math.abs(rate - 1) * this._take.length <= 0.5 + 1e-9;
   }
 
+  /**
+   * The loop would play on the exact path with the transport at `bpm` (its rate, at the speed set now, counts as 1).
+   * The core asks this when tracks load, to pick the tempo that keeps the loaded loops exact (ruling R65).
+   */
+  exactAt(bpm: number): boolean {
+    const r = playbackRate(this.cfg.tempoSyncSw, bpm, this._recordedTempo, this.targetSpeed());
+    return this.isUnity(r > RATE_MAX ? RATE_MAX : r < RATE_MIN ? RATE_MIN : r);
+  }
+
   /** A position folded into `[0, length)`: the exact path's seam-corrected frames -1 and `length` are the loop's ends. */
   private wrapped(pos: number): number {
     const len = this._take.length;
