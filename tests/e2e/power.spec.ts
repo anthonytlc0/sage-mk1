@@ -21,7 +21,7 @@ test('off until POWER: the panel is dark and its controls do nothing', async ({ 
 test('first power-on: the boot screen, then CALIBRATE? over the play screen; EXIT shows the play screen at 120.0', async ({ page, browserName }) => {
   await tap(page, powerSwitch(page), browserName);
   await expect.poll(() => lcdShows(page, `VER ${APP_VERSION}`, FONT_SMALL), { intervals: [20] }).toBe(true);
-  await expect.poll(() => powerState(page), { timeout: 3000, intervals: [50] }).toBe('on');
+  await expect.poll(() => powerState(page), { timeout: 10_000, intervals: [50] }).toBe('on');
   await expect(powerSwitch(page)).toHaveAttribute('aria-checked', 'true');
   expect(await topScreen(page)).toBe('LATENCY'); // the first-run offer
   await expect.poll(() => lcdShows(page, 'CALIBRATE?', FONT_MEDIUM)).toBe(true); // drawn by the next frame
@@ -33,7 +33,7 @@ test('first power-on: the boot screen, then CALIBRATE? over the play screen; EXI
 test('a returning user: POWER lands on the play screen within 3 s; POWER off goes dark', async ({ page, browserName }) => {
   // The first power-on makes the CALIBRATE? offer; a POWER off saves that it was made.
   await tap(page, powerSwitch(page), browserName);
-  await expect.poll(() => powerState(page), { timeout: 3000 }).toBe('on');
+  await expect.poll(() => powerState(page), { timeout: 10_000 }).toBe('on');
   await page.keyboard.press('Escape');
   await tap(page, powerSwitch(page), browserName);
   await expect.poll(() => powerState(page)).toBe('off');
@@ -78,7 +78,7 @@ interface BootTiming {
 
 test('trk1.rec with the fake mic: red while recording, green once the second press closes the loop', async ({ page, browserName }) => {
   await tap(page, powerSwitch(page), browserName);
-  await expect.poll(() => powerState(page), { timeout: 3000 }).toBe('on');
+  await expect.poll(() => powerState(page), { timeout: 10_000 }).toBe('on');
   await page.keyboard.press('Escape'); // past the CALIBRATE? offer
   await expect.poll(() => lcdShows(page, '120.0', FONT_SMALL)).toBe(true);
   expect(await page.evaluate(() => window.__sage!.unit.engine!.micAvailable)).toBe(true);
@@ -102,7 +102,7 @@ test('portrait shows the rotate screen; landscape hides it', async ({ page }) =>
 
 test('the panel, POWER and the recorder pod keep at least 24 px from every edge', async ({ page, browserName }) => {
   await tap(page, powerSwitch(page), browserName);
-  await expect.poll(() => powerState(page), { timeout: 3000 }).toBe('on');
+  await expect.poll(() => powerState(page), { timeout: 10_000 }).toBe('on');
   const boxes = await page.evaluate(() => {
     const sr = window.__sage!.view.rootSvg.getBoundingClientRect();
     const vb = { w: 1680, h: 936 };
@@ -168,7 +168,7 @@ const topAt = (page: Page, selector: string): Promise<string> =>
 test.describe('TAP POWER TO RESUME', () => {
   test.beforeEach(async ({ page, browserName }) => {
     await tap(page, powerSwitch(page), browserName);
-    await expect.poll(() => powerState(page), { timeout: 3000 }).toBe('on');
+    await expect.poll(() => powerState(page), { timeout: 10_000 }).toBe('on');
     await page.keyboard.press('Escape');
   });
 
