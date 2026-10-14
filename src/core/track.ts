@@ -274,6 +274,14 @@ export class Track implements SyncTrack {
    * 1): it starts the moment the tail ends (fix round 1). Shown as pending 'dub'; a second press cancels it.
    */
   private punchPending = false;
+  /** The frame the waiting punch-in was heard at: when it starts, the input from then on is the pass's (fix round 1). */
+  private punchHeard = 0;
+  /**
+   * The round trip the current recording, and the current pass, run with (latched when they start), so a latency
+   * change mid-way leaves no hole or double write in them.
+   */
+  private recLag = 0;
+  private passLag = 0;
 
   // Undo history (see the file comment) ---------------------------------------------------------------------------
   /** The four snapshots (history.ts); a take released from them leaves the in-flight lists first (`forget`). */
@@ -505,6 +513,7 @@ export class Track implements SyncTrack {
           // pass is whole, in the take and in the new pass's undo. Cutting it left a step in the layer, and the two
           // passes cannot share the gathering ring without the undo picking up the new one.
           this.punchPending = true;
+          this.punchHeard = now + this.host.lead - this.host.lag;
           return;
         }
         this.beginPass(false);
@@ -851,7 +860,8 @@ export class Track implements SyncTrack {
     this._state = 'recording'; // the take is always fresh and empty here
     this.autoRec = false;
     this.recSkip = skip;
-    this.recStart = frame + skip - this.host.lag;
+    this.recLag = this.host.lag;
+    this.recStart = frame + skip - this.recLag;
     this.recEnd = null;
     this.recEndFrames = 0;
     this.recMu = 0;
@@ -866,6 +876,15 @@ export class Track implements SyncTrack {
       const r = sync.origin + Math.round((start - sync.origin) / M) * M - start;
       if (Math.abs(r) < 1) this.recResidual = r;
     }
+  }
+
+  /**
+   * The current action's lead (`host.lead`) for a recording or pass running with round trip `lag` (latched when it
+   * started): the input frames from now on heard before the action, 0..lag.
+   */
+  private leadFor(lag: number): number {
+    const lead = this.host.lead - this.host.lag + lag;
+    return lead < 0 ? 0 : lead > lag ? lag : lead;
   }
 
   /** AUTO REC: the input reached SENS at timeline frame `now`, its first frame of the loop (the core calls this). */
@@ -898,7 +917,7 @@ export class Track implements SyncTrack {
     }
     const len = this._take.length;
     // The recording's length when the press was heard: the input for the last `lead` frames of it is still on its way.
-    const heardLen = len + this.host.lead - this.recSkip;
+    const heardLen = len + this.leadFor(this.recLag) - this.recSkip;
     if (this.syncMode() !== 'grid') {
       if (heardLen > len) {
         this.recEnd = next;
@@ -1028,8 +1047,10 @@ export class Track implements SyncTrack {
     this.seamPhase = 0;
     // The latency pipeline: the loop's end was heard `lag` frames ago (that much input was still on its way), so
     // playback picks up `lag` frames further on, in step with what is heard now, `lag` ahead of where a REC->DUB pass
-    // writes (the input arriving now belongs at the playhead of `lag` frames ago).
-    const lag = this.host.lag;
+    // writes (the input arriving now belongs at the playhead of `lag` frames ago). So the first pass's first `lag`
+    // frames are never heard: the playback cannot start before the recording's last input has arrived (deferred, fix
+    // round 1: a pre-start of the playback from the frames already recorded).
+    const lag = this.recLag;
     const ahead = over + lag;
     if (this.exact) {
       this.readPos = 0;
@@ -1493,7 +1514,7 @@ export class Track implements SyncTrack {
    * `fromRecording`: the pass follows a recording, during which the track output nothing, so REPLACE2 is muted at once
    * rather than ramped (it must never play the track).
    */
-  private beginPass(fromRecording: boolean, passFrames = 0, before: Snap | null = null): void {
+  private beginPass(fromRecording: boolean, passFrames = 0, before: Snap | null = null, lead = this.host.lead): void {
     // Undo history: the pass can be undone to the loop as it is now (`before`, when the caller has it). An earlier
     // pass's gathered writes land first, so that loop holds all of it; seam and punch-out tails carry on into it.
     if (before === null) {
@@ -1507,7 +1528,8 @@ export class Track implements SyncTrack {
     this.passMode = this.cfg.dubMode;
     // A press: the input heard before it is still arriving for `lead` frames, and is not the pass's (the latency
     // pipeline). A pass straight from a recording carries on from input already where it was heard.
-    this.passFrames = fromRecording ? passFrames : passFrames - this.host.lead;
+    this.passLag = fromRecording ? this.recLag : this.host.lag;
+    this.passFrames = fromRecording ? passFrames : passFrames - lead;
     if (!this.exact) this.startStream(!fromRecording);
     if (this.passMode === 'REPLACE2') {
       if (fromRecording) this.mute.set(0);
@@ -1520,7 +1542,7 @@ export class Track implements SyncTrack {
    * `pending` frames of input heard before the press that are still on their way (the latency pipeline; a press's
    * lead, 0 after an interruption).
    */
-  private endPass(tail: boolean, pending = this.host.lead): void {
+  private endPass(tail: boolean, pending = this.leadFor(this.passLag)): void {
     this.seamSkip = false;
     this.replayNext = false;
     const xf = this.host.xfade;
@@ -1530,7 +1552,7 @@ export class Track implements SyncTrack {
       // A tail still running from a pass that ended under 5 ms (plus the round trip) ago is cut short (a negligible
       // overlap). It starts where the pass would write next: `lag` behind the playhead.
       const len = this._take.length;
-      this.dubTail.pos = ((((this.playhead - this.host.lag) % len) + len) % len);
+      this.dubTail.pos = ((((this.playhead - this.passLag) % len) + len) % len);
       this.dubTail.left = pending + xf;
       this.dubTail.j = j;
       this.dubTail.replace = this.passMode !== 'OVERDUB';
@@ -1757,7 +1779,7 @@ export class Track implements SyncTrack {
    */
   private startStream(lagged = true): void {
     const rate = this.rateAt(this.speed);
-    const q0 = lagged ? this.readPos - rate * this.host.lag : this.readPos;
+    const q0 = lagged ? this.readPos - rate * this.passLag : this.readPos;
     // A fresh stream writes to the current take only (a pass's own writes never reach a snapshot).
     if (this.writer.pending) this.wSinks.add(this._take);
     else this.wSinks.reset(this._take);
@@ -1950,7 +1972,7 @@ export class Track implements SyncTrack {
         }
         if (due < end) end = due;
       }
-      this.renderSpan(inL, inR, outL, outR, a, end);
+      this.renderSpan(inL, inR, outL, outR, a, end, frame0);
       a = end;
     }
   }
@@ -1963,6 +1985,7 @@ export class Track implements SyncTrack {
     outR: Float32Array,
     from: number,
     to: number,
+    frame0: number,
   ): void {
     let a = from;
     while (a < to) {
@@ -2005,7 +2028,12 @@ export class Track implements SyncTrack {
       if (this.punchPending && this.wTail === 0) {
         // The punch-out tail has just ended: the waiting punch-in starts here, as a press on this frame would.
         this.punchPending = false;
-        if (this._state === 'playing' && this.stopping === null) this.beginPass(false);
+        if (this._state === 'playing' && this.stopping === null) {
+          // As a press heard when it was made would: the input heard since then is the pass's (fix round 1).
+          const lag = this.host.lag;
+          const lead = this.punchHeard + lag - (frame0 + a);
+          this.beginPass(false, 0, null, lead < 0 ? 0 : lead > lag ? lag : lead);
+        }
       }
     }
   }
@@ -2167,7 +2195,7 @@ export class Track implements SyncTrack {
    * so it is written there (`lag` 0: recorded input already in place, `dubOvershoot`), wrapping at the loop end. Input
    * heard before the punch-in (`passFrames` < 0) is let go by.
    */
-  private writePass(inL: Float32Array, inR: Float32Array, a: number, m: number, lag = this.host.lag): void {
+  private writePass(inL: Float32Array, inR: Float32Array, a: number, m: number, lag = this.passLag): void {
     const xf = this.host.xfade;
     const len = this._take.length;
     const { srcL, srcR, tmpL, tmpR } = this;

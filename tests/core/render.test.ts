@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cycleLength, lengthAfterRate, renderMix } from '../../src/core/render';
+import { cycleLength, lengthAfterRate, mixRenderer, renderMix } from '../../src/core/render';
+import { LooperCore } from '../../src/core/looper';
 import { RATE_MAX } from '../../src/core/track';
 import { defaultMemory } from '../../src/schema/memory';
 import { defaultSystem } from '../../src/schema/system';
@@ -57,13 +58,67 @@ describe('renderMix: one full cycle', () => {
     expect(cycleLength([CAP + 5], CAP)).toBe(CAP); // never more than the cap
   });
 
-  it('all playing tracks start together at frame 0 and are summed (after the 5 ms start ramp)', () => {
-    const { L, R } = mix([audio(2000, (k) => k / 10000), audio(3000, (k) => -k / 20000)]);
-    for (let f = XF; f < 6000; f += 101) {
-      expect(L[f]).toBeCloseTo((f % 2000) / 10000 - (f % 3000) / 20000, 6);
+  it('all playing tracks start together and are summed; the cycle starts 5 ms in, past the start ramp', () => {
+    const { L, R } = mix([audio(2000, (k) => 0.1 + k / 10000), audio(3000, (k) => -k / 20000)]);
+    for (let f = 0; f < 6000; f += 101) {
+      const g = f + XF; // the tracks started together XF frames before the cycle's first frame
+      expect(L[f]).toBeCloseTo(0.1 + (g % 2000) / 10000 - (g % 3000) / 20000, 6);
       expect(R[f]).toBeCloseTo(L[f], 9);
     }
-    expect(Math.abs(L[0])).toBeLessThan(1e-9); // the ramp starts from silence, as a start does live
+  });
+
+  it('its first frames are the steady state, so the cycle loops with no dip at its seam', () => {
+    const t = audio(1000, (k) => 0.25 + k / 10000);
+    const { L } = mix([t]);
+    for (let f = 0; f < 1000; f++) expect(L[f]).toBeCloseTo(t.L[(f + XF) % 1000], 6);
+  });
+
+  it('mixRenderer streams the very samples renderMix returns, whatever the chunk size', () => {
+    const sine = (hz: number) => (k: number): number => 0.4 * Math.sin((2 * Math.PI * hz * k) / SR);
+    const tracks: Slot[] = [audio(2000, sine(7), 60), audio(3000, sine(11), 120), audio(1500, sine(3), 100), null, null];
+    const edit = (m: MemorySettings): void => {
+      m.track[0].tempoSyncMode = 'PITCH';
+      m.track[1].reverse = true;
+      m.track[2].tempoSyncMode = 'XFADE';
+    };
+    const { memory, system } = settings(edit);
+    const playing = [true, true, true, false, false];
+    const gains = [1, 0.5, 0.8, 1, 1];
+    const whole = renderMix(memory, system, tracks, playing, gains, SR);
+    expect(whole.L.length).toBeGreaterThan(0);
+    for (const step of [4096, 777, 1]) {
+      const r = mixRenderer(memory, system, tracks, playing, gains, SR);
+      expect(r.frames).toBe(whole.L.length);
+      expect(r.cut).toBe(false);
+      const L = new Float32Array(r.frames);
+      const R = new Float32Array(r.frames);
+      const bl = new Float32Array(step);
+      const br = new Float32Array(step);
+      for (let at = 0; at < r.frames; at += step) {
+        const n = Math.min(step, r.frames - at);
+        r.render(bl, br, n);
+        L.set(bl.subarray(0, n), at);
+        R.set(br.subarray(0, n), at);
+      }
+      expect(L).toEqual(whole.L);
+      expect(R).toEqual(whole.R);
+    }
+  });
+
+  it('a cap shorter than the cycle cuts it there and says so', () => {
+    const tracks: Slot[] = [audio(2000, () => 0.25), audio(3000, () => 0.125), null, null, null];
+    const { memory, system } = settings();
+    const playing = [true, true, false, false, false];
+    const capped = mixRenderer(memory, system, tracks, playing, [1, 1, 1, 1, 1], SR, { maxFrames: 1500 });
+    expect(capped.frames).toBe(1500);
+    expect(capped.cut).toBe(true);
+    const free = mixRenderer(memory, system, tracks, playing, [1, 1, 1, 1, 1], SR, { maxFrames: 6000 });
+    expect(free.frames).toBe(6000);
+    expect(free.cut).toBe(false);
+    // Past 10 minutes the cycle falls back to the longest track: that is the brief's rule, not a cut.
+    const coprime = mixRenderer(memory, system, [audio(1009, () => 0.1), audio(997, () => 0.1), null, null, null], playing, [1, 1, 1, 1, 1], SR);
+    expect(coprime.frames).toBe(1009);
+    expect(coprime.cut).toBe(false);
   });
 
   it('only the playing tracks sound, each at its fader gain', () => {
@@ -103,13 +158,13 @@ describe('renderMix: one full cycle', () => {
     const rev = mix([audio(1000, (k) => k / 1000)], track((s) => {
       s.reverse = true;
     }));
-    expect(rev.L[100]).toBeCloseTo(899 / 1000, 6);
+    expect(rev.L[100]).toBeCloseTo((899 - XF) / 1000, 6);
     const once = mix([audio(1000, () => 0.5), audio(3000, () => 0)], track((s) => {
       s.oneShot = true;
     }));
     expect(once.L.length).toBe(3000);
     expect(once.L[500]).toBeCloseTo(0.5, 6);
-    expect(once.L.subarray(1000 + XF).every((v) => v === 0)).toBe(true);
+    expect(once.L.subarray(1000).every((v) => v === 0)).toBe(true); // once, from XF frames before the cycle
   });
 });
 
@@ -121,7 +176,7 @@ describe('renderMix: tempo sync, as live', () => {
       m.track[0].tempoSyncMode = 'PITCH';
     });
     expect(r.L.length).toBe(1000);
-    for (let f = XF; f < 1000; f += 53) expect(r.L[f]).toBeCloseTo((2 * f) / 10000, 5);
+    for (let f = 0; f < 1000 - XF; f += 53) expect(r.L[f]).toBeCloseTo((2 * (f + XF)) / 10000, 5);
   });
 
   it('XFADE keeps the pitch where PITCH raises it', () => {
@@ -165,16 +220,54 @@ describe('renderMix: tempo sync, as live', () => {
     })).L.length).toBe(1000);
   });
 
-  it('a synced loop at the tempo it derived plays sample for sample, though the memory keeps that tempo only to 0.1 BPM (R31)', () => {
+  it('plays at the tempo it is given, the engine\'s exact one, not the memory\'s 0.1 BPM copy (R31)', () => {
     // 8 measures of 4/4 in 14948 frames: 128.4453 BPM, which the memory stores as 128.4.
     const T = 14948;
     const bpm = (8 * 4 * 60 * SR) / T;
     const t = audio(T, (k) => Math.sin(k / 7) * 0.5, bpm, 8);
-    const r = mix([t], (m) => {
+    const { memory, system } = settings((m) => {
       m.tempo = 128.4;
     });
+    const r = renderMix(memory, system, [t, null, null, null, null], [true, false, false, false, false], [1, 1, 1, 1, 1], SR, bpm);
     expect(r.L.length).toBe(T);
-    for (let f = XF; f < T; f += 113) expect(r.L[f]).toBe(t.L[f]);
+    for (let f = 0; f < T; f += 113) expect(r.L[f]).toBe(t.L[(f + XF) % T]);
+  });
+
+  it('a loop at 119.97 BPM under a memory tempo of 120.0 plays bit for bit as it does live', () => {
+    // 8 measures in 16004 frames. The memory's 120.0 is within R31's 0.05 of it, which once left the offline transport
+    // at 120.0 and played the loop 0.025 % fast through XFADE.
+    const T = 16004;
+    const bpm = (8 * 4 * 60 * SR) / T;
+    const t = audio(T, (k) => Math.sin(k / 5) * 0.5 + Math.sin(k / 31) * 0.3, bpm, 8);
+    const { memory, system } = settings((m) => {
+      m.tempo = 120;
+    });
+    const tracks: Slot[] = [t, null, null, null, null];
+    const playing = [true, false, false, false, false];
+    const r = renderMix(memory, system, tracks, playing, [1, 1, 1, 1, 1], SR, bpm);
+    expect(r.L.length).toBe(T);
+
+    // Live: the engine's transport is at the loop's exact tempo, and the loop starts from stopped.
+    const live = new LooperCore({ sampleRate: SR, memoryBudgetBytes: 64 * 1024 * 1024 });
+    const liveMem = settings((m) => {
+      m.tempo = 120;
+      for (const s of m.track) s.loopSyncSw = false;
+    }).memory;
+    live.setSettings(liveMem, system);
+    live.command({ t: 'tempo', bpm });
+    live.setTrackAudio(0, t);
+    live.command({ t: 'recPlay', track: 0 });
+    const out = { tracks: [0, 1, 2, 3, 4].map((): [Float32Array, Float32Array] => [new Float32Array(T + XF), new Float32Array(T + XF)]), click: [new Float32Array(T + XF), new Float32Array(T + XF)] as [Float32Array, Float32Array] };
+    const z = new Float32Array(T + XF);
+    live.process(z, z, z, z, out, T + XF);
+    let differ = 0;
+    for (let f = 0; f < T; f++) if (r.L[f] !== out.tracks[0][0][f + XF]) differ++;
+    expect(differ).toBe(0);
+    const streamed = mixRenderer(memory, system, tracks, playing, [1, 1, 1, 1, 1], SR, { tempo: bpm });
+    const L = new Float32Array(T);
+    const R = new Float32Array(T);
+    streamed.render(L, R, T);
+    expect(L).toEqual(r.L);
   });
 });
 

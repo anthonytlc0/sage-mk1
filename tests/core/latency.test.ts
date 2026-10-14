@@ -1,6 +1,9 @@
-import { describe, expect, it } from 'vitest';
-import type { LooperCore } from '../../src/core/looper';
-import { at, dc, makeCore, ramp, recPlay, run, trk, XF } from './harness';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { LooperCore } from '../../src/core/looper';
+import { defaultMemory } from '../../src/schema/memory';
+import { defaultSystem } from '../../src/schema/system';
+import type { EngineCommand } from '../../src/shared/protocol';
+import { at, dc, makeCore, makeOutput, ramp, recPlay, run, trk, XF } from './harness';
 import { exportTracks, freeSettings, makeProcessor, maxAbs, run as runProcessor, send } from '../engine/helpers';
 
 const PLAY = { rec: { recAction: 'REC->PLAY' as const } };
@@ -200,5 +203,117 @@ describe('the engine hands the round trip to the core (Task 21 calibration -> la
     expect(loop.length).toBe(48000);
     expect(maxAbs(loop)).toBeLessThanOrEqual(0.5 + 1e-5);
     expect(maxAbs(loop)).toBeGreaterThan(0.5 - 1e-5); // the overdub is there
+  });
+});
+
+describe('fix round 1: the latency pipeline away from the exact path', () => {
+  const SR48 = 48000;
+  /** The input heard at frame h: it varies, so a layer in the wrong place shows. */
+  const sig = (h: number): number => 0.3 * Math.sin(h / 37) + 0.2 * Math.sin(h / 113);
+
+  /**
+   * A 2 s loop recorded at 120, played at 126 (TEMPO SYNC `mode`: off the exact path), then overdubbed by presses dated
+   * at the frames they were heard: `presses` are heard frames of REC/DUB/PLAY. The input arriving at frame f is
+   * `input(f - rt)`. Returns the loop.
+   */
+  function overdubbed(rt: number, mode: 'PITCH' | 'XFADE', presses: number[], input: (h: number) => number, end: number): Float32Array {
+    const memory = defaultMemory();
+    for (const t of memory.track) t.loopSyncSw = false;
+    memory.rec.recAction = 'REC->PLAY';
+    memory.track[0].tempoSyncSw = true;
+    memory.track[0].tempoSyncMode = mode;
+    const core = new LooperCore({ sampleRate: SR48, memoryBudgetBytes: 256 * 1024 * 1024 });
+    core.setSettings(memory, defaultSystem());
+    core.setLatency(rt, 0);
+    const cmds: [number, EngineCommand][] = [
+      [0, recPlay()],
+      [96000, recPlay()],
+      [110000, { t: 'tempo', bpm: 126 }],
+      ...presses.map((f): [number, EngineCommand] => [f, recPlay()]),
+    ];
+    for (const [f, cmd] of cmds) core.command(cmd, f);
+    const out = makeOutput(128);
+    const inL = new Float32Array(128);
+    const none = new Float32Array(128);
+    for (let f0 = 0; f0 < end; f0 += 128) {
+      for (let k = 0; k < 128; k++) inL[k] = input(f0 + k - rt);
+      core.process(inL, inL, none, none, out, 128);
+    }
+    return core.getTrackAudio(0)!.L;
+  }
+
+  it('PITCH: the same heard presses give the same loop at round trips 0, 1440 and 7000, quick punch-ins included', () => {
+    // Passes: 150000-180000; 200000-230000, then a punch-in 100 frames after the punch-out (inside its 5 ms tail, so it
+    // waits for the tail at every round trip) to 240000, then one 1000 frames after that punch-out: past the 5 ms tail,
+    // but inside a 1440 or 7000-frame tail still carrying the pass's last input (it waits, then must start where heard).
+    const presses = [150000, 180000, 200000, 230000, 230100, 240000, 241000, 260000];
+    const plain = overdubbed(0, 'PITCH', presses, sig, 300000);
+    for (const rt of [1440, 7000]) {
+      const late = overdubbed(rt, 'PITCH', presses, sig, 300000 + rt);
+      expect(late.length).toBe(plain.length);
+      let worst = 0;
+      for (let k = 0; k < plain.length; k++) worst = Math.max(worst, Math.abs(late[k] - plain[k]));
+      expect(worst).toBeLessThan(1e-5);
+    }
+  });
+
+  it('XFADE: an overdub lands where it was heard, within a splice', () => {
+    const burst = (h: number): number => (h >= 160000 && h < 165000 ? 0.5 * Math.sin(h / 9) : 0);
+    const edges = (rt: number): [number, number] => {
+      const loop = overdubbed(rt, 'XFADE', [150000, 200000], (h) => (h < 96000 ? 0 : burst(h)), 230000 + rt);
+      let first = -1;
+      let last = -1;
+      for (let k = 0; k < loop.length; k++) {
+        if (Math.abs(loop[k]) > 0.05) {
+          if (first < 0) first = k;
+          last = k;
+        }
+      }
+      return [first, last];
+    };
+    const [a0, a1] = edges(0);
+    const [b0, b1] = edges(1440);
+    expect(a0).toBeGreaterThan(0);
+    // A splice is 2/7 of a 60 ms grain at the rate (about 860 frames at 48 kHz and 1.05x); unplaced, the layer would
+    // sit 1.05 x 1440 = 1512 frames late.
+    const splice = 1.05 * 2 * Math.round(2880 / 7);
+    expect(Math.abs(b0 - a0)).toBeLessThan(splice);
+    expect(Math.abs(b1 - a1)).toBeLessThan(splice);
+  });
+
+  it('a pass keeps the round trip it started with: a latency change mid-pass leaves no hole and no double layer', () => {
+    const core = lagged();
+    const x = dc(0.25);
+    at(core, 0, recPlay(), x);
+    at(core, 1000, recPlay(), x); // a loop of 0.25
+    at(core, 2000, recPlay(), x); // overdub from position 0
+    run(core, 300, x);
+    core.setLatency(60, 10); // the output device changed, say
+    at(core, 2600, recPlay(), x);
+    run(core, 200, x);
+    const loop = core.getTrackAudio(0)!.L;
+    for (let k = XF; k < 590; k++) expect(loop[k]).toBeCloseTo(0.5, 6);
+    expect(Math.max(...loop)).toBeLessThanOrEqual(0.5 + 1e-6);
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('a latency command allocates nothing on the audio thread: the delay rings are there from the start', () => {
+    const core = new LooperCore({ sampleRate: SR48, memoryBudgetBytes: 64 * 1024 * 1024 });
+    const out = makeOutput(128);
+    const z = new Float32Array(128);
+    core.process(z, z, z, z, out, 128);
+    const made: unknown[] = [];
+    const Real = Float32Array;
+    vi.stubGlobal('Float32Array', new Proxy(Real, {
+      construct(target, args: unknown[]) {
+        made.push(args);
+        return Reflect.construct(target, args) as object;
+      },
+    }));
+    core.command({ t: 'latency', roundTripFrames: SR48, outputLatencyFrames: 480 }); // the longest taken: 1 s
+    for (let i = 0; i < 10; i++) core.process(z, z, z, z, out, 128);
+    vi.unstubAllGlobals();
+    expect(made).toHaveLength(0);
   });
 });

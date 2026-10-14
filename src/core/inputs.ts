@@ -14,9 +14,13 @@
  * late, landing on the timeline frame it was heard at. (With no latency the ring hands back what was pushed this
  * very span: sources must be rendered before the tracks that record them, which the core arranges.)
  *
- * Buffers grow only when the block size or the round trip does (a setLatency, or the first larger block), never per
- * block, and nothing else allocates.
+ * Everything is allocated at construction, for blocks of up to INITIAL_BLOCK frames and the longest round trip the
+ * core takes (fix round 1: a latency command allocates nothing on the audio thread). Only a larger block grows the
+ * buffers, once.
  */
+
+/** Frames per block the buffers are made for at first (a render quantum is 128; renderMix uses 1024). */
+const INITIAL_BLOCK = 2048;
 
 /** A stereo delay line indexed by absolute timeline frame. */
 class Ring {
@@ -73,10 +77,12 @@ export class InputRouter {
   private tracks: Ring[];
   private block = 0;
 
-  constructor(private readonly count: number) {
+  /** For `count` tracks and round trips of up to `maxLag` frames. */
+  constructor(private readonly count: number, maxLag: number) {
     this.rhythm = new Ring(1);
     this.tracks = [];
     for (let i = 0; i < count; i++) this.tracks.push(new Ring(1));
+    this.ensure(INITIAL_BLOCK, maxLag);
   }
 
   /** Size everything for blocks of up to `n` frames and a round trip of `lag` frames. Allocates only when they grow. */

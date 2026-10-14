@@ -125,7 +125,7 @@ export class LooperCore {
     this.sync = new LoopSync(this.transport);
     this.maxLatency = Math.round(MAX_LATENCY_SECONDS * cfg.sampleRate);
     this.click = new GuideClick(cfg.sampleRate);
-    this.router = new InputRouter(TRACKS.length);
+    this.router = new InputRouter(TRACKS.length, this.maxLatency);
     this.inSelL = this.router.silence;
     this.inSelR = this.router.silence;
     this.late = new Uint8Array(TRACKS.length);
@@ -190,7 +190,6 @@ export class LooperCore {
     this.roundTripFrames = latencyFrames(roundTripFrames, this.maxLatency);
     this.outputLatencyFrames = latencyFrames(outputLatencyFrames, this.maxLatency);
     this.lead = this.roundTripFrames;
-    this.router.ensure(1, this.roundTripFrames); // the delay rings grow now, not in a render
   }
 
   /**
