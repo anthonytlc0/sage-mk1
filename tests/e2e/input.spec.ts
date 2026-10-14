@@ -1,5 +1,6 @@
 import { expect, test, type CDPSession, type Page } from '@playwright/test';
 import type { AbsoluteId, ButtonId, ControlEvent } from '../../src/shared/ids';
+import { finger, type FingerEventType } from './touch';
 
 const PANEL_URL = '/tests/e2e/pages/panel.html';
 
@@ -83,10 +84,7 @@ interface Finger {
  * Multi-touch, per engine.
  *  - Chromium: real touch through CDP `Input.dispatchTouchEvent`. The browser turns each finger into a genuine touch
  *    PointerEvent with its own pointerId, and implicit capture works as on a device.
- *  - WebKit: Playwright has no multi-touch API there (page.touchscreen only taps one finger, and there is no CDP). So
- *    each finger is a synthetic `PointerEvent` (pointerType 'touch', its own pointerId, isPrimary on the first
- *    finger) dispatched on the element under the finger when it went down, which stands in for the capture a real
- *    finger gets. setPointerCapture throws for a synthetic pointerId, which the input layer tolerates.
+ *  - WebKit: Playwright has no multi-touch API there, so each finger is a synthetic touch `PointerEvent` (touch.ts).
  * Either way the page sees two or more concurrently active touch pointers on different controls.
  */
 class Touch {
@@ -109,34 +107,8 @@ class Touch {
     await this.cdp.send('Input.dispatchTouchEvent', { type, touchPoints: points.map(({ id, x, y }) => ({ id, x, y })) });
   }
 
-  private synthetic(type: 'pointerdown' | 'pointermove' | 'pointerup' | 'pointercancel', f: Finger, primary: boolean) {
-    return this.page.evaluate(
-      ({ type, f, primary }) => {
-        const w = window as unknown as { __fingerTarget?: Map<number, Element> };
-        const targets = (w.__fingerTarget ??= new Map());
-        const fresh = document.elementFromPoint(f.x, f.y) ?? document.body;
-        const target = type === 'pointerdown' ? fresh : (targets.get(f.id) ?? fresh);
-        if (type === 'pointerdown') targets.set(f.id, target);
-        if (type === 'pointerup' || type === 'pointercancel') targets.delete(f.id);
-        target.dispatchEvent(
-          new PointerEvent(type, {
-            pointerId: f.id,
-            pointerType: 'touch',
-            isPrimary: primary,
-            clientX: f.x,
-            clientY: f.y,
-            button: type === 'pointermove' ? -1 : 0,
-            buttons: type === 'pointerup' || type === 'pointercancel' ? 0 : 1,
-            width: 20,
-            height: 20,
-            bubbles: true,
-            cancelable: true,
-            composed: true,
-          }),
-        );
-      },
-      { type, f, primary },
-    );
+  private synthetic(type: FingerEventType, f: Finger, primary: boolean): Promise<void> {
+    return finger(this.page, type, f, primary);
   }
 
   async down(f: Finger): Promise<void> {

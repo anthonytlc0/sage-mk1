@@ -5,6 +5,8 @@ export default defineConfig({
   // Relative by default; GitHub Pages builds pass `--base=/<repo>/`. Nothing below hard-codes '/': the manifest's
   // start_url and scope, the service worker's URL and scope, and the precache list all follow Vite's base.
   base: './',
+  // Pre-bundled at server start: found later, on a page's first request, it would make Vite reload every open page.
+  optimizeDeps: { include: ['fflate'] },
   plugins: [
     VitePWA({
       // A new version waits until the app has been closed: it never takes over in the middle of a set.

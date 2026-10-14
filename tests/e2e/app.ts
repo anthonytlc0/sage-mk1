@@ -35,8 +35,9 @@ export const powerState = (page: Page): Promise<PowerState> => page.evaluate(() 
 /** The LCD framebuffer the panel shows now. */
 export const readLcd = (page: Page): Promise<number[]> => page.evaluate(() => Array.from(window.__sage!.lcd()));
 
-export async function lcdShows(page: Page, s: string, font: Font): Promise<boolean> {
-  return lcdHas(await readLcd(page), s, font);
+/** True when the LCD shows `s` in `font` (light on dark with `invert`). */
+export async function lcdShows(page: Page, s: string, font: Font, invert = false): Promise<boolean> {
+  return lcdHas(await readLcd(page), s, font, invert);
 }
 
 /** The title of the top screen of the menu stack, or null when off. */
