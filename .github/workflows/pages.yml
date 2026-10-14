@@ -3,8 +3,8 @@
 # One-time setup in the GitHub repository: Settings > Pages > Build and deployment > Source: "GitHub Actions".
 #
 # The site is served from a project subpath (https://<user>.github.io/<repo>/), so the build gets that path as its
-# base on the command line. vite.config.ts is not touched, and vite-plugin-pwa takes the manifest scope and start_url
-# from the same base. (A user site named <user>.github.io is served from "/" and would need --base=/ instead.)
+# base on the command line. vite.config.ts needs no change for the base, and vite-plugin-pwa takes the manifest scope and
+# start_url from the same base. (A user site named <user>.github.io is served from "/" and would need --base=/ instead.)
 name: Deploy to GitHub Pages
 
 on:
