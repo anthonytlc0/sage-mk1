@@ -156,6 +156,6 @@ Pushing to `main` runs `.github/workflows/pages.yml`. It runs `npm ci`, the type
 
 ## License and credits
 
-License: to be decided before publishing.
+Released under the MIT License; see [LICENSE](LICENSE).
 
 Third-party licenses, the Roland trademark notice, and what was and was not used from the manuals are in [CREDITS.md](CREDITS.md).
