@@ -90,8 +90,60 @@ describe('exportLoopMix', () => {
     expect(playing).toEqual([true, true, false, false, false]); // playing and overdubbing sound; stopped, recording, empty do not
     expect(gains).toEqual([1, 0.5, 0.25, 0, 1]);
     expect(sr).toBe(SR);
-    // The engine's exact tempo (the memory keeps it to 0.1 BPM only), and the desktop's 10-minute cap.
-    expect(opts).toEqual({ tempo: src.status!.tempo, maxFrames: 10 * 60 * SR });
+    // The engine's exact tempo (the memory keeps it to 0.1 BPM only), the desktop's 10-minute cap, and where each track
+    // is (all at their start in this status).
+    expect(opts).toEqual({ tempo: src.status!.tempo, maxFrames: 10 * 60 * SR, offsets: [0, 0, 0, 0, 0] });
+  });
+
+  it('hands on each playing track\'s live playhead from the status, as frames into its loop in play order (R64)', async () => {
+    const tracks = [track(1000, 0.1), track(1000, 0.2), track(400, 0.3), track(1000, 0.4), null];
+    const states: TrackState[] = ['playing', 'overdubbing', 'playing', 'stopped', 'empty'];
+    const status = makeStatus({ sampleRate: SR, tempo: 121.37 }, [
+      { state: 'playing', position: 0.25 },
+      { state: 'overdubbing', position: 0.5 },
+      { state: 'playing', position: 0.75 }, // REVERSE: the playhead runs 1 -> 0 through the take
+      { state: 'stopped', position: 0 },
+      { state: 'empty', position: 0 },
+    ]);
+    const src = source(tracks, states, { status });
+    src.session.memory.track[2].reverse = true;
+    const render = vi.fn(fakeRender);
+    await exportLoopMix(src, render);
+    const opts = render.mock.calls[0]![6]!;
+    expect(opts.tempo).toBe(121.37);
+    // 250 frames in; 500 in; the REVERSE track's playhead at take frame 300 is 400 - 1 - 300 = 99 frames into its
+    // backwards loop; the stopped and empty tracks do not play.
+    expect(opts.offsets).toEqual([250, 500, 99, 0, 0]);
+  });
+
+  it('takes the playheads, the playing set and the tempo from the one status there is at the press', async () => {
+    const tracks = [track(1000, 0.1), track(1000, 0.2), null, null, null];
+    const atPress = makeStatus({ sampleRate: SR, tempo: 128.4453 }, [
+      { state: 'playing', position: 0.1 },
+      { state: 'playing', position: 0.2 },
+    ]);
+    const later = makeStatus({ sampleRate: SR, tempo: 100 }, [
+      { state: 'playing', position: 0.9 },
+      { state: 'stopped', position: 0 },
+    ]);
+    let exported = false;
+    const src: LoopMixSource & { session: Session } = {
+      session: new Session(),
+      get status() {
+        return exported ? later : atPress;
+      },
+      faderGain: () => 1,
+      requestTracks: async () => {
+        exported = true; // the engine has moved on by the time the tracks arrive
+        return tracks;
+      },
+    };
+    const render = vi.fn(fakeRender);
+    await exportLoopMix(src, render);
+    const [, , , playing, , , opts] = render.mock.calls[0]!;
+    expect(playing).toEqual([true, true, false, false, false]);
+    expect(opts!.tempo).toBe(128.4453);
+    expect(opts!.offsets).toEqual([100, 200, 0, 0, 0]);
   });
 
   it('a track the status calls playing but that has no audio is not in the set', async () => {
@@ -172,6 +224,35 @@ describe('exportLoopMix', () => {
       const b = await bytesOf(await exportLoopMix(src, impulse));
       expect(sameBytes(a, b)).toBe(true);
     });
+  });
+});
+
+describe('exportLoopMix: a cut mix (PROMOTED 2)', () => {
+  /** A constant 0.5 mix of `n` frames at 44.1 kHz (so nothing is resampled), cut or not. */
+  const flat = (n: number, cut: boolean): RenderMixFn => () => {
+    const r = mixFromArrays(new Float32Array(n).fill(0.5), new Float32Array(n).fill(0.5));
+    return { frames: r.frames, cut, render: r.render.bind(r) };
+  };
+  const src = () => source([track(44100, 0.1, 44100), null, null, null, null], ['playing', 'empty', 'empty', 'empty', 'empty'], { sampleRate: 44100 });
+  const XF44 = Math.round((5 * 44100) / 1000); // 5 ms
+
+  it('fades out over its last 5 ms, so it ends on silence rather than mid-waveform', async () => {
+    const n = 3 * 4096 + 100; // the fade spans the last two 4096-frame render steps
+    const wav = await decoded(await exportLoopMix(src(), flat(n, true), { touch: true }));
+    const L = wav.chs[0]!;
+    expect(L.length).toBe(n);
+    expect(L[n - XF44 - 1]).toBeCloseTo(0.5, 5);
+    expect(Math.abs(L[n - 1]!)).toBeLessThan(1e-6);
+    for (let k = n - XF44; k < n; k++) {
+      expect(L[k]!).toBeCloseTo((0.5 * (n - 1 - k)) / XF44, 5);
+      expect(wav.chs[1]![k]!).toBeCloseTo(L[k]!, 6);
+    }
+  });
+
+  it('a whole cycle is not faded: it loops seamlessly as it is', async () => {
+    const n = 5000;
+    const wav = await decoded(await exportLoopMix(src(), flat(n, false), { touch: false }));
+    expect(wav.chs[0]![n - 1]).toBeCloseTo(0.5, 5);
   });
 });
 

@@ -369,9 +369,20 @@ export class LooperCore {
     return this.tracks[i]?.audio() ?? null;
   }
 
-  /** Load (or with null, empty) track `i`. A loaded track is stopped. MEMORY FULL leaves it empty. */
+  /**
+   * Load (or with null, empty) track `i`. A loaded track is stopped. MEMORY FULL leaves it empty. With no track
+   * running, the transport may then take a loaded loop's exact tempo (`snapToLoops`, ruling R65).
+   */
   setTrackAudio(i: TrackIndex, a: TrackAudio | null): void {
-    this.tracks[i]?.load(a);
+    this.loadTrack(i, a, this._frame);
+  }
+
+  /**
+   * Offline renders only (LOOP MIX, ruling R64): start stopped track `i` playing at once from take position `pos`, with
+   * the exact path's seam phase `phase` (see `Track.startAt`). The engine never calls this; a live start is a `recPlay`.
+   */
+  startTrackAt(i: TrackIndex, pos: number, phase = 0): void {
+    this.tracks[i]?.startAt(pos, phase);
   }
 
   /**
@@ -416,7 +427,7 @@ export class LooperCore {
         this.applySettings(cmd.memory, cmd.system, now);
         return;
       case 'loadTrack':
-        this.setTrackAudio(cmd.track, cmd.audio);
+        this.loadTrack(cmd.track, cmd.audio, now);
         return;
       case 'latency':
         this.setLatency(cmd.roundTripFrames, cmd.outputLatencyFrames);
@@ -577,7 +588,58 @@ export class LooperCore {
     const bpm = this.transport.bpm;
     const tempo = this.memory.tempo;
     // R31: the transport's own tempo at the memory's 0.1 BPM step is not a change.
-    const same = Math.abs(tempo - Math.round(bpm * 10) / 10) < 0.05;
-    this.sync.retime(same ? bpm : tempo, this.memory.rhythm.beat, frame);
+    this.sync.retime(storedAs(tempo, bpm) ? bpm : tempo, this.memory.rhythm.beat, frame);
   }
+
+  private loadTrack(i: TrackIndex, a: TrackAudio | null, now: number): void {
+    this.tracks[i]?.load(a);
+    this.snapToLoops(now);
+  }
+
+  /**
+   * Ruling R65 (final review I4): a recalled memory brings its tempo at the 0.1 BPM step it is stored at, while each loop
+   * keeps the exact tempo it was recorded at (128.4453 against 128.4). At the stored tempo a synced loop would miss the
+   * exact path and play through the stretcher. So once the tracks have loaded and none is running, the transport takes
+   * a loaded loop's exact tempo when the memory tempo is its 0.1 BPM copy (R31's own test, so a later settings push of
+   * the memory tempo keeps it), and when that keeps more of the loaded loops on the exact path than the tempo it has.
+   *
+   * The tempo that keeps the most loops exact wins; a tie keeps the transport's tempo, then goes to the loops in track
+   * order. So a memory whose first loop set the tempo gets that loop's tempo back (every loop recorded on its grid is
+   * exact there), and a typed tempo stays (its grid loops are exact at it, and a loop's own tempo can push the longer
+   * ones off). The memory, the LCD and storage keep the 0.1 BPM value. Runs after every load, so the last of a recall's
+   * five loads decides; a command-time cost of five tracks by six tempos, no allocation.
+   */
+  private snapToLoops(frame: number): void {
+    const tracks = this.tracks;
+    for (let i = 0; i < tracks.length; i++) if (tracks[i].running) return;
+    const tempo = this.memory.tempo;
+    const current = this.transport.bpm;
+    let best = current;
+    let most = this.exactCount(current);
+    for (let i = 0; i < tracks.length; i++) {
+      const t = tracks[i];
+      if (!t.hasLoop) continue;
+      const bpm = t.recordedTempo;
+      if (bpm === best || !storedAs(tempo, bpm)) continue;
+      const n = this.exactCount(bpm);
+      if (n > most) {
+        best = bpm;
+        most = n;
+      }
+    }
+    if (best !== current) this.sync.retime(best, this.transport.beat, frame);
+  }
+
+  /** How many of the loaded loops would play on the exact path with the transport at `bpm`. */
+  private exactCount(bpm: number): number {
+    const tracks = this.tracks;
+    let n = 0;
+    for (let i = 0; i < tracks.length; i++) if (tracks[i].hasLoop && tracks[i].exactAt(bpm)) n++;
+    return n;
+  }
+}
+
+/** R31: `tempo` (the memory's, at its 0.1 BPM step) is how the memory stores `bpm`, so it is not a different tempo. */
+function storedAs(tempo: number, bpm: number): boolean {
+  return Math.abs(tempo - Math.round(bpm * 10) / 10) < 0.05;
 }

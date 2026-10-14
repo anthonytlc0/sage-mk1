@@ -1325,6 +1325,18 @@ export class Track implements SyncTrack {
     else this.startPlayback(this.startPosition());
   }
 
+  /**
+   * Offline renders only (LOOP MIX, ruling R64): start a stopped track playing now from take position `pos`, as a start
+   * from stopped does (START MODE, the 5 ms ramp-in, PLAY MODE SINGLE), with no wait for a line and no LOOP SYNC
+   * alignment. A whole-frame `pos` keeps the exact path, with seam phase `phase` (see `seamPhase`). A position outside
+   * the take, or not a number, starts at the loop's start. Live starts go through `recPlay`.
+   */
+  startAt(pos: number, phase = 0): void {
+    if (this._state !== 'stopped') return;
+    const ok = Number.isFinite(pos) && pos >= 0 && pos < this._take.length;
+    this.startPlayback(ok ? pos : this.startPosition(), Number.isFinite(phase) ? phase : 0);
+  }
+
   // ALL START/STOP and PLAY MODE SINGLE (driven by the core) --------------------------------------------------------
 
   /** Recording, playing or overdubbing. */
@@ -1731,7 +1743,19 @@ export class Track implements SyncTrack {
    * speed change never is. Such a loop plays on the exact path, its drift corrected at the seam.
    */
   private isUnity(rate: number): boolean {
-    return Math.abs(rate - 1) * this._take.length <= 0.5 + 1e-9;
+    // `length / rate` is the length on the timeline. (Not `|rate - 1| x length`, which is a hair over half a frame for a
+    // grid loop whose ideal length is a whole number and a half, rounded up: that sent it through the stretcher.)
+    const len = this._take.length;
+    return Math.abs(len / rate - len) <= 0.5 + 1e-9;
+  }
+
+  /**
+   * The loop would play on the exact path with the transport at `bpm` (its rate, at the speed set now, counts as 1).
+   * The core asks this when tracks load, to pick the tempo that keeps the loaded loops exact (ruling R65).
+   */
+  exactAt(bpm: number): boolean {
+    const r = playbackRate(this.cfg.tempoSyncSw, bpm, this._recordedTempo, this.targetSpeed());
+    return this.isUnity(r > RATE_MAX ? RATE_MAX : r < RATE_MIN ? RATE_MIN : r);
   }
 
   /** A position folded into `[0, length)`: the exact path's seam-corrected frames -1 and `length` are the loop's ends. */
