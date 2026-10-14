@@ -34,7 +34,7 @@ import type { TakeInfo } from '../storage/takes';
 import { TakePlayer } from './takePlayer';
 
 export interface RecorderPodOptions {
-  /** The mixer behind LOOP MIX: Task 9's `renderMix`. Null until it exists: LOOP MIX then says NOT READY (ruling R56). */
+  /** The mixer behind LOOP MIX: Task 9's `renderMix` (the app's renderAdapter). Null: LOOP MIX says NOT READY (R56). */
   render: RenderMixFn | null;
   /** Most bytes of take Blobs kept ready for SAVE and play. Default 64 MB (`DEFAULT_CACHE_BYTES`). */
   cacheBytes?: number;

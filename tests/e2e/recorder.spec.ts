@@ -1,4 +1,7 @@
 import { expect, test, type Download, type Locator, type Page } from '@playwright/test';
+import { FONT_SMALL } from '../../src/lcd/fonts';
+import { expectLed, lcdShows, openApp, powerState, powerSwitch, pressControl, tap } from './app';
+import { fakeMic } from './fakeMic';
 
 const HARNESS = '/tests/e2e/pages/recorder.html';
 
@@ -345,18 +348,41 @@ test.describe('recorder pod: memory and saving', () => {
   });
 });
 
-test.describe('recorder pod: no mixer yet', () => {
-  test('LOOP MIX says NOT READY, asks the engine for nothing and stays LOOP MIX (ruling R56)', async ({ page }) => {
+test.describe('recorder pod: LOOP MIX in the app (renderMix, Task 9)', () => {
+  test('after recording a track, LOOP MIX prepares the mix and offers SAVE MIX', async ({ page, browserName }) => {
     const errors: string[] = [];
     page.on('pageerror', (e) => errors.push(e.message));
     page.on('console', (m) => {
       if (m.type() === 'error') errors.push(m.text());
     });
-    await open(page, { noRender: true });
-    await mix(page).click();
-    await expect(page.locator('.rp-note')).toHaveText('NOT READY');
-    await expect(mix(page)).toHaveText('LOOP MIX');
-    expect(await page.evaluate(() => window.__rec.engine.sent.filter((s) => s.cmd.t === 'exportTracks').length)).toBe(0);
+    await page.addInitScript(fakeMic);
+    await openApp(page);
+    await tap(page, powerSwitch(page), browserName);
+    await expect.poll(() => powerState(page), { timeout: 3000 }).toBe('on');
+    await page.keyboard.press('Escape'); // past the CALIBRATE? offer
+    await expect.poll(() => lcdShows(page, '120.0', FONT_SMALL)).toBe(true);
+
+    await pressControl(page, 'trk1.rec', browserName);
+    await expectLed(page, 'trk1.rec', 'red');
+    await page.waitForTimeout(1000);
+    await pressControl(page, 'trk1.rec', browserName);
+    await expectLed(page, 'trk1.rec', 'green'); // playing
+
+    // Every label LOOP MIX shows from here on.
+    await page.evaluate(() => {
+      const btn = document.querySelector('.rp-mix')!;
+      const seen: string[] = [];
+      (window as unknown as { __mixLabels: string[] }).__mixLabels = seen;
+      new MutationObserver((records) => {
+        for (const r of records) for (const n of r.addedNodes) seen.push(n.textContent ?? '');
+      }).observe(btn, { childList: true });
+    });
+    await tap(page, mix(page), browserName);
+    await expect(mix(page)).toHaveText('SAVE MIX', { timeout: 10000 });
+    const labels = await page.evaluate(() => (window as unknown as { __mixLabels: string[] }).__mixLabels);
+    expect(labels).toContain('PREPARING…');
+    expect(labels.at(-1)).toBe('SAVE MIX');
+    await expect(page.locator('.rp-note')).not.toHaveText('NOT READY');
     expect(errors).toEqual([]);
   });
 });
