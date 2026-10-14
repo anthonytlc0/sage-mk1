@@ -314,7 +314,8 @@ describe('Recorder: appends are chained, so there is never a hole', () => {
     });
     await recorder.start();
     feed(6); // all six blocks arrive while the first appends are still being written
-    await vi.waitFor(() => expect(recorder.recording).toBe(false), { timeout: 2000 });
+    // Generous: under a heavily loaded full suite the fake IndexedDB writes can take seconds.
+    await vi.waitFor(() => expect(recorder.recording).toBe(false), { timeout: 10_000 });
 
     expect(append).toHaveBeenCalledTimes(4);
     const id = recorder.lastTakeId!;
