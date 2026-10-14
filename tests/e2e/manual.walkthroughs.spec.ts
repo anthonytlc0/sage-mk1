@@ -6,8 +6,8 @@
  *   p. 10  Recording on Multiple Tracks: tracks in ascending order, then stopping with ALL START/STOP
  *   p. 12  Saving a Memory (WRITE): write to memory 02, go to 03, back to 02
  *
- * Undo/redo and ALL START/STOP are no-ops in the core until Task 8 merges (ruling R62): the tests that need them are
- * written to the Task 8 brief and marked fixme.
+ * Undo/redo and ALL START/STOP follow the Task 8 brief, with ruling R61: pressed while starts wait, ALL START/STOP
+ * cancels them.
  */
 import { expect, test as base, type Page } from '@playwright/test';
 import { FONT_LARGE, FONT_MEDIUM, FONT_SMALL } from '../../src/lcd/fonts';
@@ -17,8 +17,6 @@ import { fakeMic } from './fakeMic';
 import {
   Panel, expectSteady, expectTrack, ledState, overdub, powerOn, recordLoop, session, stopTrack, trackLength, tracks, waitAudio,
 } from './helpers';
-
-const T8 = 'needs Task 8 (lane-a)';
 
 /** A powered-on unit on the play screen, and the hand that works its panel. */
 const test = base.extend<{ panel: Panel }>({
@@ -79,7 +77,6 @@ test('p.9 single track: REC lights red, PLAY green, DUB yellow, PLAY again; STOP
 });
 
 test('p.9 UNDO/REDO: green while undo is available, red once undone (redo available), unlit when neither', async ({ page, panel }) => {
-  test.fixme(true, T8);
   const length = await recordLoop(page, 0, 1, rec(panel, 0));
   await overdub(page, 0, 0.6, rec(panel, 0));
 
@@ -103,7 +100,6 @@ test('p.9 UNDO/REDO: green while undo is available, red once undone (redo availa
 });
 
 test('p.9 UNDO of a first recording empties the track; REDO brings the phrase back', async ({ page, panel }) => {
-  test.fixme(true, T8);
   const length = await recordLoop(page, 0, 1, rec(panel, 0));
   await panel.press('undoRedo');
   await expectSteady(page, 'trk1.rec', 'green'); // the recording itself can be undone
@@ -165,7 +161,6 @@ test('p.10 multiple tracks in ascending order: each records, plays and overdubs 
 });
 
 test('p.10 stopping: ALL START/STOP darkens every track; pressed again it starts the ALL START TRK set', async ({ page, panel }) => {
-  test.fixme(true, T8);
   const lengths = await recordAscending(page, panel);
 
   // LOOP > PLAY, page 2: ALL START TRK, track 3 off (knob [1] turned to it, pushed)
@@ -199,7 +194,6 @@ test('p.10 stopping: ALL START/STOP darkens every track; pressed again it starts
 });
 
 test('p.10 ALL START/STOP pressed while the starts wait for the measure line cancels them (R61)', async ({ page, panel }) => {
-  test.fixme(true, T8);
   await recordLoop(page, 0, 1, rec(panel, 0));
   await recordLoop(page, 1, 1, rec(panel, 1));
   // TRACK 1 and 2, page 3: LOOP SYNC MODE (knob [4]) IMMEDIATE -> MEASURE, so a start waits for the next measure line
@@ -216,21 +210,38 @@ test('p.10 ALL START/STOP pressed while the starts wait for the measure line can
 
   await panel.press('allStartStop'); // stop all
   await expect.poll(async () => (await tracks(page)).slice(0, 2).map((t) => t.state)).toEqual(['stopped', 'stopped']);
+  // With every track stopped nothing keeps the measure grid going, and a start would be at once. The rhythm keeps it.
+  await panel.press('rhythmStartStop');
+  await expect.poll(() => page.evaluate(() => window.__sage!.unit.controller!.status!.rhythm)).toBe('on');
+  await expectSteady(page, 'rhythmStartStop', 'green');
 
-  // Early in a measure, so the line is most of a measure away: start (armed), then cancel before it comes.
-  await expect
-    .poll(() => page.evaluate(() => window.__sage!.unit.controller!.status!.measurePhase), { timeout: 10_000, intervals: [10] })
-    .toBeLessThan(0.3);
-  await panel.press('allStartStop');
-  await expect.poll(async () => (await tracks(page)).slice(0, 2).map((t) => t.pending)).toEqual(['play', 'play']);
-  expect((await ledState(page, 'trk1.rec'))).toEqual({ color: 'green', blink: 'fast' }); // armed: blinks
-  await panel.press('allStartStop');
+  /** Waits until a measure has just begun, so the next line is most of a measure away. */
+  const earlyInMeasure = (): Promise<void> =>
+    expect
+      .poll(() => page.evaluate(() => window.__sage!.unit.controller!.status!.measurePhase), { timeout: 10_000, intervals: [10] })
+      .toBeLessThan(0.3);
+  const startsArmed = async (): Promise<void> => {
+    await expect.poll(async () => (await tracks(page)).slice(0, 2).map((t) => [t.state, t.pending])).toEqual([['stopped', 'play'], ['stopped', 'play']]);
+    expect(await ledState(page, 'trk1.rec')).toEqual({ color: 'green', blink: 'fast' }); // armed: blinks
+  };
+
+  await earlyInMeasure();
+  await panel.press('allStartStop'); // both starts wait for the measure line
+  await startsArmed();
+  await panel.press('allStartStop'); // pressed again before the line: cancelled
   await expect.poll(async () => (await tracks(page)).slice(0, 2).map((t) => [t.state, t.pending])).toEqual([['stopped', null], ['stopped', null]]);
   const sr = await page.evaluate(() => window.__sage!.unit.controller!.status!.sampleRate);
   await waitAudio(page, (await measureFrames(page)) / sr + 0.5); // past the line: nothing starts
   expect((await tracks(page)).slice(0, 2).map((t) => t.state)).toEqual(['stopped', 'stopped']);
   await expectSteady(page, 'trk1.rec', 'off');
   await expectSteady(page, 'allStartStop', 'off');
+
+  await earlyInMeasure();
+  await panel.press('allStartStop'); // left alone, the armed starts fire together at the line
+  await startsArmed();
+  await expect.poll(async () => (await tracks(page)).slice(0, 2).map((t) => [t.state, t.pending]), { timeout: 10_000 }).toEqual([['playing', null], ['playing', null]]);
+  await expectSteady(page, 'trk1.rec', 'green');
+  await expectSteady(page, 'trk2.rec', 'green');
 });
 
 // ------------------------------------------------------------------------------------------------ p. 12

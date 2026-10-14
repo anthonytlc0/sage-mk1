@@ -11,8 +11,6 @@ import { lcdShows, menuDepth, openApp, powerState, topScreen } from './app';
 import { fakeMic } from './fakeMic';
 import { Panel, expectSteady, expectTrack, overdub, powerOn, recordLoop, session, stopTrack, tracks, waitAudio } from './helpers';
 
-const T8 = 'needs Task 8 (lane-a)';
-
 /** Every test starts powered on (the first-run CALIBRATE? offer dismissed with Esc); `panel` taps what has no key. */
 const test = base.extend<{ panel: Panel }>({
   panel: [
@@ -61,7 +59,6 @@ test('a held key is one press: A held down through its auto-repeat starts one re
 });
 
 test('Space is ALL START/STOP: it stops both tracks, starts them together, and the unit stays on', async ({ page }) => {
-  test.fixme(true, T8);
   await recordLoop(page, 0, 1, key(page, 'KeyA'));
   await recordLoop(page, 1, 1, key(page, 'KeyS'));
 
@@ -83,7 +80,6 @@ test('Space is ALL START/STOP: it stops both tracks, starts them together, and t
 });
 
 test('Tab is UNDO/REDO: A undoes and redoes track 1 (red, then green), Tab again leaves undo mode', async ({ page }) => {
-  test.fixme(true, T8);
   const length = await recordLoop(page, 0, 1, key(page, 'KeyA'));
   await overdub(page, 0, 0.5, key(page, 'KeyA'));
 
