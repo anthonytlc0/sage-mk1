@@ -378,11 +378,11 @@ export class LooperCore {
   }
 
   /**
-   * Offline renders only (LOOP MIX, ruling R64): start stopped track `i` playing at once from take position `pos` (see
-   * `Track.startAt`). The engine never calls this; a live start is a `recPlay`.
+   * Offline renders only (LOOP MIX, ruling R64): start stopped track `i` playing at once from take position `pos`, with
+   * the exact path's seam phase `phase` (see `Track.startAt`). The engine never calls this; a live start is a `recPlay`.
    */
-  startTrackAt(i: TrackIndex, pos: number): void {
-    this.tracks[i]?.startAt(pos);
+  startTrackAt(i: TrackIndex, pos: number, phase = 0): void {
+    this.tracks[i]?.startAt(pos, phase);
   }
 
   /**

@@ -360,6 +360,27 @@ describe('renderMix: from the live playheads (ruling R64)', () => {
     for (let f = 0; f < 1000; f += 7) expect(back.L[f]).toBeCloseTo((999 - ((f + 250) % 1000)) / 1000, 6);
   });
 
+  it('a loop a fraction of a frame off its grid length is not moved by the seam its pre-roll runs across (R45)', () => {
+    // 1000 frames whose ideal length at the tempo is 999.6: on the exact path, its seam corrected a frame at a time.
+    // Started in the pre-roll 5 frames before its seam, it must still be at its start on the cycle's first frame, and
+    // then play as a fresh start there does live.
+    const ideal = 999.6;
+    const t = audio(1000, (k) => Math.sin(k / 9) * 0.5, (120 * ideal) / 1000);
+    const { memory, system } = settings((m) => {
+      for (const s of m.track) s.loopSyncSw = false;
+    });
+    const tracks: Slot[] = [t, null, null, null, null];
+    const r = renderMix(memory, system, tracks, [true, false, false, false, false], [1, 1, 1, 1, 1], SR, 120);
+    expect(r.L.length).toBe(1000);
+    for (let f = 0; f < 1000; f++) expect(r.L[f]).toBe(t.L[f]);
+    // Live, a fresh start at frame 0 plays the same pass (past its ramp).
+    const live = liveCore(memory, system, tracks);
+    live.command({ t: 'tempo', bpm: 120 });
+    live.command({ t: 'recPlay', track: 0 });
+    const heard = liveMix(live, system, 1000);
+    for (let f = XF; f < 1000; f++) expect(heard.L[f]).toBe(r.L[f]);
+  });
+
   it('offsets outside the loop wrap into it, and one that is not a number counts as 0', () => {
     const t = audio(1000, (k) => k / 1000);
     const { memory, system } = settings();

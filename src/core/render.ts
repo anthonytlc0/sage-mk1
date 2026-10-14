@@ -67,21 +67,31 @@ export function lengthAfterRate(frames: number, rate: number): number {
 }
 
 /**
- * The take position a loop of `len` frames at `rate` starts from, `pre` timeline frames before the cycle's first frame,
- * so that it is `offset` frames into the loop (in play order) on that frame. On the exact path a whole frame (it reads
- * whole frames, so it stays exact); otherwise the playhead is fractional, as live. REVERSE counts from the loop's end.
+ * Where a loop of `len` frames at `rate` starts, `pre` timeline frames before the cycle's first frame, so that it is
+ * `offset` frames into the loop (in play order) on that frame: its take position and its seam phase. On the exact path
+ * the position is a whole frame (it reads whole frames, so it stays exact); otherwise the playhead is fractional, as
+ * live. REVERSE counts from the loop's end.
+ *
+ * The phase: a loop a fraction of a frame off its grid length moves its seam a frame now and then on the exact path
+ * (ruling R45). A pre-roll that runs across the seam would have that correction move the loop a frame there, just
+ * before the cycle. Started with the phase that makes that crossing on time, the pass from the seam is the one a fresh
+ * start there plays. (Otherwise the phase is 0, as for a start from stopped. The live loop's own phase is not in the
+ * status, so at later seams the mix can differ from live by one such frame, inside the seam crossfade.)
  */
-function startPosition(len: number, rate: number, reverse: boolean, offset: number | undefined, pre: number): number {
+function startOf(len: number, rate: number, reverse: boolean, offset: number | undefined, pre: number): { pos: number; phase: number } {
   const exact = exactPath(len, rate);
   let e = typeof offset === 'number' && Number.isFinite(offset) ? offset : 0;
-  e -= exact ? pre : pre * rate;
   if (exact) e = Math.round(e);
   e %= len;
   if (e < 0) e += len;
   if (e >= len) e -= len; // a tiny negative remainder that rounded up to len
-  if (!reverse) return e;
-  const p = len - 1 - e;
-  return p < 0 ? p + len : p;
+  let s = e - (exact ? pre : pre * rate);
+  const phase = exact && s < 0 ? len - len / rate : 0; // minus the drift a pass: the crossing is on time
+  while (s < 0) s += len;
+  if (s >= len) s -= len;
+  if (!reverse) return { pos: s, phase };
+  const p = len - 1 - s;
+  return { pos: p < 0 ? p + len : p, phase };
 }
 
 /** The least common multiple of `lengths` if it is at most `cap`, else the longest; never more than `cap`. */
@@ -201,8 +211,8 @@ export function mixRenderer(
   /** Start track `idx[k]` now, `pre` frames before the cycle's first frame, at its offset. */
   const start = (k: number, pre: number): void => {
     const i = idx[k];
-    const cfg = mem.track[i];
-    core.startTrackAt(TRACKS[i], startPosition(tracks[i]!.L.length, rates[k], cfg.reverse, opts.offsets?.[i], pre));
+    const { pos, phase } = startOf(tracks[i]!.L.length, rates[k], mem.track[i].reverse, opts.offsets?.[i], pre);
+    core.startTrackAt(TRACKS[i], pos, phase);
   };
   // The loops start before the pre-roll (below), so the cycle begins past their start ramp. A 1SHOT starts after it,
   // on the cycle's first frame, with the live ramp: through the pre-roll it would start with a step (PROMOTED 1), and

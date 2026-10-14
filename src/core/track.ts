@@ -1328,13 +1328,13 @@ export class Track implements SyncTrack {
   /**
    * Offline renders only (LOOP MIX, ruling R64): start a stopped track playing now from take position `pos`, as a start
    * from stopped does (START MODE, the 5 ms ramp-in, PLAY MODE SINGLE), with no wait for a line and no LOOP SYNC
-   * alignment. A whole-frame `pos` keeps the exact path. A position outside the take, or not a number, starts at the
-   * loop's start. Live starts go through `recPlay`.
+   * alignment. A whole-frame `pos` keeps the exact path, with seam phase `phase` (see `seamPhase`). A position outside
+   * the take, or not a number, starts at the loop's start. Live starts go through `recPlay`.
    */
-  startAt(pos: number): void {
+  startAt(pos: number, phase = 0): void {
     if (this._state !== 'stopped') return;
     const ok = Number.isFinite(pos) && pos >= 0 && pos < this._take.length;
-    this.startPlayback(ok ? pos : this.startPosition());
+    this.startPlayback(ok ? pos : this.startPosition(), Number.isFinite(phase) ? phase : 0);
   }
 
   // ALL START/STOP and PLAY MODE SINGLE (driven by the core) --------------------------------------------------------
