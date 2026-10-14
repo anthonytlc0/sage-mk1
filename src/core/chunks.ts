@@ -5,7 +5,8 @@
  * (copy-on-write), which keeps overdubbing under a held snapshot cheap.
  *
  * The pool enforces a byte budget: this is MEMORY FULL. iPad browsers get only about 1.5 to 4 GB of RAM per tab, so
- * the store has to refuse to grow rather than let the tab be killed.
+ * the store has to refuse to grow rather than let the tab be killed. Before it refuses, it asks its owner to give back
+ * memory held only for undo (`reclaim`, Task 8).
  *
  * This runs on the audio thread. `read` never allocates. `write` and `append` allocate only when they need a chunk
  * the pool has no recycled one for: `append` at the start of each new second, `write` and `append` when a shared
@@ -35,6 +36,13 @@ export class ChunkPool {
   readonly chunkBytes: number;
   readonly budgetBytes: number;
 
+  /**
+   * Asked for room when the budget is exhausted, before `alloc` gives up: it lets go of one snapshot held only for
+   * undo (the core's history) and returns true, or returns false when there is nothing left to let go of. It must
+   * never release a take that is still being played or recorded. Null: no history to reclaim.
+   */
+  reclaim: (() => boolean) | null = null;
+
   /** Chunks with refs > 0. Chunks parked in `free` do not count; they are reused before anything new is allocated. */
   private live = 0;
   private readonly free: Chunk[] = [];
@@ -57,17 +65,26 @@ export class ChunkPool {
    * A chunk with `refs = 1`, or null when the budget is exhausted (MEMORY FULL). Recycles a freed chunk when it can.
    * Contents are unspecified. A new allocation happens only when nothing is free, and then live chunks are all that
    * exist, so live plus free never exceeds the budget.
+   *
+   * With the budget exhausted it asks `reclaim` for room, one snapshot at a time, until a chunk is free or nothing is
+   * left to reclaim. `shared`: the chunk a copy-on-write copy is wanted for; once reclaiming has let go of its other
+   * holders (refs <= 1) no copy is needed, so it stops there and returns null, and the caller writes the chunk itself.
    */
-  alloc(): Chunk | null {
-    const recycled = this.free.pop();
-    if (recycled !== undefined) {
-      recycled.refs = 1;
-      this.live++;
-      return recycled;
+  alloc(shared: Chunk | null = null): Chunk | null {
+    for (;;) {
+      const recycled = this.free.pop();
+      if (recycled !== undefined) {
+        recycled.refs = 1;
+        this.live++;
+        return recycled;
+      }
+      if ((this.live + 1) * this.chunkBytes <= this.budgetBytes) {
+        this.live++;
+        return { L: new Float32Array(this.chunkFrames), R: new Float32Array(this.chunkFrames), refs: 1 };
+      }
+      if (shared !== null && shared.refs <= 1) return null;
+      if (this.reclaim === null || !this.reclaim()) return null;
     }
-    if ((this.live + 1) * this.chunkBytes > this.budgetBytes) return null;
-    this.live++;
-    return { L: new Float32Array(this.chunkFrames), R: new Float32Array(this.chunkFrames), refs: 1 };
   }
 
   /** Another take now holds `chunk`. */
@@ -138,6 +155,11 @@ export class AudioTake {
       let chunk: Chunk;
       if (ci === this.chunks.length) {
         const fresh = this.pool.alloc();
+        if (this.released) {
+          // The pool's reclaim let go of this very take while making room.
+          if (fresh !== null) this.pool.release(fresh);
+          return false;
+        }
         if (fresh === null) return false;
         this.chunks.push(fresh);
         chunk = fresh;
@@ -242,6 +264,29 @@ export class AudioTake {
     return true;
   }
 
+  /**
+   * Hold `other`'s chunks in place of this take's own, when the two are the same length: for two takes known to hold
+   * the same audio again after copy-on-write made them diverge (a snapshot that received the same writes as the take
+   * it was made of), so the copies go back to the pool. Takes of different lengths are left alone. Never allocates.
+   */
+  shareFrom(other: AudioTake): void {
+    if (this.released || other.released || other.len !== this.len || other === this) return;
+    for (let i = 0; i < this.chunks.length; i++) {
+      const theirs = other.chunks[i];
+      const mine = this.chunks[i];
+      if (theirs === mine) continue;
+      this.pool.retain(theirs);
+      this.chunks[i] = theirs;
+      this.pool.release(mine);
+    }
+  }
+
+  /** Whether this take is the only holder of at least one of its chunks (releasing it would free memory). */
+  ownsChunks(): boolean {
+    for (let i = 0; i < this.chunks.length; i++) if (this.chunks[i].refs <= 1) return true;
+    return false;
+  }
+
   /** A new take sharing every chunk with this one. Nothing is copied until either side writes. */
   snapshot(): AudioTake {
     const snap = new AudioTake(this.pool);
@@ -293,12 +338,22 @@ export class AudioTake {
 
   /**
    * Chunk `ci` made safe to write: itself when this take is its only holder, otherwise a fresh copy that replaces it
-   * here (the old one loses a ref). Null when the pool has no chunk for the copy.
+   * here (the old one loses a ref). Null when the pool has no chunk for the copy, or when the pool's reclaim released
+   * this take while making room.
    */
   private exclusive(ci: number): Chunk | null {
     const chunk = this.chunks[ci];
     if (chunk.refs <= 1) return chunk;
-    const copy = this.pool.alloc();
+    const copy = this.pool.alloc(chunk);
+    if (this.released) {
+      if (copy !== null) this.pool.release(copy);
+      return null;
+    }
+    if (chunk.refs <= 1) {
+      // Reclaiming let go of the chunk's other holders: it is this take's alone now, no copy needed.
+      if (copy !== null) this.pool.release(copy);
+      return chunk;
+    }
     if (copy === null) return null;
     copy.L.set(chunk.L);
     copy.R.set(chunk.R);

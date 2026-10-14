@@ -105,40 +105,73 @@ export class SplatWriter {
   }
 
   /**
-   * Write the pending frames below stream frame `upTo` into `take`, at `j mod loopLen`. Returns false on MEMORY FULL
-   * (a shared chunk could not be copied): the frames already written stay, the rest are dropped.
+   * Write the pending frames below stream frame `upTo` into each take of `takes`, at `j mod loopLen`. `loopLen` is
+   * the first take's length unless given (a take still longer than its loop); null entries and takes shorter than it
+   * are skipped. Each take's frames become its own audio there times the keep-gain plus the gathered input, so takes
+   * that held the same audio end up the same. Returns false on MEMORY FULL (a shared chunk of a take still holding
+   * audio could not be copied): the frames already written stay, the rest are dropped. A take the pool released while
+   * making room (its length is then 0) is skipped, not counted as a failure.
    */
-  flush(take: AudioTake, upTo: number, loopLen: number): boolean {
+  flush(takes: readonly (AudioTake | null)[], upTo: number, loopLen = 0): boolean {
     const end = Math.min(this.hi, upTo === Infinity ? this.hi : Math.floor(upTo));
+    for (let t = 0; t < takes.length && loopLen <= 0; t++) loopLen = takes[t]?.length ?? 0;
     if (loopLen <= 0) {
-      this.base = this.hi;
+      if (end > this.base) this.base = end;
       return true;
     }
-    const { w, a, bl, br, mask, tmpL, tmpR, outL, outR } = this;
     while (this.base < end) {
       let pos = this.base % loopLen;
       if (pos < 0) pos += loopLen;
       const n = Math.min(end - this.base, loopLen - pos, RUN);
-      take.read(pos, tmpL, tmpR, 0, n);
-      for (let i = 0; i < n; i++) {
-        const x = (this.base + i) & mask;
-        const wt = w[x];
-        if (wt > 0) {
-          const keep = a[x] / wt;
-          outL[i] = tmpL[i] * keep + bl[x] / wt;
-          outR[i] = tmpR[i] * keep + br[x] / wt;
-        } else {
-          outL[i] = tmpL[i];
-          outR[i] = tmpR[i];
+      for (let t = 0; t < takes.length; t++) {
+        const take = takes[t];
+        if (take === null || take.length < loopLen) continue;
+        if (!this.writeRun(take, pos, n) && take.length > 0) {
+          this.base = this.hi;
+          return false;
         }
-      }
-      if (!take.write(pos, outL, outR, n, 'replace')) {
-        this.base = this.hi;
-        return false;
       }
       this.base += n;
     }
     return true;
+  }
+
+  /**
+   * Write every pending frame into `take` (at `j mod take.length`) without consuming it: the frames stay gathered, to
+   * be flushed into the takes they belong to as usual. For a copy that must hold a pass whose last writes have not
+   * landed yet (a save or export straight after a punch-out). Returns false on MEMORY FULL.
+   */
+  bake(take: AudioTake): boolean {
+    const loopLen = take.length;
+    if (loopLen <= 0) return true;
+    let j = this.base;
+    while (j < this.hi) {
+      let pos = j % loopLen;
+      if (pos < 0) pos += loopLen;
+      const n = Math.min(this.hi - j, loopLen - pos, RUN);
+      if (!this.writeRun(take, pos, n, j)) return false;
+      j += n;
+    }
+    return true;
+  }
+
+  /** Write the `n` gathered frames from stream frame `from` (default: the base) into `take` at loop position `pos`. */
+  private writeRun(take: AudioTake, pos: number, n: number, from = this.base): boolean {
+    const { w, a, bl, br, mask, tmpL, tmpR, outL, outR } = this;
+    take.read(pos, tmpL, tmpR, 0, n);
+    for (let i = 0; i < n; i++) {
+      const x = (from + i) & mask;
+      const wt = w[x];
+      if (wt > 0) {
+        const keep = a[x] / wt;
+        outL[i] = tmpL[i] * keep + bl[x] / wt;
+        outR[i] = tmpR[i] * keep + br[x] / wt;
+      } else {
+        outL[i] = tmpL[i];
+        outR[i] = tmpR[i];
+      }
+    }
+    return take.write(pos, outL, outR, n, 'replace');
   }
 
   /** Drop everything pending without writing it. */
